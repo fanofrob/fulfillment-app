@@ -1,0 +1,249 @@
+import axios from 'axios'
+
+const api = axios.create({ baseURL: 'http://localhost:8000/api' })
+
+export const skuMappingApi = {
+  list: (params) => api.get('/sku-mappings/', { params }).then(r => r.data),
+  refresh: () => api.post('/sku-mappings/refresh').then(r => r.data),
+}
+
+export const cogsApi = {
+  list: (params) => api.get('/cogs/', { params }).then(r => r.data),
+  create: (data) => api.post('/cogs/', data).then(r => r.data),
+  refresh: () => api.post('/cogs/refresh').then(r => r.data),
+}
+
+export const rateCardApi = {
+  list: (params) => api.get('/rate-cards/', { params }).then(r => r.data),
+  refresh: () => api.post('/rate-cards/refresh').then(r => r.data),
+  rebuildUps: () => api.post('/rate-cards/rebuild-ups', {}, { timeout: 180000 }).then(r => r.data),
+}
+
+export const rulesApi = {
+  listOrders: () => api.get('/rules/orders/').then(r => r.data),
+  listOrderTags: () => api.get('/rules/orders/tags').then(r => r.data),
+  createOrder: (data) => api.post('/rules/orders/', data).then(r => r.data),
+  updateOrder: (id, data) => api.put(`/rules/orders/${id}`, data).then(r => r.data),
+  deleteOrder: (id) => api.delete(`/rules/orders/${id}`).then(r => r.data),
+  pauseOrder: (id) => api.patch(`/rules/orders/${id}/pause`).then(r => r.data),
+  unpauseOrder: (id) => api.patch(`/rules/orders/${id}/unpause`).then(r => r.data),
+}
+
+export const boxTypesApi = {
+  list: (params) => api.get('/rules/box-types', { params }).then(r => r.data),
+  create: (data) => api.post('/rules/box-types', data).then(r => r.data),
+  update: (id, data) => api.put(`/rules/box-types/${id}`, data).then(r => r.data),
+  delete: (id) => api.delete(`/rules/box-types/${id}`).then(r => r.data),
+}
+
+export const packageRulesApi = {
+  list: (params) => api.get('/rules/packages', { params }).then(r => r.data),
+  create: (data) => api.post('/rules/packages', data).then(r => r.data),
+  update: (id, data) => api.put(`/rules/packages/${id}`, data).then(r => r.data),
+  delete: (id) => api.delete(`/rules/packages/${id}`).then(r => r.data),
+  pause: (id) => api.patch(`/rules/packages/${id}/pause`).then(r => r.data),
+  unpause: (id) => api.patch(`/rules/packages/${id}/unpause`).then(r => r.data),
+}
+
+export const carrierServiceRulesApi = {
+  list: (params) => api.get('/rules/carrier-services', { params }).then(r => r.data),
+  create: (data) => api.post('/rules/carrier-services', data).then(r => r.data),
+  update: (id, data) => api.put(`/rules/carrier-services/${id}`, data).then(r => r.data),
+  delete: (id) => api.delete(`/rules/carrier-services/${id}`).then(r => r.data),
+  pause: (id) => api.patch(`/rules/carrier-services/${id}/pause`).then(r => r.data),
+  unpause: (id) => api.patch(`/rules/carrier-services/${id}/unpause`).then(r => r.data),
+}
+
+export const statusApi = {
+  get: () => api.get('/status').then(r => r.data),
+  refreshAll: () => api.post('/refresh').then(r => r.data),
+}
+
+export const inventoryApi = {
+  // Items CRUD
+  listItems: (warehouse, params) =>
+    api.get('/inventory/items', { params: { warehouse, ...params } }).then(r => r.data),
+  createItem: (data) => api.post('/inventory/items', data).then(r => r.data),
+  updateItem: (id, data) => api.put(`/inventory/items/${id}`, data).then(r => r.data),
+  deleteItem: (id) => api.delete(`/inventory/items/${id}`).then(r => r.data),
+
+  // Adjustment log
+  getItemAdjustments: (itemId) =>
+    api.get(`/inventory/items/${itemId}/adjustments`).then(r => r.data),
+  listAdjustments: (warehouse, params) =>
+    api.get('/inventory/adjustments', { params: { warehouse, ...params } }).then(r => r.data),
+
+  // Batches
+  getItemBatches: (itemId) =>
+    api.get(`/inventory/items/${itemId}/batches`).then(r => r.data),
+  receiveBatch: (itemId, data) =>
+    api.post(`/inventory/items/${itemId}/batches`, data).then(r => r.data),
+  updateBatch: (batchId, data) =>
+    api.put(`/inventory/batches/${batchId}`, data).then(r => r.data),
+
+  // Recompute committed from live orders
+  recomputeCommitted: (warehouse) =>
+    api.post('/inventory/recompute-committed', null, { params: { warehouse } }).then(r => r.data),
+
+  // Out-of-stock demand analysis
+  demandAnalysis: (warehouse, order_scope = 'staged', health_filter = 'all') =>
+    api.get('/inventory/demand-analysis', { params: { warehouse, order_scope, health_filter } }).then(r => r.data),
+
+  stagedShortages: (warehouse) =>
+    api.get('/inventory/staged-shortages', { params: warehouse ? { warehouse } : {} }).then(r => r.data),
+}
+
+export const shopifyAuthApi = {
+  status: () => api.get('/shopify/status').then(r => r.data),
+  // connect is a browser redirect, not an axios call — use window.location
+  connectUrl: () => 'http://localhost:8000/api/shopify/connect',
+  disconnect: () => api.delete('/shopify/disconnect').then(r => r.data),
+}
+
+export const ordersApi = {
+  list: (params) => api.get('/orders/', { params }).then(r => r.data),
+  pull: (data) => api.post('/orders/pull', data).then(r => r.data),
+  get: (id) => api.get(`/orders/${id}`).then(r => r.data),
+  updateStatus: (id, data) => api.put(`/orders/${id}/status`, data).then(r => r.data),
+  stage: (id) => api.post(`/orders/${id}/stage`).then(r => r.data),
+  stageBatch: (data) => api.post('/orders/stage-batch', data).then(r => r.data),
+  unstageBatch: (order_ids) => api.post('/orders/unstage-batch', { order_ids }).then(r => r.data),
+  unstagePlanIssues: () => api.post('/orders/unstage-plan-issues').then(r => r.data),
+  getMargin: (id) => api.get(`/orders/${id}/margin`).then(r => r.data),
+  getBatchMargins: (ids) => api.get('/orders/margins', { params: { ids: ids.join(',') } }).then(r => r.data),
+  listArchived: () => api.get('/orders/archived').then(r => r.data),
+  cancelOrder: (id) => api.post(`/orders/${id}/cancel`).then(r => r.data),
+}
+
+export const shipstationApi = {
+  status: () => api.get('/shipstation/status').then(r => r.data),
+  push: (orderId) => api.post(`/shipstation/push/${orderId}`).then(r => r.data),
+  pushBatch: (data) => api.post('/shipstation/push-batch', data).then(r => r.data),
+  sync: () => api.post('/shipstation/sync').then(r => r.data),
+  getEstimatedDelivery: (orderId) => api.get(`/shipstation/estimated-delivery/${orderId}`).then(r => r.data),
+  checkDuplicates: () => api.post('/shipstation/check-duplicates').then(r => r.data),
+}
+
+export const picklistSkusApi = {
+  list: (params) => api.get('/picklist-skus/', { params }).then(r => r.data),
+  sync: () => api.post('/picklist-skus/sync').then(r => r.data),
+  update: (id, data) => api.put(`/picklist-skus/${id}`, data).then(r => r.data),
+  missingCogs: () => api.get('/picklist-skus/missing-cogs').then(r => r.data),
+}
+
+export const gmSettingsApi = {
+  get: () => api.get('/gm-settings/').then(r => r.data),
+  update: (data) => api.put('/gm-settings/', data).then(r => r.data),
+}
+
+export const packagingMaterialsApi = {
+  list: () => api.get('/rules/packaging-materials').then(r => r.data),
+  create: (data) => api.post('/rules/packaging-materials', data).then(r => r.data),
+  update: (id, data) => api.put(`/rules/packaging-materials/${id}`, data).then(r => r.data),
+  delete: (id) => api.delete(`/rules/packaging-materials/${id}`).then(r => r.data),
+}
+
+export const boxTypePackagingApi = {
+  list: (boxTypeId) => api.get(`/rules/box-types/${boxTypeId}/packaging`).then(r => r.data),
+  add: (boxTypeId, data) => api.post(`/rules/box-types/${boxTypeId}/packaging`, data).then(r => r.data),
+  update: (boxTypeId, entryId, data) => api.put(`/rules/box-types/${boxTypeId}/packaging/${entryId}`, data).then(r => r.data),
+  remove: (boxTypeId, entryId) => api.delete(`/rules/box-types/${boxTypeId}/packaging/${entryId}`).then(r => r.data),
+}
+
+export const productsApi = {
+  list: (params) => api.get('/products/', { params }).then(r => r.data),
+  listProductTypes: () => api.get('/products/product-types').then(r => r.data),
+  catalogErrors: () => api.get('/products/catalog-errors').then(r => r.data),
+  update: (id, data) => api.patch(`/products/${id}`, data).then(r => r.data),
+  setShortShipByType: (data) => api.post('/products/set-short-ship-by-type', data).then(r => r.data),
+  setInventoryHoldByType: (data) => api.post('/products/set-inventory-hold-by-type', data).then(r => r.data),
+  apply: () => api.post('/products/apply').then(r => r.data),
+  sync: () => api.post('/products/sync').then(r => r.data),
+}
+
+export const fulfillmentApi = {
+  // Carrier service rule evaluation
+  getCarrierServiceForOrder: (shopifyOrderId) =>
+    api.get(`/fulfillment/carrier-service-for-order/${shopifyOrderId}`).then(r => r.data),
+
+  // Pactor map
+  getPactorMap: () => api.get('/fulfillment/pactor-map').then(r => r.data),
+
+  // Plans
+  listPlans: (params) => api.get('/fulfillment/plans', { params }).then(r => r.data),
+  createPlan: (data) => api.post('/fulfillment/plans', data).then(r => r.data),
+  getPlan: (id) => api.get(`/fulfillment/plans/${id}`).then(r => r.data),
+  updatePlan: (id, data) => api.put(`/fulfillment/plans/${id}`, data).then(r => r.data),
+  deletePlan: (id) => api.delete(`/fulfillment/plans/${id}`).then(r => r.data),
+
+  // Boxes
+  addBox: (planId, data) => api.post(`/fulfillment/plans/${planId}/boxes`, data).then(r => r.data),
+  updateBox: (planId, boxId, data) => api.put(`/fulfillment/plans/${planId}/boxes/${boxId}`, data).then(r => r.data),
+  deleteBox: (planId, boxId) => api.delete(`/fulfillment/plans/${planId}/boxes/${boxId}`).then(r => r.data),
+  deleteUnpushedBoxes: (planId) => api.delete(`/fulfillment/plans/${planId}/boxes/unpushed`).then(r => r.data),
+  bulkResetUnpushed: () => api.delete('/fulfillment/bulk-reset-unpushed').then(r => r.data),
+  bulkResetUnpushedByOrders: (order_ids) => api.delete('/fulfillment/bulk-reset-unpushed-by-orders', { data: { order_ids } }).then(r => r.data),
+
+  // Box items
+  setBoxItems: (planId, boxId, data) => api.put(`/fulfillment/plans/${planId}/boxes/${boxId}/items`, data).then(r => r.data),
+
+  // ShipStation
+  pushBox: (planId, boxId) => api.post(`/fulfillment/plans/${planId}/boxes/${boxId}/push`).then(r => r.data),
+  sync: () => api.post('/fulfillment/sync').then(r => r.data),
+
+  // Bulk push plan boxes for multiple orders (legacy, non-streaming)
+  bulkPush: (data) => api.post('/fulfillment/bulk-push', data).then(r => r.data),
+
+  // Streaming bulk push — returns an EventSource-like reader
+  bulkPushStream: ({ order_ids, onProgress, onDone, onError }) => {
+    const ctrl = new AbortController()
+    fetch('http://localhost:8000/api/fulfillment/bulk-push-stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order_ids }),
+      signal: ctrl.signal,
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const detail = await res.text()
+          throw new Error(detail)
+        }
+        const reader = res.body.getReader()
+        const decoder = new TextDecoder()
+        let buf = ''
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += decoder.decode(value, { stream: true })
+          const lines = buf.split('\n')
+          buf = lines.pop() // keep incomplete line
+          let eventType = null
+          for (const line of lines) {
+            if (line.startsWith('event: ')) {
+              eventType = line.slice(7).trim()
+            } else if (line.startsWith('data: ')) {
+              const data = JSON.parse(line.slice(6))
+              if (eventType === 'progress' && onProgress) onProgress(data)
+              else if (eventType === 'done' && onDone) onDone(data)
+              else if (eventType === 'start' && onProgress) onProgress(data)
+            }
+          }
+        }
+      })
+      .catch((err) => {
+        if (err.name !== 'AbortError' && onError) onError(err)
+      })
+    return ctrl // caller can call ctrl.abort() to cancel
+  },
+
+  // Auto-create plans for all unplanned not_processed orders
+  bulkAutoPlan: (orderIds) => api.post('/fulfillment/bulk-auto-plan', orderIds ? { order_ids: orderIds } : {}).then(r => r.data),
+
+  // Change detection
+  detectChanges: (shopifyOrderId) => api.post('/fulfillment/detect-changes', null, {
+    params: shopifyOrderId ? { shopify_order_id: shopifyOrderId } : {},
+  }).then(r => r.data),
+  listChanges: (params) => api.get('/fulfillment/changes', { params }).then(r => r.data),
+  approveChange: (id, data) => api.post(`/fulfillment/changes/${id}/approve`, data || {}).then(r => r.data),
+  rejectChange: (id, data) => api.post(`/fulfillment/changes/${id}/reject`, data || {}).then(r => r.data),
+}

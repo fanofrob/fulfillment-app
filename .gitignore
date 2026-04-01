@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# Node
+node_modules/
+dist/
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets & credentials — NEVER commit these
+backend/.env
+backend/ .env
+backend/credentials.env
+backend/credentials.json
+backend/shopify_token.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

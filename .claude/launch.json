@@ -1,0 +1,21 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "backend",
+      "runtimeExecutable": "/Users/robertfan/Claude Code/fulfillment-app/backend/venv/bin/uvicorn",
+      "runtimeArgs": ["main:app", "--reload", "--port", "8000"],
+      "cwd": "/Users/robertfan/Claude Code/fulfillment-app/backend",
+      "port": 8000,
+      "autoPort": false
+    },
+    {
+      "name": "frontend",
+      "runtimeExecutable": "/usr/local/bin/node",
+      "runtimeArgs": ["node_modules/.bin/vite", "--port", "5173"],
+      "cwd": "/Users/robertfan/Claude Code/fulfillment-app/frontend",
+      "port": 5173,
+      "autoPort": false
+    }
+  ]
+}
