@@ -156,6 +156,85 @@ def get_sku_mappings_both(search: str = None, skip: int = 0, limit: int = 50, er
     return combined[skip: skip + limit]
 
 
+# ── Period-Specific SKU Mappings ──────────────────────────────────────────────
+
+def get_period_sku_mappings(tab_name: str, search: str = None, skip: int = 0, limit: int = 50):
+    """
+    Read SKU mappings from a period-specific Google Sheets tab.
+    Tab name is stored on the projection_period record (e.g. "Period 1 SKU Mapping").
+    Uses the same spreadsheet and column format as the default bundles_cvr tabs.
+    """
+    if not tab_name:
+        return []
+
+    def fetch():
+        client = _get_client()
+        ws = client.open_by_key(SPREADSHEET_IDS["inventory"]).worksheet(tab_name)
+        rows = ws.get_all_records(expected_headers=["shopifysku2", "picklist sku"])
+        result = []
+        for i, row in enumerate(rows):
+            sku = str(_row_get(row, "shopifysku2") or "").strip()
+            if not sku or sku == "shopifysku2":
+                continue
+            pick_sku = str(_row_get(row, "picklist sku") or "").strip() or None
+            mix_qty = _parse_float(_row_get(row, "actualqty")) or 1.0
+            result.append({
+                "id": i + 1,
+                "_row": i + 2,
+                "shopify_sku": sku,
+                "pick_sku": pick_sku,
+                "mix_quantity": mix_qty,
+                "product_type": str(_row_get(row, "Product Type") or "").strip() or None,
+                "pick_type": str(_row_get(row, "Pick Type") or "").strip() or None,
+                "pick_weight_lb": _parse_float(_row_get(row, "Pick Weight LB")),
+                "lineitem_weight": _parse_float(_row_get(row, "Lineitem Weight")),
+                "shop_status": str(_row_get(row, "Shop Status") or "").strip() or None,
+                "is_active": str(_row_get(row, "Shop Status") or "").strip() != "Inactive",
+            })
+        return result
+
+    all_rows = _cached(f"period_sku_{tab_name}", fetch)
+
+    if search:
+        s = search.lower()
+        all_rows = [r for r in all_rows if s in r["shopify_sku"].lower()
+                    or (r["pick_sku"] and s in r["pick_sku"].lower())]
+
+    return all_rows[skip: skip + limit]
+
+
+def get_period_sku_mapping_lookup(tab_name: str) -> dict:
+    """
+    Returns {shopify_sku: [{"pick_sku": str, "mix_quantity": float, "product_type": str}, ...]}
+    for a period-specific Google Sheets tab. Mirrors get_sku_mapping_lookup() but preserves
+    the product_type field needed by the projection engine.
+    """
+    rows = get_period_sku_mappings(tab_name, skip=0, limit=100000)
+    result: dict = {}
+    for r in rows:
+        sku = r.get("shopify_sku")
+        if not sku:
+            continue
+        if sku not in result:
+            result[sku] = []
+        result[sku].append({
+            "pick_sku": r["pick_sku"],
+            "mix_quantity": r.get("mix_quantity") or 1.0,
+            "product_type": r.get("product_type"),
+        })
+    return result
+
+
+def list_sheet_tabs():
+    """List all worksheet tab names in the inventory spreadsheet."""
+    try:
+        client = _get_client()
+        spreadsheet = client.open_by_key(SPREADSHEET_IDS["inventory"])
+        return [ws.title for ws in spreadsheet.worksheets()]
+    except Exception:
+        return []
+
+
 # ── COGS ──────────────────────────────────────────────────────────────────────
 
 def get_cogs(product_type_search: str = None, skip: int = 0, limit: int = 200):

@@ -431,3 +431,241 @@ class ArchivedOrder(Base):
     line_items_summary   = Column(String, nullable=True)
     shopify_archived     = Column(Boolean, nullable=False, default=False)
     archived_at          = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ── Projection System ────────────────────────────────────────────────────────
+
+class ProjectionPeriod(Base):
+    """
+    A named time window for demand projection with configurable date boundaries.
+    Default cycle: Wed 12:00am → Tue 11:59pm.
+    Status: draft → active → closed.
+    """
+    __tablename__ = "projection_periods"
+    id                    = Column(Integer, primary_key=True, index=True)
+    name                  = Column(String, nullable=False)
+    start_datetime        = Column(DateTime(timezone=True), nullable=False)
+    end_datetime          = Column(DateTime(timezone=True), nullable=False)
+    fulfillment_start     = Column(DateTime(timezone=True), nullable=True)
+    fulfillment_end       = Column(DateTime(timezone=True), nullable=True)
+    status                = Column(String, nullable=False, default="draft")  # draft | active | closed
+    sku_mapping_sheet_tab = Column(String, nullable=True)
+    previous_period_id    = Column(Integer, ForeignKey("projection_periods.id"), nullable=True)
+    spoilage_adjustments  = Column(JSON, nullable=True)   # per-SKU spoilage % overrides
+    notes                 = Column(Text, nullable=True)
+    created_at            = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at            = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class PeriodShortShipConfig(Base):
+    """Short-ship SKU configuration scoped to a specific projection period."""
+    __tablename__ = "period_short_ship_configs"
+    id          = Column(Integer, primary_key=True, index=True)
+    period_id   = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
+    shopify_sku = Column(String, nullable=False)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('period_id', 'shopify_sku', name='uq_period_short_ship'),
+    )
+
+
+class PeriodInventoryHoldConfig(Base):
+    """Inventory-hold SKU configuration scoped to a specific projection period."""
+    __tablename__ = "period_inventory_hold_configs"
+    id          = Column(Integer, primary_key=True, index=True)
+    period_id   = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
+    shopify_sku = Column(String, nullable=False)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('period_id', 'shopify_sku', name='uq_period_inv_hold'),
+    )
+
+
+class HistoricalSales(Base):
+    """
+    Hourly-bucketed historical sales data aggregated from Shopify orders.
+    Used by the projection engine for demand forecasting.
+    """
+    __tablename__ = "historical_sales"
+    id            = Column(Integer, primary_key=True, index=True)
+    hour_bucket   = Column(DateTime(timezone=True), nullable=False, index=True)
+    shopify_sku   = Column(String, nullable=False, index=True)
+    order_count   = Column(Integer, nullable=False, default=0)
+    quantity_sold = Column(Integer, nullable=False, default=0)
+    revenue       = Column(Float, nullable=False, default=0.0)
+
+    __table_args__ = (
+        UniqueConstraint('hour_bucket', 'shopify_sku', name='uq_historical_hour_sku'),
+    )
+
+
+class HistoricalPromotion(Base):
+    """
+    Tags a historical time period as having a promotion active.
+    Used to exclude or re-weight promotional periods in demand forecasting.
+    """
+    __tablename__ = "historical_promotions"
+    id             = Column(Integer, primary_key=True, index=True)
+    name           = Column(String, nullable=False)
+    start_datetime = Column(DateTime(timezone=True), nullable=False)
+    end_datetime   = Column(DateTime(timezone=True), nullable=False)
+    scope          = Column(String, nullable=False, default="store_wide")  # store_wide | sku_specific
+    affected_skus  = Column(JSON, nullable=True)    # list of SKUs if sku_specific
+    discount_type  = Column(String, nullable=True)   # percentage | fixed | bogo | etc.
+    discount_value = Column(Float, nullable=True)
+    notes          = Column(Text, nullable=True)
+    source         = Column(String, nullable=False, default="manual")  # manual | klaviyo
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at     = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+# ── Projections ──────────────────────────────────────────────────────────────
+
+class Projection(Base):
+    """
+    A point-in-time demand forecast for a specific projection period.
+    Generated on demand; previous projections for the same period are marked 'superseded'.
+    """
+    __tablename__ = "projections"
+    id                        = Column(Integer, primary_key=True, index=True)
+    period_id                 = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
+    generated_at              = Column(DateTime(timezone=True), server_default=func.now())
+    shopify_data_as_of        = Column(DateTime(timezone=True), nullable=True)
+    historical_range_start    = Column(DateTime(timezone=True), nullable=True)
+    historical_range_end      = Column(DateTime(timezone=True), nullable=True)
+    parameters                = Column(JSON, nullable=True)       # frozen snapshot of generation inputs
+    methodology_report        = Column(Text, nullable=True)       # auto-generated transparency text
+    status                    = Column(String, nullable=False, default="current")  # current | superseded
+    total_confirmed_demand_lbs = Column(Float, nullable=False, default=0.0)
+    total_projected_demand_lbs = Column(Float, nullable=False, default=0.0)
+    total_demand_lbs          = Column(Float, nullable=False, default=0.0)
+    created_at                = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at                = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class ProjectionLine(Base):
+    """Per-product-type row within a projection."""
+    __tablename__ = "projection_lines"
+    id                    = Column(Integer, primary_key=True, index=True)
+    projection_id         = Column(Integer, ForeignKey("projections.id"), nullable=False, index=True)
+    product_type          = Column(String, nullable=False, index=True)
+    confirmed_order_count = Column(Integer, nullable=False, default=0)
+    confirmed_demand_lbs  = Column(Float, nullable=False, default=0.0)
+    projected_order_count = Column(Float, nullable=False, default=0.0)  # fractional (forecast)
+    projected_demand_lbs  = Column(Float, nullable=False, default=0.0)
+    total_demand_lbs      = Column(Float, nullable=False, default=0.0)
+    padding_pct           = Column(Float, nullable=False, default=0.0)
+    padded_demand_lbs     = Column(Float, nullable=False, default=0.0)
+    on_hand_lbs           = Column(Float, nullable=False, default=0.0)
+    expected_on_hand_lbs  = Column(Float, nullable=False, default=0.0)
+    on_order_lbs          = Column(Float, nullable=False, default=0.0)   # 0 until PO system (Phase 4)
+    gap_lbs               = Column(Float, nullable=False, default=0.0)
+    gap_cases             = Column(Float, nullable=True)
+    case_weight_lbs       = Column(Float, nullable=True)
+    gap_status            = Column(String, nullable=False, default="ok")  # short | long | ok
+    detail                = Column(JSON, nullable=True)   # per-SKU breakdown for drill-down
+    created_at            = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ProjectionPaddingConfig(Base):
+    """Per-product-type padding percentage applied on top of projected demand."""
+    __tablename__ = "projection_padding_configs"
+    id           = Column(Integer, primary_key=True, index=True)
+    product_type = Column(String, nullable=False, unique=True, index=True)
+    padding_pct  = Column(Float, nullable=False, default=0.0)  # e.g., 10.0 means 10%
+    notes        = Column(Text, nullable=True)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at   = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+# ── Vendor Management & Purchase Orders (Phase 4) ───────────────────────────
+
+class Vendor(Base):
+    """Vendor registry with contact info and communication preferences."""
+    __tablename__ = "vendors"
+    id                       = Column(Integer, primary_key=True, index=True)
+    name                     = Column(String, nullable=False)
+    contact_name             = Column(String, nullable=True)
+    contact_email            = Column(String, nullable=True)
+    contact_phone            = Column(String, nullable=True)
+    contact_whatsapp         = Column(String, nullable=True)
+    preferred_communication  = Column(String, nullable=True)  # whatsapp | email | phone
+    notes                    = Column(Text, nullable=True)
+    is_active                = Column(Boolean, nullable=False, default=True)
+    created_at               = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at               = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class VendorProduct(Base):
+    """Default product types, case sizes, pricing, and lead times per vendor."""
+    __tablename__ = "vendor_products"
+    id                      = Column(Integer, primary_key=True, index=True)
+    vendor_id               = Column(Integer, ForeignKey("vendors.id"), nullable=False, index=True)
+    product_type            = Column(String, nullable=False, index=True)
+    default_case_weight_lbs = Column(Float, nullable=True)
+    default_case_count      = Column(Integer, nullable=True)   # pieces per case
+    default_price_per_case  = Column(Float, nullable=True)
+    default_price_per_lb    = Column(Float, nullable=True)
+    lead_time_days          = Column(Integer, nullable=True)
+    order_unit              = Column(String, nullable=True, default="case")  # case | lb | piece
+    is_preferred            = Column(Boolean, nullable=False, default=False)
+    notes                   = Column(Text, nullable=True)
+    created_at              = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at              = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('vendor_id', 'product_type', name='uq_vendor_product_type'),
+    )
+
+
+class PurchaseOrder(Base):
+    """
+    A vendor order with lifecycle tracking.
+    Status: draft → placed → in_transit → partially_received → delivered → imported → reconciled
+    """
+    __tablename__ = "purchase_orders"
+    id                      = Column(Integer, primary_key=True, index=True)
+    po_number               = Column(String, nullable=False, unique=True, index=True)
+    vendor_id               = Column(Integer, ForeignKey("vendors.id"), nullable=False, index=True)
+    status                  = Column(String, nullable=False, default="draft")
+    order_date              = Column(Date, nullable=True)
+    expected_delivery_date  = Column(Date, nullable=True)
+    actual_delivery_date    = Column(Date, nullable=True)
+    delivery_notes          = Column(Text, nullable=True)
+    communication_method    = Column(String, nullable=True)   # how order was placed
+    subtotal                = Column(Float, nullable=True)     # calculated from line items
+    notes                   = Column(Text, nullable=True)
+    created_at              = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at              = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class PurchaseOrderLine(Base):
+    """A line item on a purchase order — one product type per line."""
+    __tablename__ = "purchase_order_lines"
+    id                = Column(Integer, primary_key=True, index=True)
+    purchase_order_id = Column(Integer, ForeignKey("purchase_orders.id"), nullable=False, index=True)
+    product_type      = Column(String, nullable=False)
+    quantity_cases    = Column(Float, nullable=False, default=0.0)
+    case_weight_lbs   = Column(Float, nullable=True)
+    total_weight_lbs  = Column(Float, nullable=True)   # quantity_cases × case_weight_lbs
+    unit_price        = Column(Float, nullable=True)
+    price_unit        = Column(String, nullable=True, default="case")  # case | lb
+    total_price       = Column(Float, nullable=True)
+    notes             = Column(Text, nullable=True)
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at        = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class PurchaseOrderPeriodAllocation(Base):
+    """Allocates portions of a PO line to specific projection periods with spoilage adjustments."""
+    __tablename__ = "purchase_order_period_allocations"
+    id             = Column(Integer, primary_key=True, index=True)
+    po_line_id     = Column(Integer, ForeignKey("purchase_order_lines.id"), nullable=False, index=True)
+    period_id      = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
+    allocated_lbs  = Column(Float, nullable=False, default=0.0)
+    spoilage_pct   = Column(Float, nullable=False, default=0.0)
+    effective_lbs  = Column(Float, nullable=False, default=0.0)  # allocated_lbs × (1 - spoilage_pct)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at     = Column(DateTime(timezone=True), onupdate=func.now())
