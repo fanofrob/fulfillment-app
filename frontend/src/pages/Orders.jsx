@@ -399,6 +399,8 @@ export default function Orders() {
   const [selectedForBatch, setSelectedForBatch] = useState(new Set())
   const [sortCol, setSortCol] = useState('order_date')
   const [sortDir, setSortDir] = useState('desc')
+  const [syncBanner, setSyncBanner] = useState(null) // { type: 'syncing'|'success'|'error', message: string }
+  const syncBannerTimer = useRef(null)
   const [colFilters, setColFilters] = useState({
     tags: null,     // Set | null
     items: null,    // Set | null
@@ -525,6 +527,8 @@ export default function Orders() {
 
   const syncSSMutation = useMutation({
     mutationFn: async () => {
+      setSyncBanner({ type: 'syncing', message: 'Syncing with ShipStation...' })
+      if (syncBannerTimer.current) clearTimeout(syncBannerTimer.current)
       const [ss, ff] = await Promise.all([shipstationApi.sync(), fulfillmentApi.sync()])
       return {
         synced: (ss.synced || 0) + (ff.synced || 0),
@@ -533,7 +537,21 @@ export default function Orders() {
         errors: [...(ss.errors || []), ...(ff.errors || [])],
       }
     },
-    onSuccess: () => qc.invalidateQueries(['orders']),
+    onSuccess: (data) => {
+      qc.invalidateQueries(['orders'])
+      const parts = []
+      if (data.synced) parts.push(`${data.synced} order${data.synced !== 1 ? 's' : ''} synced`)
+      if (data.shipped) parts.push(`${data.shipped} shipped`)
+      if (data.shopify_fulfillments) parts.push(`${data.shopify_fulfillments} Shopify fulfillment${data.shopify_fulfillments !== 1 ? 's' : ''} created`)
+      if (data.errors.length) parts.push(`${data.errors.length} error${data.errors.length !== 1 ? 's' : ''}`)
+      const message = parts.length ? parts.join(', ') : 'No new updates from ShipStation'
+      setSyncBanner({ type: data.errors.length ? 'error' : 'success', message })
+      syncBannerTimer.current = setTimeout(() => setSyncBanner(null), 8000)
+    },
+    onError: (err) => {
+      setSyncBanner({ type: 'error', message: `Sync failed: ${err.message || 'Unknown error'}` })
+      syncBannerTimer.current = setTimeout(() => setSyncBanner(null), 10000)
+    },
   })
 
   const stageBatchMutation = useMutation({
@@ -928,9 +946,17 @@ export default function Orders() {
             {pullMutation.data?.auto_archived > 0 && `, ${pullMutation.data.auto_archived} auto-archived`}
           </div>
         )}
-        {syncSSMutation.isSuccess && (
-          <div className="info-banner">
-            ✓ ShipStation sync: {syncSSMutation.data?.shipped} marked shipped, {syncSSMutation.data?.synced} checked{syncSSMutation.data?.shopify_fulfillments > 0 ? `, ${syncSSMutation.data.shopify_fulfillments} Shopify fulfillments created` : ''}
+        {syncBanner && (
+          <div className={`sync-status-banner sync-status-${syncBanner.type}`}>
+            <span>
+              {syncBanner.type === 'syncing' && <span className="sync-spinner" />}
+              {syncBanner.type === 'success' && '✓ '}
+              {syncBanner.type === 'error' && '✗ '}
+              {syncBanner.message}
+            </span>
+            {syncBanner.type !== 'syncing' && (
+              <button className="sync-banner-dismiss" onClick={() => { setSyncBanner(null); if (syncBannerTimer.current) clearTimeout(syncBannerTimer.current) }}>×</button>
+            )}
           </div>
         )}
 
