@@ -2416,9 +2416,14 @@ def repair_duplicate_sku_fulfillments(
     db: Session = Depends(get_db),
 ):
     """
-    Find and fix orders where multiple Shopify line items share the same pick_sku
-    but only one line_item_id was stored on BoxLineItems, causing the other(s) to
-    remain unfulfilled in Shopify.
+    Find and fix orders where the app shipped boxes but some Shopify line items
+    remain unfulfilled — typically caused by duplicate SKUs (e.g. upsells) where
+    only one line_item_id was tracked on BoxLineItems.
+
+    Approach: find orders with shipped boxes where the same shopify_sku appears on
+    multiple Shopify line_item_ids, and at least one has fulfillable_quantity > 0
+    (still unfulfilled). For each, create a Shopify fulfillment with the shipped
+    box's tracking number, and split the merged BoxLineItem in the DB.
 
     When dry_run=True (default), reports what would be fixed without making changes.
     When dry_run=False, fixes BoxLineItems in the DB and creates Shopify fulfillments.
@@ -2428,21 +2433,18 @@ def repair_duplicate_sku_fulfillments(
 
     results = []
 
-    # Step 1: Find orders with duplicate pick_sku across different line_item_ids
-    # that were fulfilled by the app (have shipped/fulfilled boxes)
-    all_lis = db.query(models.ShopifyLineItem).filter(
-        models.ShopifyLineItem.sku_mapped == True,
-        models.ShopifyLineItem.pick_sku.isnot(None),
-    ).all()
+    # Step 1: Find orders with multiple line_item_ids for the same shopify_sku
+    all_lis = db.query(models.ShopifyLineItem).all()
 
-    # Group by (shopify_order_id, pick_sku) → list of line items
+    # Group by (shopify_order_id, shopify_sku) → list of distinct line_item_ids
     order_sku_groups: dict = defaultdict(list)
     for li in all_lis:
-        order_sku_groups[(li.shopify_order_id, li.pick_sku)].append(li)
+        if li.shopify_sku:
+            order_sku_groups[(li.shopify_order_id, li.shopify_sku)].append(li)
 
-    # Filter to only groups with multiple distinct line_item_ids (the bug scenario)
+    # Find orders where the same shopify_sku has multiple distinct line_item_ids
     affected_order_ids: set = set()
-    for (order_id, pick_sku), lis in order_sku_groups.items():
+    for (order_id, sku), lis in order_sku_groups.items():
         distinct_li_ids = {li.line_item_id for li in lis}
         if len(distinct_li_ids) > 1:
             affected_order_ids.add(order_id)
@@ -2450,8 +2452,7 @@ def repair_duplicate_sku_fulfillments(
     if not affected_order_ids:
         return {"dry_run": dry_run, "affected_orders": 0, "results": []}
 
-    # Step 2: For each affected order, check if it was fulfilled by the app
-    # (has shipped/fulfilled boxes) and if BoxLineItems are wrong
+    # Step 2: For each affected order, check if it has shipped boxes and unfulfilled line items
     for order_id in sorted(affected_order_ids):
         plan = db.query(models.FulfillmentPlan).filter(
             models.FulfillmentPlan.shopify_order_id == order_id,
@@ -2472,123 +2473,174 @@ def repair_duplicate_sku_fulfillments(
         ).first()
         order_number = order.shopify_order_number if order else order_id
 
-        # Get all ShopifyLineItems for this order
+        # Get all ShopifyLineItems grouped by shopify_sku
         order_lis = db.query(models.ShopifyLineItem).filter(
             models.ShopifyLineItem.shopify_order_id == order_id,
-            models.ShopifyLineItem.sku_mapped == True,
-            models.ShopifyLineItem.pick_sku.isnot(None),
         ).all()
 
-        # Find pick_skus that have multiple line_item_ids
-        sku_to_lis: dict = defaultdict(list)
+        sku_to_li_ids: dict = defaultdict(set)
+        li_id_to_lis: dict = defaultdict(list)
         for li in order_lis:
-            sku_to_lis[li.pick_sku].append(li)
+            if li.shopify_sku:
+                sku_to_li_ids[li.shopify_sku].add(li.line_item_id)
+            li_id_to_lis[li.line_item_id].append(li)
 
+        # Find shopify_skus with duplicate line_item_ids
+        dup_skus = {sku: li_ids for sku, li_ids in sku_to_li_ids.items() if len(li_ids) > 1}
+        if not dup_skus:
+            continue
+
+        # Collect all line_item_ids referenced by shipped box items
+        shipped_box_li_ids: set = set()
+        shipped_box_tracking: dict = {}  # line_item_id → (tracking, carrier) from first box
         for box in shipped_boxes:
             box_items = db.query(models.BoxLineItem).filter(
                 models.BoxLineItem.box_id == box.id
             ).all()
-
             for bi in box_items:
-                if bi.pick_sku not in sku_to_lis:
-                    continue
-                lis_for_sku = sku_to_lis[bi.pick_sku]
-                distinct_li_ids = {li.line_item_id for li in lis_for_sku}
-                if len(distinct_li_ids) <= 1:
-                    continue
+                if bi.shopify_line_item_id:
+                    shipped_box_li_ids.add(bi.shopify_line_item_id)
+                    if bi.shopify_line_item_id not in shipped_box_tracking:
+                        shipped_box_tracking[bi.shopify_line_item_id] = (box.tracking_number, box.carrier, box.id, box.box_number)
 
-                # This BoxLineItem covers a pick_sku with multiple line_item_ids
-                # but only references one. Check if it's merged (qty covers multiple).
-                stored_li_id = bi.shopify_line_item_id
-                other_li_ids = [li_id for li_id in distinct_li_ids if li_id != stored_li_id]
+        # For each duplicate SKU, find orphaned line_item_ids not referenced by shipped boxes
+        for sku, li_ids in dup_skus.items():
+            referenced_li_ids = li_ids & shipped_box_li_ids
+            orphaned_li_ids = li_ids - shipped_box_li_ids
 
-                if not other_li_ids:
-                    continue
+            if not orphaned_li_ids or not referenced_li_ids:
+                continue
 
-                # Calculate expected pick units per line item
-                li_allocations = []
-                total_expected = 0.0
-                for li in lis_for_sku:
-                    qty = li.quantity or 0
-                    pick_units = qty * (li.mix_quantity or 1.0)
-                    li_allocations.append({
-                        "line_item_id": li.line_item_id,
-                        "shopify_qty": qty,
-                        "pick_units": pick_units,
-                        "mix_quantity": li.mix_quantity or 1.0,
-                    })
-                    total_expected += pick_units
+            # Check if orphaned line items are actually unfulfilled
+            unfulfilled_orphans = []
+            for orphan_id in orphaned_li_ids:
+                orphan_lis = li_id_to_lis.get(orphan_id, [])
+                # Check the first row for this line_item_id
+                first = orphan_lis[0] if orphan_lis else None
+                if first:
+                    fq = first.fulfillable_quantity
+                    if fq is not None and fq > 0:
+                        unfulfilled_orphans.append({
+                            "line_item_id": orphan_id,
+                            "shopify_qty": first.quantity or 0,
+                            "fulfillable_quantity": fq,
+                        })
+                    elif fq is None:
+                        # fulfillable_quantity not set — assume unfulfilled
+                        unfulfilled_orphans.append({
+                            "line_item_id": orphan_id,
+                            "shopify_qty": first.quantity or 0,
+                            "fulfillable_quantity": first.quantity or 0,
+                        })
 
-                # Only fix if the BoxLineItem qty matches the total (i.e. it was merged)
-                if abs(bi.quantity - total_expected) > 0.01:
-                    continue
+            if not unfulfilled_orphans:
+                continue
 
-                result_entry = {
-                    "order_id": order_id,
-                    "order_number": order_number,
-                    "box_id": box.id,
-                    "box_number": box.box_number,
-                    "tracking_number": box.tracking_number,
-                    "pick_sku": bi.pick_sku,
-                    "original_box_line_item_id": bi.id,
-                    "original_shopify_line_item_id": stored_li_id,
-                    "original_qty": bi.quantity,
-                    "split_into": li_allocations,
-                    "db_fixed": False,
-                    "shopify_fixed": False,
-                    "shopify_errors": [],
-                }
+            # Use tracking from the first referenced line_item_id's box
+            ref_li_id = next(iter(referenced_li_ids))
+            tracking_info = shipped_box_tracking.get(ref_li_id)
+            tracking = tracking_info[0] if tracking_info else None
+            carrier = tracking_info[1] if tracking_info else None
+            box_id = tracking_info[2] if tracking_info else None
+            box_number = tracking_info[3] if tracking_info else None
 
-                if not dry_run:
-                    # Fix DB: split the merged BoxLineItem into separate rows
-                    # Keep the existing row for the stored_li_id, update its qty
-                    # Add new rows for the other li_ids
-                    for alloc in li_allocations:
-                        if alloc["line_item_id"] == stored_li_id:
-                            bi.quantity = alloc["pick_units"]
+            result_entry = {
+                "order_id": order_id,
+                "order_number": order_number,
+                "shopify_sku": sku,
+                "box_id": box_id,
+                "box_number": box_number,
+                "tracking_number": tracking,
+                "carrier": carrier,
+                "referenced_line_item_ids": sorted(referenced_li_ids),
+                "orphaned_unfulfilled": unfulfilled_orphans,
+                "db_fixed": False,
+                "shopify_fixed": False,
+                "shopify_errors": [],
+            }
+
+            if not dry_run:
+                # Fix DB: For each orphan, add BoxLineItem rows to the shipped box
+                # mirroring the pick_sku expansion of the referenced line_item_id
+                if box_id:
+                    for orphan in unfulfilled_orphans:
+                        orphan_id = orphan["line_item_id"]
+                        orphan_pick_lis = [
+                            li for li in li_id_to_lis.get(orphan_id, [])
+                            if li.pick_sku
+                        ]
+                        if orphan_pick_lis:
+                            # Orphan has its own pick_sku expansion — use it
+                            for li in orphan_pick_lis:
+                                pick_units = (li.quantity or 0) * (li.mix_quantity or 1.0)
+                                if pick_units > 0:
+                                    db.add(models.BoxLineItem(
+                                        box_id=box_id,
+                                        pick_sku=li.pick_sku,
+                                        shopify_sku=li.shopify_sku,
+                                        product_title=li.product_title,
+                                        shopify_line_item_id=orphan_id,
+                                        quantity=pick_units,
+                                    ))
                         else:
-                            db.add(models.BoxLineItem(
-                                box_id=box.id,
-                                pick_sku=bi.pick_sku,
-                                shopify_sku=bi.shopify_sku,
-                                product_title=bi.product_title,
-                                shopify_line_item_id=alloc["line_item_id"],
-                                quantity=alloc["pick_units"],
-                            ))
+                            # No pick expansion — copy from the referenced line_item's box items
+                            ref_box_items = db.query(models.BoxLineItem).filter(
+                                models.BoxLineItem.box_id == box_id,
+                                models.BoxLineItem.shopify_line_item_id == ref_li_id,
+                            ).all()
+                            # Each ref item's qty covers all line items; split proportionally
+                            ref_total_shopify_qty = sum(
+                                (li_id_to_lis.get(r, [{}])[0].quantity or 0)
+                                if isinstance(r, str) else 0
+                                for r in referenced_li_ids
+                            ) or 1
+                            for rbi in ref_box_items:
+                                # The ref box item qty is for total units; split per line item
+                                orphan_qty = orphan["shopify_qty"]
+                                ref_li = li_id_to_lis.get(ref_li_id, [None])[0]
+                                ref_shopify_qty = (ref_li.quantity or 1) if ref_li else 1
+                                per_unit_pick = rbi.quantity / max(ref_shopify_qty, 1)
+                                new_qty = per_unit_pick * orphan_qty
+                                if new_qty > 0:
+                                    # Reduce the existing merged BoxLineItem
+                                    rbi.quantity -= new_qty
+                                    db.add(models.BoxLineItem(
+                                        box_id=box_id,
+                                        pick_sku=rbi.pick_sku,
+                                        shopify_sku=rbi.shopify_sku,
+                                        product_title=rbi.product_title,
+                                        shopify_line_item_id=orphan_id,
+                                        quantity=new_qty,
+                                    ))
                     db.flush()
                     result_entry["db_fixed"] = True
 
-                    # Fix Shopify: fulfill the orphaned line items with the same tracking
-                    if box.tracking_number and shopify_service.is_configured():
-                        orphaned_li_ids = [
-                            alloc["line_item_id"] for alloc in li_allocations
-                            if alloc["line_item_id"] != stored_li_id
-                        ]
-                        orphaned_qtys = {
-                            alloc["line_item_id"]: max(1, round(alloc["shopify_qty"]))
-                            for alloc in li_allocations
-                            if alloc["line_item_id"] != stored_li_id
-                        }
-                        if orphaned_li_ids:
-                            try:
-                                f_result = shopify_service.create_fulfillment_for_box(
-                                    shopify_order_id=order_id,
-                                    shopify_line_item_ids=orphaned_li_ids,
-                                    tracking_number=box.tracking_number,
-                                    carrier_code=box.carrier,
-                                    notify_customer=False,
-                                    line_item_quantities=orphaned_qtys,
-                                )
-                                if f_result:
-                                    result_entry["shopify_fixed"] = True
-                                else:
-                                    result_entry["shopify_errors"].append(
-                                        "Shopify fulfillment returned None (may already be fulfilled or no open items)"
-                                    )
-                            except Exception as e:
-                                result_entry["shopify_errors"].append(str(e))
+                # Fix Shopify: create fulfillment for orphaned line items
+                if tracking and shopify_service.is_configured():
+                    orphan_ids = [o["line_item_id"] for o in unfulfilled_orphans]
+                    orphan_qtys = {
+                        o["line_item_id"]: max(1, round(o["fulfillable_quantity"]))
+                        for o in unfulfilled_orphans
+                    }
+                    try:
+                        f_result = shopify_service.create_fulfillment_for_box(
+                            shopify_order_id=order_id,
+                            shopify_line_item_ids=orphan_ids,
+                            tracking_number=tracking,
+                            carrier_code=carrier,
+                            notify_customer=False,
+                            line_item_quantities=orphan_qtys,
+                        )
+                        if f_result:
+                            result_entry["shopify_fixed"] = True
+                        else:
+                            result_entry["shopify_errors"].append(
+                                "Shopify returned None — line items may already be fulfilled or no open fulfillment order"
+                            )
+                    except Exception as e:
+                        result_entry["shopify_errors"].append(str(e))
 
-                results.append(result_entry)
+            results.append(result_entry)
 
     if not dry_run:
         db.commit()
