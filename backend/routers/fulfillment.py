@@ -15,6 +15,8 @@ Change statuses: pending_approval | approved | rejected
 from datetime import datetime, timezone
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
 
 import csv
 import json
@@ -1593,8 +1595,8 @@ def bulk_reset_unpushed_by_orders(body: BulkPushRequest, db: Session = Depends(g
 def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
     """
     Push multiple orders' boxes to ShipStation in parallel, streaming progress
-    via Server-Sent Events.  ~8 concurrent workers keeps us under ShipStation's
-    40-req/60-s rate limit while cutting wall-clock time by ~8×.
+    via Server-Sent Events.  Rate-limited to ~35 req/60s (under ShipStation's
+    40-req/60-s cap) with automatic retry on 429 errors.
 
     SSE event types:
       start    → {"total": N}           (total orders to process)
@@ -1720,23 +1722,56 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
 
     total_orders = len(validated) + len(skip_results)
 
-    # ── Phase 2 & 3: parallel push + stream progress ────────────────────────
+    # ── Phase 2 & 3: rate-limited push + stream progress ─────────────────────
 
-    def _push_one_order(entry):
-        """Run in thread — only does HTTP, no DB access."""
-        results = []
-        for bt in entry["box_tasks"]:
+    # Rate limiter: max 35 requests per 60-second sliding window (ShipStation
+    # caps at 40/60s — leave headroom).  All threads share this.
+    _rate_lock = threading.Lock()
+    _rate_timestamps: list = []
+    _RATE_MAX = 35
+    _RATE_WINDOW = 60.0  # seconds
+
+    def _rate_wait():
+        """Block until we have a slot in the sliding window."""
+        while True:
+            with _rate_lock:
+                now = time.monotonic()
+                # Purge timestamps older than the window
+                while _rate_timestamps and _rate_timestamps[0] <= now - _RATE_WINDOW:
+                    _rate_timestamps.pop(0)
+                if len(_rate_timestamps) < _RATE_MAX:
+                    _rate_timestamps.append(now)
+                    return  # slot acquired
+                # Must wait — compute how long until the oldest slot expires
+                wait = _rate_timestamps[0] - (now - _RATE_WINDOW) + 0.1
+            time.sleep(wait)
+
+    def _push_one_box(order, bt):
+        """Push a single box with rate limiting and retry on 429."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            _rate_wait()
             try:
                 ss_result = shipstation_service.push_box(
-                    entry["order"], bt["box"].box_number, bt["items"],
+                    order, bt["box"].box_number, bt["items"],
                     weight_oz=bt["weight_oz"],
                     box_type=bt["box_type"],
                     carrier_code=bt["carrier_code"],
                     service_code=bt["service_code"],
                 )
-                results.append({"box_id": bt["box"].id, "success": True, "ss_result": ss_result})
+                return {"box_id": bt["box"].id, "success": True, "ss_result": ss_result}
             except Exception as e:
-                results.append({"box_id": bt["box"].id, "success": False, "error": str(e)})
+                err_str = str(e)
+                if "429" in err_str and attempt < max_retries - 1:
+                    time.sleep(5 * (attempt + 1))  # back off 5s, 10s
+                    continue
+                return {"box_id": bt["box"].id, "success": False, "error": err_str}
+
+    def _push_one_order(entry):
+        """Run in thread — only does HTTP, no DB access."""
+        results = []
+        for bt in entry["box_tasks"]:
+            results.append(_push_one_box(entry["order"], bt))
         return entry, results
 
     def _sse(event: str, data: dict) -> str:
@@ -1748,14 +1783,15 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
         pushed_count = 0
         failed_count = len(skip_results)
 
-        # Emit skipped orders as immediate progress
+        # Emit skipped orders as immediate progress (include skip reason)
         for sr in skip_results:
             yield _sse("progress", {
                 "pushed": pushed_count, "failed": failed_count,
                 "total": total_orders, "order_id": sr["order_id"], "success": False,
+                "error": sr.get("error", "Unknown"),
             })
 
-        # Push validated orders in parallel (8 workers)
+        # Push validated orders in parallel (8 workers, rate-limited)
         if validated:
             with ThreadPoolExecutor(max_workers=8) as pool:
                 futures = {pool.submit(_push_one_order, entry): entry for entry in validated}
@@ -1815,6 +1851,7 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                     yield _sse("progress", {
                         "pushed": pushed_count, "failed": failed_count,
                         "total": total_orders, "order_id": order_id, "success": success,
+                        **({"error": box_results[0].get("error")} if not success and box_results else {}),
                     })
 
         yield _sse("done", {"pushed": pushed_count, "failed": failed_count, "total": total_orders})

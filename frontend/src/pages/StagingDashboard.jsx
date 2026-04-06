@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ordersApi, inventoryApi, productsApi, fulfillmentApi, rulesApi, shipstationApi } from '../api'
 import InventoryDashboard from './InventoryDashboard'
@@ -233,6 +233,16 @@ function StagedOrdersTab() {
   const [selectedOrders, setSelectedOrders] = useState(new Set())
   const [collapsedTiers, setCollapsedTiers] = useState(new Set())
 
+  // Prune stale selections when orders data changes (e.g. after push)
+  useEffect(() => {
+    if (orders.length === 0) return
+    setSelectedOrders(prev => {
+      const validIds = new Set(orders.map(o => o.shopify_order_id))
+      const pruned = new Set([...prev].filter(id => validIds.has(id)))
+      return pruned.size === prev.size ? prev : pruned
+    })
+  }, [orders])
+
   // Streaming bulk push state
   const [pushState, setPushState] = useState({ active: false, pushed: 0, failed: 0, total: 0, done: false, error: null })
 
@@ -324,12 +334,16 @@ function StagedOrdersTab() {
       order_ids: ids,
       onProgress: (data) => {
         setPushState(prev => ({ ...prev, pushed: data.pushed, failed: data.failed, total: data.total }))
+        if (!data.success && data.error) {
+          console.warn(`Push skip: order ${data.order_id} — ${data.error}`)
+        }
       },
       onDone: (data) => {
         setPushState({ active: false, pushed: data.pushed, failed: data.failed, total: data.total, done: true, error: null })
+        setSelectedOrders(new Set())
         qc.invalidateQueries(['orders-staged'])
         if (data.failed > 0) {
-          alert(`${data.pushed} pushed, ${data.failed} failed`)
+          alert(`${data.pushed} pushed, ${data.failed} skipped/failed — check console for details`)
         }
       },
       onError: (err) => {
