@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ordersApi, inventoryApi, productsApi, fulfillmentApi, rulesApi, shipstationApi } from '../api'
 import InventoryDashboard from './InventoryDashboard'
@@ -243,10 +243,55 @@ function StagedOrdersTab() {
     })
   }, [orders])
 
-  // Streaming bulk push state
-  const [pushState, setPushState] = useState({ active: false, pushed: 0, failed: 0, total: 0, done: false, error: null })
+  // Streaming bulk push state (persists job_id to localStorage)
+  const [pushState, setPushState] = useState(() => {
+    const saved = localStorage.getItem('pushJob')
+    if (saved) {
+      try {
+        const { jobId } = JSON.parse(saved)
+        if (jobId) return { active: true, pushed: 0, failed: 0, total: 0, done: false, error: null, jobId }
+      } catch {}
+    }
+    return { active: false, pushed: 0, failed: 0, total: 0, done: false, error: null, jobId: null }
+  })
+  const pollRef = useRef(null)
 
-  // Legacy mutation kept as fallback but no longer used by default
+  // Poll for push progress on mount (reconnect after refresh)
+  useEffect(() => {
+    if (!pushState.jobId || pushState.done) return
+    // Already polling
+    if (pollRef.current) return
+
+    pollRef.current = setInterval(async () => {
+      try {
+        const status = await fulfillmentApi.getPushStatus(pushState.jobId)
+        setPushState(prev => ({
+          ...prev,
+          active: status.status === 'running',
+          pushed: status.pushed,
+          failed: status.failed,
+          total: status.total,
+          done: status.status === 'done',
+        }))
+        if (status.status === 'done') {
+          clearInterval(pollRef.current)
+          pollRef.current = null
+          localStorage.removeItem('pushJob')
+          setSelectedOrders(new Set())
+          qc.invalidateQueries(['orders-staged'])
+        }
+      } catch {
+        // Job expired or not found — clean up
+        clearInterval(pollRef.current)
+        pollRef.current = null
+        localStorage.removeItem('pushJob')
+        setPushState({ active: false, pushed: 0, failed: 0, total: 0, done: false, error: null, jobId: null })
+      }
+    }, 2000)
+
+    return () => { clearInterval(pollRef.current); pollRef.current = null }
+  }, [pushState.jobId, pushState.done])
+
   const pushMut = {
     isPending: pushState.active,
     isSuccess: pushState.done && !pushState.error,
@@ -329,9 +374,16 @@ function StagedOrdersTab() {
     const selectedList = sortedFiltered.filter(o => selectedOrders.has(o.shopify_order_id))
     const ids = selectedList.map(o => o.shopify_order_id)
     if (ids.length === 0) return
-    setPushState({ active: true, pushed: 0, failed: 0, total: ids.length, done: false, error: null })
+    setPushState({ active: true, pushed: 0, failed: 0, total: ids.length, done: false, error: null, jobId: null })
     fulfillmentApi.bulkPushStream({
       order_ids: ids,
+      onStart: (data) => {
+        // Persist job_id so we can reconnect after page refresh
+        if (data.job_id) {
+          localStorage.setItem('pushJob', JSON.stringify({ jobId: data.job_id }))
+          setPushState(prev => ({ ...prev, jobId: data.job_id, total: data.total }))
+        }
+      },
       onProgress: (data) => {
         setPushState(prev => ({ ...prev, pushed: data.pushed, failed: data.failed, total: data.total }))
         if (!data.success && data.error) {
@@ -339,7 +391,8 @@ function StagedOrdersTab() {
         }
       },
       onDone: (data) => {
-        setPushState({ active: false, pushed: data.pushed, failed: data.failed, total: data.total, done: true, error: null })
+        setPushState({ active: false, pushed: data.pushed, failed: data.failed, total: data.total, done: true, error: null, jobId: null })
+        localStorage.removeItem('pushJob')
         setSelectedOrders(new Set())
         qc.invalidateQueries(['orders-staged'])
         if (data.failed > 0) {
@@ -348,6 +401,7 @@ function StagedOrdersTab() {
       },
       onError: (err) => {
         setPushState(prev => ({ ...prev, active: false, done: false, error: err?.message || 'Unknown error' }))
+        localStorage.removeItem('pushJob')
         alert(`Push failed: ${err?.message || 'Unknown error'}`)
       },
     })

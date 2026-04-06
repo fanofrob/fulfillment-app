@@ -236,7 +236,7 @@ export const fulfillmentApi = {
   bulkPush: (data) => api.post('/fulfillment/bulk-push', data).then(r => r.data),
 
   // Streaming bulk push — returns an EventSource-like reader
-  bulkPushStream: ({ order_ids, onProgress, onDone, onError }) => {
+  bulkPushStream: ({ order_ids, onProgress, onStart, onDone, onError }) => {
     const ctrl = new AbortController()
     fetch('http://localhost:8000/api/fulfillment/bulk-push-stream', {
       method: 'POST',
@@ -264,9 +264,9 @@ export const fulfillmentApi = {
               eventType = line.slice(7).trim()
             } else if (line.startsWith('data: ')) {
               const data = JSON.parse(line.slice(6))
-              if (eventType === 'progress' && onProgress) onProgress(data)
+              if (eventType === 'start' && onStart) onStart(data)
+              else if (eventType === 'progress' && onProgress) onProgress(data)
               else if (eventType === 'done' && onDone) onDone(data)
-              else if (eventType === 'start' && onProgress) onProgress(data)
             }
           }
         }
@@ -276,6 +276,9 @@ export const fulfillmentApi = {
       })
     return ctrl // caller can call ctrl.abort() to cancel
   },
+
+  // Poll push job status (survives page refresh)
+  getPushStatus: (jobId) => api.get(`/fulfillment/bulk-push-status/${jobId}`).then(r => r.data),
 
   // Auto-create plans for all unplanned not_processed orders
   bulkAutoPlan: (orderIds) => api.post('/fulfillment/bulk-auto-plan', orderIds ? { order_ids: orderIds } : {}).then(r => r.data),
@@ -338,4 +341,14 @@ export const purchaseOrdersApi = {
   createFromProjection: (data) => api.post('/purchase-orders/from-projection', data).then(r => r.data),
   // On-order summary
   getOnOrder: (periodId) => api.get(`/purchase-orders/on-order/${periodId}`).then(r => r.data),
+}
+
+export const receivingApi = {
+  listForPO: (poId) => api.get(`/receiving/po/${poId}`).then(r => r.data),
+  receive: (poId, lineId, data) => api.post(`/receiving/po/${poId}/lines/${lineId}/receive`, data).then(r => r.data),
+  update: (recordId, data) => api.put(`/receiving/${recordId}`, data).then(r => r.data),
+  delete: (recordId) => api.delete(`/receiving/${recordId}`).then(r => r.data),
+  getSkusForProductType: (productType) => api.get(`/receiving/skus-for-product-type/${encodeURIComponent(productType)}`).then(r => r.data),
+  pushToInventory: (recordId, data) => api.post(`/receiving/${recordId}/push-to-inventory`, data || {}).then(r => r.data),
+  pushAll: (poId, data) => api.post(`/receiving/po/${poId}/push-all`, data || {}).then(r => r.data),
 }

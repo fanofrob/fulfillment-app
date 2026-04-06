@@ -17,6 +17,7 @@ from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
+import uuid
 
 import csv
 import json
@@ -33,6 +34,38 @@ import models
 from services import shipstation_service, sheets_service, shopify_service
 
 router = APIRouter()
+
+
+# ── ShipStation rate limiter (shared across all push operations) ─────────────
+_rate_lock = threading.Lock()
+_rate_timestamps: list = []
+_RATE_MAX = 35          # max requests per window (ShipStation caps at 40)
+_RATE_WINDOW = 60.0     # seconds
+
+
+def _ss_rate_wait():
+    """Block the calling thread until a rate-limit slot is available."""
+    while True:
+        with _rate_lock:
+            now = time.monotonic()
+            while _rate_timestamps and _rate_timestamps[0] <= now - _RATE_WINDOW:
+                _rate_timestamps.pop(0)
+            if len(_rate_timestamps) < _RATE_MAX:
+                _rate_timestamps.append(now)
+                return
+            wait = _rate_timestamps[0] - (now - _RATE_WINDOW) + 0.1
+        time.sleep(wait)
+
+
+# ── Background push-job tracker ──────────────────────────────────────────────
+_push_jobs: dict = {}   # job_id → {status, pushed, failed, total, …}
+
+
+def _cleanup_old_jobs():
+    stale = [jid for jid, j in _push_jobs.items()
+             if time.time() - j.get("started_at", 0) > 1800]
+    for jid in stale:
+        del _push_jobs[jid]
 
 
 # ── Request schemas ───────────────────────────────────────────────────────────
@@ -1594,14 +1627,17 @@ def bulk_reset_unpushed_by_orders(body: BulkPushRequest, db: Session = Depends(g
 @router.post("/bulk-push-stream")
 def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
     """
-    Push multiple orders' boxes to ShipStation in parallel, streaming progress
-    via Server-Sent Events.  Rate-limited to ~35 req/60s (under ShipStation's
-    40-req/60-s cap) with automatic retry on 429 errors.
+    Push multiple orders' boxes to ShipStation in a background thread,
+    streaming progress via SSE.  The push survives client disconnects —
+    reconnect via GET /bulk-push-status/{job_id} to resume watching.
+
+    Rate-limited to ~35 req/60s (under ShipStation's 40-req/60-s cap)
+    with automatic retry on 429 errors.
 
     SSE event types:
-      start    → {"total": N}           (total orders to process)
+      start    → {"total": N, "job_id": "…"}
       progress → {"pushed": P, "failed": F, "total": N, "order_id": "…", "success": bool}
-      done     → full summary identical to the old /bulk-push response
+      done     → {"pushed": P, "failed": F, "total": N, "job_id": "…"}
     """
     if not shipstation_service.is_configured():
         raise HTTPException(status_code=503, detail="ShipStation not configured")
@@ -1722,35 +1758,25 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
 
     total_orders = len(validated) + len(skip_results)
 
-    # ── Phase 2 & 3: rate-limited push + stream progress ─────────────────────
+    # ── Phase 2: launch background push thread ──────────────────────────────
 
-    # Rate limiter: max 35 requests per 60-second sliding window (ShipStation
-    # caps at 40/60s — leave headroom).  All threads share this.
-    _rate_lock = threading.Lock()
-    _rate_timestamps: list = []
-    _RATE_MAX = 35
-    _RATE_WINDOW = 60.0  # seconds
-
-    def _rate_wait():
-        """Block until we have a slot in the sliding window."""
-        while True:
-            with _rate_lock:
-                now = time.monotonic()
-                # Purge timestamps older than the window
-                while _rate_timestamps and _rate_timestamps[0] <= now - _RATE_WINDOW:
-                    _rate_timestamps.pop(0)
-                if len(_rate_timestamps) < _RATE_MAX:
-                    _rate_timestamps.append(now)
-                    return  # slot acquired
-                # Must wait — compute how long until the oldest slot expires
-                wait = _rate_timestamps[0] - (now - _RATE_WINDOW) + 0.1
-            time.sleep(wait)
+    _cleanup_old_jobs()
+    job_id = uuid.uuid4().hex[:8]
+    job = {
+        "status": "running",
+        "pushed": 0,
+        "failed": len(skip_results),
+        "total": total_orders,
+        "progress_log": [],       # list of {order_id, success, error?}
+        "started_at": time.time(),
+    }
+    _push_jobs[job_id] = job
 
     def _push_one_box(order, bt):
         """Push a single box with rate limiting and retry on 429."""
         max_retries = 3
         for attempt in range(max_retries):
-            _rate_wait()
+            _ss_rate_wait()
             try:
                 ss_result = shipstation_service.push_box(
                     order, bt["box"].box_number, bt["items"],
@@ -1763,36 +1789,19 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
             except Exception as e:
                 err_str = str(e)
                 if "429" in err_str and attempt < max_retries - 1:
-                    time.sleep(5 * (attempt + 1))  # back off 5s, 10s
+                    time.sleep(5 * (attempt + 1))
                     continue
                 return {"box_id": bt["box"].id, "success": False, "error": err_str}
 
     def _push_one_order(entry):
-        """Run in thread — only does HTTP, no DB access."""
         results = []
         for bt in entry["box_tasks"]:
             results.append(_push_one_box(entry["order"], bt))
         return entry, results
 
-    def _sse(event: str, data: dict) -> str:
-        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-    def generate():
-        yield _sse("start", {"total": total_orders})
-
-        pushed_count = 0
-        failed_count = len(skip_results)
-
-        # Emit skipped orders as immediate progress (include skip reason)
-        for sr in skip_results:
-            yield _sse("progress", {
-                "pushed": pushed_count, "failed": failed_count,
-                "total": total_orders, "order_id": sr["order_id"], "success": False,
-                "error": sr.get("error", "Unknown"),
-            })
-
-        # Push validated orders in parallel (8 workers, rate-limited)
-        if validated:
+    def _run_push():
+        """Background thread — pushes orders and updates DB."""
+        try:
             with ThreadPoolExecutor(max_workers=8) as pool:
                 futures = {pool.submit(_push_one_order, entry): entry for entry in validated}
                 for future in as_completed(futures):
@@ -1802,10 +1811,6 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                     boxes_pushed = sum(1 for r in box_results if r["success"])
                     boxes_failed = sum(1 for r in box_results if not r["success"])
 
-                    # Use a fresh DB session for updates — the original session
-                    # from Depends(get_db) may be closed by the time the
-                    # StreamingResponse generator runs, detaching ORM objects
-                    # so that modifications silently fail to persist.
                     gen_db = SessionLocal()
                     try:
                         order = gen_db.query(models.ShopifyOrder).filter(
@@ -1816,7 +1821,6 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                             models.FulfillmentPlan.status.notin_(["cancelled", "completed"]),
                         ).first()
 
-                        # Apply DB updates for this order
                         for br in box_results:
                             if br["success"]:
                                 box = gen_db.query(models.FulfillmentBox).filter(
@@ -1841,22 +1845,83 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                     finally:
                         gen_db.close()
 
-                    if boxes_failed == 0 and boxes_pushed > 0:
-                        pushed_count += 1
-                        success = True
+                    success = boxes_failed == 0 and boxes_pushed > 0
+                    if success:
+                        job["pushed"] += 1
                     else:
-                        failed_count += 1
-                        success = False
+                        job["failed"] += 1
 
-                    yield _sse("progress", {
-                        "pushed": pushed_count, "failed": failed_count,
-                        "total": total_orders, "order_id": order_id, "success": success,
+                    job["progress_log"].append({
+                        "order_id": order_id,
+                        "success": success,
                         **({"error": box_results[0].get("error")} if not success and box_results else {}),
                     })
+        except Exception as e:
+            print(f"[bulk-push] background thread error: {e}")
+        finally:
+            job["status"] = "done"
 
-        yield _sse("done", {"pushed": pushed_count, "failed": failed_count, "total": total_orders})
+    bg_thread = threading.Thread(target=_run_push, daemon=True)
+    bg_thread.start()
+
+    # ── Phase 3: SSE stream reads from job state ─────────────────────────────
+
+    def _sse(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    def generate():
+        yield _sse("start", {"total": total_orders, "job_id": job_id})
+
+        # Emit skipped orders immediately
+        for sr in skip_results:
+            yield _sse("progress", {
+                "pushed": job["pushed"], "failed": job["failed"],
+                "total": total_orders, "order_id": sr["order_id"],
+                "success": False, "error": sr.get("error", "Unknown"),
+            })
+
+        # Stream progress from background thread
+        last_idx = 0
+        while job["status"] == "running":
+            while last_idx < len(job["progress_log"]):
+                entry = job["progress_log"][last_idx]
+                last_idx += 1
+                yield _sse("progress", {
+                    "pushed": job["pushed"], "failed": job["failed"],
+                    "total": total_orders, **entry,
+                })
+            time.sleep(0.5)
+
+        # Drain any remaining entries
+        while last_idx < len(job["progress_log"]):
+            entry = job["progress_log"][last_idx]
+            last_idx += 1
+            yield _sse("progress", {
+                "pushed": job["pushed"], "failed": job["failed"],
+                "total": total_orders, **entry,
+            })
+
+        yield _sse("done", {
+            "pushed": job["pushed"], "failed": job["failed"],
+            "total": total_orders, "job_id": job_id,
+        })
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@router.get("/bulk-push-status/{job_id}")
+def get_push_status(job_id: str):
+    """Poll endpoint for push progress — survives page refresh."""
+    job = _push_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "pushed": job["pushed"],
+        "failed": job["failed"],
+        "total": job["total"],
+    }
 
 
 @router.post("/bulk-push")
