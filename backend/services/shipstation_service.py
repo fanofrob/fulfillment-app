@@ -214,7 +214,7 @@ def push_box(order, box_number: int, box_items, weight_oz=None, box_type=None, c
         if not item.pick_sku:
             continue
         if item.pick_sku in seen_skus:
-            ss_items[seen_skus[item.pick_sku]]["quantity"] += item.quantity
+            ss_items[seen_skus[item.pick_sku]]["quantity"] += int(item.quantity)
         else:
             idx = len(ss_items)
             seen_skus[item.pick_sku] = idx
