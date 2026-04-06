@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from database import get_db
+from database import get_db, SessionLocal
 import models
 from services import shipstation_service, sheets_service, shopify_service
 
@@ -95,33 +95,60 @@ def _plan_to_dict(plan, db: Session) -> dict:
     return {**_row(plan), "boxes": boxes_out, "pending_changes": [_row(c) for c in changes]}
 
 
+def _snap_to_json(snap: dict) -> dict:
+    """Convert {(pick_sku, li_id): qty} to JSON-safe {pick_sku||li_id: qty}."""
+    return {f"{k[0]}||{k[1]}": v for k, v in snap.items()}
+
+
+def _json_to_snap(json_dict: dict) -> dict:
+    """Convert JSON {pick_sku||li_id: qty} back to {(pick_sku, li_id): qty}.
+
+    Also handles legacy format {pick_sku: qty} (no separator).
+    """
+    result = {}
+    for k, v in json_dict.items():
+        if "||" in k:
+            parts = k.split("||", 1)
+            result[(parts[0], parts[1])] = v
+        else:
+            result[(k, "")] = v
+    return result
+
+
 def _shopify_items_snapshot(shopify_order_id: str, db: Session) -> dict:
-    """Return {pick_sku: total_quantity} from current ShopifyLineItems, excluding short-ship."""
+    """Return {(pick_sku, line_item_id): total_quantity_in_pick_units} from current ShopifyLineItems.
+
+    Using a composite key preserves line-item-level granularity so that
+    duplicate SKUs (different Shopify line item IDs) each get their own
+    BoxLineItem and are fulfilled individually in Shopify.
+    """
     items = db.query(models.ShopifyLineItem).filter(
         models.ShopifyLineItem.shopify_order_id == shopify_order_id,
         models.ShopifyLineItem.sku_mapped == True,
         models.ShopifyLineItem.pick_sku.isnot(None),
         or_(models.ShopifyLineItem.app_line_status != "short_ship", models.ShopifyLineItem.app_line_status.is_(None)),
     ).all()
-    totals: dict[str, float] = {}
+    totals: dict[tuple, float] = {}
     for li in items:
         qty = li.fulfillable_quantity if li.fulfillable_quantity is not None else li.quantity
         if qty <= 0:
             continue
         units = qty * (li.mix_quantity or 1.0)
-        totals[li.pick_sku] = totals.get(li.pick_sku, 0.0) + units
+        key = (li.pick_sku, li.line_item_id)
+        totals[key] = totals.get(key, 0.0) + units
     return totals
 
 
 def _plan_items_snapshot(plan_id: int, db: Session) -> dict:
-    """Return {pick_sku: total_quantity} summed across all boxes in the plan."""
+    """Return {(pick_sku, line_item_id): total_quantity} summed across all boxes in the plan."""
     boxes = db.query(models.FulfillmentBox).filter(
         models.FulfillmentBox.plan_id == plan_id
     ).all()
-    totals: dict[str, float] = {}
+    totals: dict[tuple, float] = {}
     for box in boxes:
         for item in db.query(models.BoxLineItem).filter(models.BoxLineItem.box_id == box.id).all():
-            totals[item.pick_sku] = totals.get(item.pick_sku, 0.0) + item.quantity
+            key = (item.pick_sku, item.shopify_line_item_id or "")
+            totals[key] = totals.get(key, 0.0) + item.quantity
     return totals
 
 
@@ -323,15 +350,15 @@ def _next_box_number(plan_id: int, db: Session) -> int:
 # ── Multi-box split helpers ───────────────────────────────────────────────────
 
 def _populate_box_items(box_id: int, items: dict, li_meta: dict, db: Session):
-    """Insert BoxLineItem rows from a {pick_sku: qty} dict."""
-    for pick_sku, qty in items.items():
-        meta = li_meta.get(pick_sku)
+    """Insert BoxLineItem rows from a {(pick_sku, line_item_id): qty} dict."""
+    for (pick_sku, line_item_id), qty in items.items():
+        meta = li_meta.get((pick_sku, line_item_id))
         db.add(models.BoxLineItem(
             box_id=box_id,
             pick_sku=pick_sku,
             shopify_sku=meta.shopify_sku if meta else None,
             product_title=meta.product_title if meta else None,
-            shopify_line_item_id=meta.line_item_id if meta else None,
+            shopify_line_item_id=line_item_id or None,
             quantity=qty,
         ))
 
@@ -446,6 +473,8 @@ def _compute_multi_box_split(
 
     # Build one "shopify unit" template per line-item group, then expand by qty.
     # Each entry in shopify_units represents 1 Shopify unit (atomic packing unit).
+    # Components use (pick_sku, line_item_id) composite keys so that duplicate SKUs
+    # with different line item IDs stay separate through bin-packing.
     shopify_units: list[dict] = []
 
     for li_id, rows in groups.items():
@@ -457,7 +486,7 @@ def _compute_multi_box_split(
 
         # Compute pactor and pick-qty contributed by this Shopify unit.
         pactor_per_unit = 0.0
-        components: dict = {}  # {pick_sku: pick_qty_per_shopify_unit}
+        components: dict = {}  # {(pick_sku, line_item_id): pick_qty_per_shopify_unit}
         skip = False
         for li in rows:
             ppu = pactor_map.get(li.pick_sku)
@@ -465,14 +494,15 @@ def _compute_multi_box_split(
                 skip = True
                 break
             mix = li.mix_quantity or 1.0
-            components[li.pick_sku] = components.get(li.pick_sku, 0.0) + mix
+            comp_key = (li.pick_sku, li_id)
+            components[comp_key] = components.get(comp_key, 0.0) + mix
             pactor_per_unit += mix * ppu
         if skip or not components:
             continue
 
         for _ in range(int(qty)):
             shopify_units.append({
-                "components": dict(components),  # {pick_sku: pick_qty}
+                "components": dict(components),  # {(pick_sku, li_id): pick_qty}
                 "item_pactor": pactor_per_unit,
             })
         frac = qty - int(qty)
@@ -493,10 +523,11 @@ def _compute_multi_box_split(
     errors = []
     seen_errors: set = set()
     for unit in shopify_units:
-        key = tuple(sorted(unit["components"].keys()))
-        if unit["item_pactor"] > max_cap + 1e-9 and key not in seen_errors:
-            seen_errors.add(key)
-            skus = ", ".join(sorted(unit["components"].keys()))
+        # Extract just pick_skus for error message dedup (ignore line_item_id)
+        pick_skus = tuple(sorted({k[0] for k in unit["components"].keys()}))
+        if unit["item_pactor"] > max_cap + 1e-9 and pick_skus not in seen_errors:
+            seen_errors.add(pick_skus)
+            skus = ", ".join(sorted({k[0] for k in unit["components"].keys()}))
             errors.append(
                 f"Item ({skus}) has per-unit pactor {unit['item_pactor']:.0f} which exceeds "
                 f"the largest available box capacity ({max_cap:.0f})"
@@ -523,8 +554,8 @@ def _compute_multi_box_split(
             bins.append(target)
 
         # Add all pick SKUs from this Shopify unit atomically
-        for pick_sku, pick_qty in unit["components"].items():
-            target["items"][pick_sku] = target["items"].get(pick_sku, 0.0) + pick_qty
+        for comp_key, pick_qty in unit["components"].items():
+            target["items"][comp_key] = target["items"].get(comp_key, 0.0) + pick_qty
         target["total_pactor"] += unit["item_pactor"]
 
     # Assign a box type to each bin based on its actual total pactor
@@ -621,14 +652,14 @@ def create_plan(body: PlanCreate, db: Session = Depends(get_db)):
 
     shopify_snap = _shopify_items_snapshot(body.shopify_order_id, db)
 
-    # Build lookup for title / shopify_sku per pick_sku
-    li_meta: dict[str, models.ShopifyLineItem] = {}
+    # Build lookup for title / shopify_sku per (pick_sku, line_item_id)
+    li_meta: dict[tuple, models.ShopifyLineItem] = {}
     for li in db.query(models.ShopifyLineItem).filter(
         models.ShopifyLineItem.shopify_order_id == body.shopify_order_id,
         models.ShopifyLineItem.sku_mapped == True,
         models.ShopifyLineItem.pick_sku.isnot(None),
     ).all():
-        li_meta.setdefault(li.pick_sku, li)
+        li_meta[(li.pick_sku, li.line_item_id)] = li
 
     auto_box_type_id = _apply_package_rules(order, db)
 
@@ -1703,9 +1734,9 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                     carrier_code=bt["carrier_code"],
                     service_code=bt["service_code"],
                 )
-                results.append({"box": bt["box"], "success": True, "ss_result": ss_result})
+                results.append({"box_id": bt["box"].id, "success": True, "ss_result": ss_result})
             except Exception as e:
-                results.append({"box": bt["box"], "success": False, "error": str(e)})
+                results.append({"box_id": bt["box"].id, "success": False, "error": str(e)})
         return entry, results
 
     def _sse(event: str, data: dict) -> str:
@@ -1730,31 +1761,49 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                 futures = {pool.submit(_push_one_order, entry): entry for entry in validated}
                 for future in as_completed(futures):
                     entry, box_results = future.result()
-                    order = entry["order"]
-                    plan = entry["plan"]
                     order_id = entry["order_id"]
 
                     boxes_pushed = sum(1 for r in box_results if r["success"])
                     boxes_failed = sum(1 for r in box_results if not r["success"])
 
-                    # Apply DB updates for this order
-                    for br in box_results:
-                        if br["success"]:
-                            br["box"].shipstation_order_id = str(br["ss_result"].get("orderId", ""))
-                            br["box"].shipstation_order_key = br["ss_result"].get("orderKey", "")
-                            br["box"].status = "packed"
+                    # Use a fresh DB session for updates — the original session
+                    # from Depends(get_db) may be closed by the time the
+                    # StreamingResponse generator runs, detaching ORM objects
+                    # so that modifications silently fail to persist.
+                    gen_db = SessionLocal()
+                    try:
+                        order = gen_db.query(models.ShopifyOrder).filter(
+                            models.ShopifyOrder.shopify_order_id == order_id
+                        ).first()
+                        plan = gen_db.query(models.FulfillmentPlan).filter(
+                            models.FulfillmentPlan.shopify_order_id == order_id,
+                            models.FulfillmentPlan.status.notin_(["cancelled", "completed"]),
+                        ).first()
 
-                    if boxes_pushed > 0 and plan.status == "draft":
-                        plan.status = "active"
+                        # Apply DB updates for this order
+                        for br in box_results:
+                            if br["success"]:
+                                box = gen_db.query(models.FulfillmentBox).filter(
+                                    models.FulfillmentBox.id == br["box_id"]
+                                ).first()
+                                if box:
+                                    box.shipstation_order_id = str(br["ss_result"].get("orderId", ""))
+                                    box.shipstation_order_key = br["ss_result"].get("orderKey", "")
+                                    box.status = "packed"
 
-                    if boxes_pushed > 0 and order and order.app_status == "staged":
-                        order.app_status = "in_shipstation_not_shipped"
-                        db.flush()
-                        from routers.inventory import _auto_deduct_on_ship, _recompute_committed as _rc
-                        _auto_deduct_on_ship(order, db)
-                        _rc(order.assigned_warehouse, db)
+                        if boxes_pushed > 0 and plan and plan.status == "draft":
+                            plan.status = "active"
 
-                    db.commit()
+                        if boxes_pushed > 0 and order and order.app_status == "staged":
+                            order.app_status = "in_shipstation_not_shipped"
+                            gen_db.flush()
+                            from routers.inventory import _auto_deduct_on_ship, _recompute_committed as _rc
+                            _auto_deduct_on_ship(order, gen_db)
+                            _rc(order.assigned_warehouse, gen_db)
+
+                        gen_db.commit()
+                    finally:
+                        gen_db.close()
 
                     if boxes_failed == 0 and boxes_pushed > 0:
                         pushed_count += 1
@@ -1975,13 +2024,13 @@ def bulk_auto_plan(body: BulkAutoPlanRequest = BulkAutoPlanRequest(), db: Sessio
                 db.flush()
 
                 shopify_snap = _shopify_items_snapshot(order.shopify_order_id, db)
-                li_meta: dict[str, models.ShopifyLineItem] = {}
+                li_meta: dict[tuple, models.ShopifyLineItem] = {}
                 for li in db.query(models.ShopifyLineItem).filter(
                     models.ShopifyLineItem.shopify_order_id == order.shopify_order_id,
                     models.ShopifyLineItem.sku_mapped == True,
                     models.ShopifyLineItem.pick_sku.isnot(None),
                 ).all():
-                    li_meta.setdefault(li.pick_sku, li)
+                    li_meta[(li.pick_sku, li.line_item_id)] = li
 
                 box_type_matched = auto_box_type_id is not None
                 if auto_box_type_id is not None:
@@ -2039,13 +2088,13 @@ def bulk_auto_plan(body: BulkAutoPlanRequest = BulkAutoPlanRequest(), db: Sessio
                 if not active_boxes:
                     # Case 2: no boxes left to ship (all cancelled/shipped) — add next box for remaining items
                     shopify_snap = _shopify_items_snapshot(order.shopify_order_id, db)
-                    li_meta: dict[str, models.ShopifyLineItem] = {}
+                    li_meta: dict[tuple, models.ShopifyLineItem] = {}
                     for li in db.query(models.ShopifyLineItem).filter(
                         models.ShopifyLineItem.shopify_order_id == order.shopify_order_id,
                         models.ShopifyLineItem.sku_mapped == True,
                         models.ShopifyLineItem.pick_sku.isnot(None),
                     ).all():
-                        li_meta.setdefault(li.pick_sku, li)
+                        li_meta[(li.pick_sku, li.line_item_id)] = li
 
                     box_type_matched = auto_box_type_id is not None
                     next_num = _next_box_number(plan.id, db)
@@ -2122,13 +2171,13 @@ def bulk_auto_plan(body: BulkAutoPlanRequest = BulkAutoPlanRequest(), db: Sessio
                             db.flush()
 
                             shopify_snap = _shopify_items_snapshot(order.shopify_order_id, db)
-                            li_meta: dict[str, models.ShopifyLineItem] = {}
+                            li_meta: dict[tuple, models.ShopifyLineItem] = {}
                             for li in db.query(models.ShopifyLineItem).filter(
                                 models.ShopifyLineItem.shopify_order_id == order.shopify_order_id,
                                 models.ShopifyLineItem.sku_mapped == True,
                                 models.ShopifyLineItem.pick_sku.isnot(None),
                             ).all():
-                                li_meta.setdefault(li.pick_sku, li)
+                                li_meta[(li.pick_sku, li.line_item_id)] = li
 
                             for i, box_def in enumerate(split_boxes, start=1):
                                 box = models.FulfillmentBox(plan_id=plan.id, box_number=i, status="pending", box_type_id=box_def["box_type_id"])
@@ -2244,8 +2293,8 @@ def detect_changes(
             db.add(models.LineItemChangeEvent(
                 plan_id=plan.id,
                 shopify_order_id=plan.shopify_order_id,
-                old_line_items=plan_snap,
-                new_line_items=shopify_snap,
+                old_line_items=_snap_to_json(plan_snap),
+                new_line_items=_snap_to_json(shopify_snap),
             ))
             plan.status = "needs_review"
             changes_detected += 1
@@ -2308,23 +2357,24 @@ def approve_change(change_id: int, body: ChangeReview, db: Session = Depends(get
 
         if unshipped_boxes:
             # Build title/sku lookup from current ShopifyLineItems
-            li_meta: dict[str, models.ShopifyLineItem] = {}
+            li_meta: dict[tuple, models.ShopifyLineItem] = {}
             for li in db.query(models.ShopifyLineItem).filter(
                 models.ShopifyLineItem.shopify_order_id == event.shopify_order_id,
                 models.ShopifyLineItem.sku_mapped == True,
                 models.ShopifyLineItem.pick_sku.isnot(None),
             ).all():
-                li_meta.setdefault(li.pick_sku, li)
+                li_meta[(li.pick_sku, li.line_item_id)] = li
 
             first_box = unshipped_boxes[0]
-            for pick_sku, qty in event.new_line_items.items():
-                meta = li_meta.get(pick_sku)
+            new_items = _json_to_snap(event.new_line_items)
+            for (pick_sku, line_item_id), qty in new_items.items():
+                meta = li_meta.get((pick_sku, line_item_id))
                 db.add(models.BoxLineItem(
                     box_id=first_box.id,
                     pick_sku=pick_sku,
                     shopify_sku=meta.shopify_sku if meta else None,
                     product_title=meta.product_title if meta else None,
-                    shopify_line_item_id=meta.line_item_id if meta else None,
+                    shopify_line_item_id=line_item_id or None,
                     quantity=qty,
                 ))
 
@@ -2356,3 +2406,196 @@ def reject_change(change_id: int, body: ChangeReview, db: Session = Depends(get_
 
     db.commit()
     return _row(event)
+
+
+# ── One-time repair: duplicate-SKU fulfillment bug ──────────────────────────
+
+@router.post("/repair-duplicate-sku-fulfillments")
+def repair_duplicate_sku_fulfillments(
+    dry_run: bool = True,
+    db: Session = Depends(get_db),
+):
+    """
+    Find and fix orders where multiple Shopify line items share the same pick_sku
+    but only one line_item_id was stored on BoxLineItems, causing the other(s) to
+    remain unfulfilled in Shopify.
+
+    When dry_run=True (default), reports what would be fixed without making changes.
+    When dry_run=False, fixes BoxLineItems in the DB and creates Shopify fulfillments.
+    """
+    from services import shopify_service
+    from collections import defaultdict
+
+    results = []
+
+    # Step 1: Find orders with duplicate pick_sku across different line_item_ids
+    # that were fulfilled by the app (have shipped/fulfilled boxes)
+    all_lis = db.query(models.ShopifyLineItem).filter(
+        models.ShopifyLineItem.sku_mapped == True,
+        models.ShopifyLineItem.pick_sku.isnot(None),
+    ).all()
+
+    # Group by (shopify_order_id, pick_sku) → list of line items
+    order_sku_groups: dict = defaultdict(list)
+    for li in all_lis:
+        order_sku_groups[(li.shopify_order_id, li.pick_sku)].append(li)
+
+    # Filter to only groups with multiple distinct line_item_ids (the bug scenario)
+    affected_order_ids: set = set()
+    for (order_id, pick_sku), lis in order_sku_groups.items():
+        distinct_li_ids = {li.line_item_id for li in lis}
+        if len(distinct_li_ids) > 1:
+            affected_order_ids.add(order_id)
+
+    if not affected_order_ids:
+        return {"dry_run": dry_run, "affected_orders": 0, "results": []}
+
+    # Step 2: For each affected order, check if it was fulfilled by the app
+    # (has shipped/fulfilled boxes) and if BoxLineItems are wrong
+    for order_id in sorted(affected_order_ids):
+        plan = db.query(models.FulfillmentPlan).filter(
+            models.FulfillmentPlan.shopify_order_id == order_id,
+            models.FulfillmentPlan.status.notin_(["cancelled"]),
+        ).first()
+        if not plan:
+            continue
+
+        shipped_boxes = db.query(models.FulfillmentBox).filter(
+            models.FulfillmentBox.plan_id == plan.id,
+            models.FulfillmentBox.status.in_(["shipped", "fulfilled"]),
+        ).all()
+        if not shipped_boxes:
+            continue
+
+        order = db.query(models.ShopifyOrder).filter(
+            models.ShopifyOrder.shopify_order_id == order_id
+        ).first()
+        order_number = order.shopify_order_number if order else order_id
+
+        # Get all ShopifyLineItems for this order
+        order_lis = db.query(models.ShopifyLineItem).filter(
+            models.ShopifyLineItem.shopify_order_id == order_id,
+            models.ShopifyLineItem.sku_mapped == True,
+            models.ShopifyLineItem.pick_sku.isnot(None),
+        ).all()
+
+        # Find pick_skus that have multiple line_item_ids
+        sku_to_lis: dict = defaultdict(list)
+        for li in order_lis:
+            sku_to_lis[li.pick_sku].append(li)
+
+        for box in shipped_boxes:
+            box_items = db.query(models.BoxLineItem).filter(
+                models.BoxLineItem.box_id == box.id
+            ).all()
+
+            for bi in box_items:
+                if bi.pick_sku not in sku_to_lis:
+                    continue
+                lis_for_sku = sku_to_lis[bi.pick_sku]
+                distinct_li_ids = {li.line_item_id for li in lis_for_sku}
+                if len(distinct_li_ids) <= 1:
+                    continue
+
+                # This BoxLineItem covers a pick_sku with multiple line_item_ids
+                # but only references one. Check if it's merged (qty covers multiple).
+                stored_li_id = bi.shopify_line_item_id
+                other_li_ids = [li_id for li_id in distinct_li_ids if li_id != stored_li_id]
+
+                if not other_li_ids:
+                    continue
+
+                # Calculate expected pick units per line item
+                li_allocations = []
+                total_expected = 0.0
+                for li in lis_for_sku:
+                    qty = li.quantity or 0
+                    pick_units = qty * (li.mix_quantity or 1.0)
+                    li_allocations.append({
+                        "line_item_id": li.line_item_id,
+                        "shopify_qty": qty,
+                        "pick_units": pick_units,
+                        "mix_quantity": li.mix_quantity or 1.0,
+                    })
+                    total_expected += pick_units
+
+                # Only fix if the BoxLineItem qty matches the total (i.e. it was merged)
+                if abs(bi.quantity - total_expected) > 0.01:
+                    continue
+
+                result_entry = {
+                    "order_id": order_id,
+                    "order_number": order_number,
+                    "box_id": box.id,
+                    "box_number": box.box_number,
+                    "tracking_number": box.tracking_number,
+                    "pick_sku": bi.pick_sku,
+                    "original_box_line_item_id": bi.id,
+                    "original_shopify_line_item_id": stored_li_id,
+                    "original_qty": bi.quantity,
+                    "split_into": li_allocations,
+                    "db_fixed": False,
+                    "shopify_fixed": False,
+                    "shopify_errors": [],
+                }
+
+                if not dry_run:
+                    # Fix DB: split the merged BoxLineItem into separate rows
+                    # Keep the existing row for the stored_li_id, update its qty
+                    # Add new rows for the other li_ids
+                    for alloc in li_allocations:
+                        if alloc["line_item_id"] == stored_li_id:
+                            bi.quantity = alloc["pick_units"]
+                        else:
+                            db.add(models.BoxLineItem(
+                                box_id=box.id,
+                                pick_sku=bi.pick_sku,
+                                shopify_sku=bi.shopify_sku,
+                                product_title=bi.product_title,
+                                shopify_line_item_id=alloc["line_item_id"],
+                                quantity=alloc["pick_units"],
+                            ))
+                    db.flush()
+                    result_entry["db_fixed"] = True
+
+                    # Fix Shopify: fulfill the orphaned line items with the same tracking
+                    if box.tracking_number and shopify_service.is_configured():
+                        orphaned_li_ids = [
+                            alloc["line_item_id"] for alloc in li_allocations
+                            if alloc["line_item_id"] != stored_li_id
+                        ]
+                        orphaned_qtys = {
+                            alloc["line_item_id"]: max(1, round(alloc["shopify_qty"]))
+                            for alloc in li_allocations
+                            if alloc["line_item_id"] != stored_li_id
+                        }
+                        if orphaned_li_ids:
+                            try:
+                                f_result = shopify_service.create_fulfillment_for_box(
+                                    shopify_order_id=order_id,
+                                    shopify_line_item_ids=orphaned_li_ids,
+                                    tracking_number=box.tracking_number,
+                                    carrier_code=box.carrier,
+                                    notify_customer=False,
+                                    line_item_quantities=orphaned_qtys,
+                                )
+                                if f_result:
+                                    result_entry["shopify_fixed"] = True
+                                else:
+                                    result_entry["shopify_errors"].append(
+                                        "Shopify fulfillment returned None (may already be fulfilled or no open items)"
+                                    )
+                            except Exception as e:
+                                result_entry["shopify_errors"].append(str(e))
+
+                results.append(result_entry)
+
+    if not dry_run:
+        db.commit()
+
+    return {
+        "dry_run": dry_run,
+        "affected_orders": len({r["order_id"] for r in results}),
+        "fixes": len(results),
+        "results": results,
+    }
