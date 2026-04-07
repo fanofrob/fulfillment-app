@@ -606,6 +606,44 @@ export default function Orders() {
     },
   })
 
+  // ── Bulk cancel ShipStation boxes ──────────────────────────────────────────
+  const [cancelSSModal, setCancelSSModal] = useState(null) // { step: 1|2|3, preview: {...} }
+  const [cancelConfirmText, setCancelConfirmText] = useState('')
+
+  const bulkCancelSSMutation = useMutation({
+    mutationFn: (order_ids) => ordersApi.bulkCancelSSBoxes(order_ids),
+    onSuccess: (data) => {
+      qc.invalidateQueries(['orders'])
+      qc.invalidateQueries(['plans'])
+      qc.invalidateQueries(['inventory'])
+      setSelectedForBatch(new Set())
+      setCancelSSModal(null)
+      setCancelConfirmText('')
+      const warnings = data.total_warnings > 0 ? ` (${data.total_warnings} ShipStation warnings — check manually)` : ''
+      alert(`Cancelled ${data.total_boxes_cancelled} box${data.total_boxes_cancelled !== 1 ? 'es' : ''} across ${data.total_orders} order${data.total_orders !== 1 ? 's' : ''}. Inventory restored.${warnings}`)
+    },
+    onError: (err) => {
+      setCancelSSModal(null)
+      setCancelConfirmText('')
+      alert(`Cancel failed: ${err.response?.data?.detail || err.message}`)
+    },
+  })
+
+  async function startBulkCancelSS() {
+    const ids = [...selectedForBatch]
+    if (ids.length === 0) return
+    try {
+      const preview = await ordersApi.bulkCancelSSBoxesPreview(ids)
+      if (preview.total_boxes === 0) {
+        alert('No cancellable ShipStation boxes found for the selected orders.')
+        return
+      }
+      setCancelSSModal({ step: 1, preview, orderIds: ids })
+    } catch (err) {
+      alert(`Preview failed: ${err.response?.data?.detail || err.message}`)
+    }
+  }
+
   const isOrderHeld = (order) => {
     if (order.shopify_hold) return true
     const tags = (order.tags || '').split(',').map(t => t.trim().toLowerCase()).filter(Boolean)
@@ -892,6 +930,20 @@ export default function Orders() {
                 {unstageBatchMutation.isPending ? 'Removing…' : `✕ Remove Selected${selectedForBatch.size > 0 ? ` (${selectedForBatch.size})` : ''}`}
               </button>
             )}
+            {statusFilter === 'in_shipstation_not_shipped' && (
+              <button
+                className="btn btn-danger"
+                onClick={startBulkCancelSS}
+                disabled={bulkCancelSSMutation.isPending || selectedForBatch.size === 0}
+                title={selectedForBatch.size === 0
+                  ? 'Select orders with checkboxes to cancel their ShipStation boxes'
+                  : `Cancel ShipStation boxes for ${selectedForBatch.size} selected order${selectedForBatch.size !== 1 ? 's' : ''}`}
+              >
+                {bulkCancelSSMutation.isPending
+                  ? 'Cancelling…'
+                  : `✕ Cancel ShipStation${selectedForBatch.size > 0 ? ` (${selectedForBatch.size})` : ''}`}
+              </button>
+            )}
             <button
               className="btn btn-secondary"
               onClick={() => {
@@ -1110,6 +1162,87 @@ export default function Orders() {
           holdTags={holdTags}
           ssConfigured={ssStatus?.configured}
         />
+      )}
+
+      {/* Triple-confirm modal for bulk cancel ShipStation boxes */}
+      {cancelSSModal && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 9999,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }} onClick={() => { setCancelSSModal(null); setCancelConfirmText('') }}>
+          <div style={{
+            background: '#fff', borderRadius: 12, padding: 28, maxWidth: 480, width: '90%',
+            boxShadow: '0 8px 32px rgba(0,0,0,0.2)',
+          }} onClick={e => e.stopPropagation()}>
+
+            {cancelSSModal.step === 1 && (
+              <>
+                <h3 style={{ margin: '0 0 12px', color: '#dc2626' }}>Cancel ShipStation Boxes</h3>
+                <p style={{ margin: '0 0 8px', fontSize: 14, color: '#374151' }}>
+                  You are about to cancel <strong>{cancelSSModal.preview.total_boxes} box{cancelSSModal.preview.total_boxes !== 1 ? 'es' : ''}</strong> across <strong>{cancelSSModal.preview.total_orders} order{cancelSSModal.preview.total_orders !== 1 ? 's' : ''}</strong> in ShipStation.
+                </p>
+                <div style={{ maxHeight: 180, overflowY: 'auto', margin: '12px 0', fontSize: 13, color: '#6b7280', border: '1px solid #e5e7eb', borderRadius: 6, padding: 8 }}>
+                  {cancelSSModal.preview.orders.map(o => (
+                    <div key={o.shopify_order_id}>#{o.order_number?.toString().replace(/^#/, '')} — {o.cancellable_boxes} box{o.cancellable_boxes !== 1 ? 'es' : ''}</div>
+                  ))}
+                </div>
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
+                  <button className="btn btn-secondary" onClick={() => { setCancelSSModal(null); setCancelConfirmText('') }}>No, go back</button>
+                  <button className="btn btn-danger" onClick={() => setCancelSSModal(m => ({ ...m, step: 2 }))}>Yes, continue</button>
+                </div>
+              </>
+            )}
+
+            {cancelSSModal.step === 2 && (
+              <>
+                <h3 style={{ margin: '0 0 12px', color: '#dc2626' }}>Are you absolutely sure?</h3>
+                <p style={{ margin: '0 0 4px', fontSize: 14, color: '#374151' }}>
+                  This will:
+                </p>
+                <ul style={{ margin: '4px 0 12px', fontSize: 13, color: '#374151', paddingLeft: 20 }}>
+                  <li>Void {cancelSSModal.preview.total_boxes} box{cancelSSModal.preview.total_boxes !== 1 ? 'es' : ''} in ShipStation</li>
+                  <li>Mark them as cancelled in the app</li>
+                  <li>Restore allocated inventory back to available stock</li>
+                  <li>Recalculate order statuses</li>
+                </ul>
+                <p style={{ margin: '0 0 0', fontSize: 13, color: '#9ca3af' }}>
+                  Already-shipped and pending boxes will not be affected.
+                </p>
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
+                  <button className="btn btn-secondary" onClick={() => setCancelSSModal(m => ({ ...m, step: 1 }))}>Go back</button>
+                  <button className="btn btn-danger" onClick={() => setCancelSSModal(m => ({ ...m, step: 3 }))}>Yes, I'm sure</button>
+                </div>
+              </>
+            )}
+
+            {cancelSSModal.step === 3 && (
+              <>
+                <h3 style={{ margin: '0 0 12px', color: '#dc2626' }}>Final confirmation</h3>
+                <p style={{ margin: '0 0 12px', fontSize: 14, color: '#374151' }}>
+                  Type <strong>CANCEL</strong> below to confirm cancellation of {cancelSSModal.preview.total_boxes} ShipStation box{cancelSSModal.preview.total_boxes !== 1 ? 'es' : ''}.
+                </p>
+                <input
+                  type="text"
+                  value={cancelConfirmText}
+                  onChange={e => setCancelConfirmText(e.target.value)}
+                  placeholder='Type "CANCEL" to confirm'
+                  autoFocus
+                  style={{ width: '100%', padding: '8px 12px', border: '1px solid #d1d5db', borderRadius: 6, fontSize: 14, boxSizing: 'border-box' }}
+                />
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
+                  <button className="btn btn-secondary" onClick={() => { setCancelSSModal(null); setCancelConfirmText('') }}>Abort</button>
+                  <button
+                    className="btn btn-danger"
+                    disabled={cancelConfirmText !== 'CANCEL' || bulkCancelSSMutation.isPending}
+                    onClick={() => bulkCancelSSMutation.mutate(cancelSSModal.orderIds)}
+                  >
+                    {bulkCancelSSMutation.isPending ? 'Cancelling…' : 'Confirm Cancel'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
       )}
     </div>
   )

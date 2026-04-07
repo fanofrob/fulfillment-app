@@ -1068,6 +1068,182 @@ def cancel_order(shopify_order_id: str, db: Session = Depends(get_db)):
     }
 
 
+# ── Bulk cancel ShipStation boxes ─────────────────────────────────────────────
+
+@router.post("/bulk-cancel-shipstation-boxes/preview")
+def preview_bulk_cancel_ss_boxes(
+    body: schemas.BulkCancelSSBoxesRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Preview how many boxes would be cancelled for the given orders.
+    Returns per-order box counts without making any changes.
+    """
+    results = []
+    total_boxes = 0
+
+    for order_id in body.order_ids:
+        order = db.query(models.ShopifyOrder).filter(
+            models.ShopifyOrder.shopify_order_id == order_id
+        ).first()
+        if not order:
+            continue
+
+        plan = db.query(models.FulfillmentPlan).filter(
+            models.FulfillmentPlan.shopify_order_id == order_id
+        ).first()
+        if not plan:
+            continue
+
+        # Count boxes that are pushed to SS but not yet shipped/fulfilled/cancelled
+        cancellable_boxes = db.query(models.FulfillmentBox).filter(
+            models.FulfillmentBox.plan_id == plan.id,
+            models.FulfillmentBox.shipstation_order_id.isnot(None),
+            models.FulfillmentBox.status.notin_(["shipped", "fulfilled", "cancelled"]),
+        ).count()
+
+        if cancellable_boxes > 0:
+            results.append({
+                "shopify_order_id": order_id,
+                "order_number": order.shopify_order_number,
+                "cancellable_boxes": cancellable_boxes,
+            })
+            total_boxes += cancellable_boxes
+
+    return {
+        "total_orders": len(results),
+        "total_boxes": total_boxes,
+        "orders": results,
+    }
+
+
+@router.post("/bulk-cancel-shipstation-boxes")
+def bulk_cancel_ss_boxes(
+    body: schemas.BulkCancelSSBoxesRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Cancel only the 'in ShipStation' (pushed, not shipped) boxes for the given orders.
+
+    For each order:
+      1. Find boxes with shipstation_order_id that are not shipped/fulfilled/cancelled.
+      2. Void each in ShipStation via DELETE.
+      3. Mark box status = 'cancelled'.
+      4. Restore inventory (ship_deduct reversals).
+      5. Recalculate order app_status based on remaining boxes.
+    """
+    from services import shipstation_service
+    from routers.inventory import _restore_inventory_on_cancel, _recompute_committed
+
+    per_order = []
+    affected_warehouses = set()
+
+    for order_id in body.order_ids:
+        order = db.query(models.ShopifyOrder).filter(
+            models.ShopifyOrder.shopify_order_id == order_id
+        ).first()
+        if not order:
+            per_order.append({"shopify_order_id": order_id, "boxes_cancelled": 0, "warnings": ["Order not found"]})
+            continue
+
+        plan = db.query(models.FulfillmentPlan).filter(
+            models.FulfillmentPlan.shopify_order_id == order_id
+        ).first()
+        if not plan:
+            per_order.append({"shopify_order_id": order_id, "boxes_cancelled": 0, "warnings": ["No plan found"]})
+            continue
+
+        # Find boxes pushed to SS but not yet shipped/fulfilled/cancelled
+        cancellable = db.query(models.FulfillmentBox).filter(
+            models.FulfillmentBox.plan_id == plan.id,
+            models.FulfillmentBox.shipstation_order_id.isnot(None),
+            models.FulfillmentBox.status.notin_(["shipped", "fulfilled", "cancelled"]),
+        ).all()
+
+        if not cancellable:
+            per_order.append({"shopify_order_id": order_id, "boxes_cancelled": 0, "warnings": ["No cancellable boxes"]})
+            continue
+
+        ss_errors = []
+        cancelled_count = 0
+
+        for box in cancellable:
+            try:
+                shipstation_service.cancel_order(box.shipstation_order_id)
+            except Exception as e:
+                ss_errors.append(f"Box {box.box_number} SS cancel failed: {e}")
+            # Mark cancelled locally even if SS call failed (same pattern as single cancel)
+            box.status = "cancelled"
+            cancelled_count += 1
+
+        db.flush()
+
+        # Also cancel order-level SS push if present
+        if order.shipstation_order_id:
+            try:
+                shipstation_service.cancel_order(order.shipstation_order_id)
+            except Exception:
+                pass  # best-effort; box-level is the important one
+            order.shipstation_order_id = None
+            order.shipstation_order_key = None
+
+        # Restore inventory
+        _restore_inventory_on_cancel(order, db)
+
+        # Recalculate order status based on remaining active boxes
+        remaining_active = db.query(models.FulfillmentBox).filter(
+            models.FulfillmentBox.plan_id == plan.id,
+            models.FulfillmentBox.status.notin_(["cancelled"]),
+        ).all()
+
+        shipped_count = sum(1 for b in remaining_active if b.status == "shipped")
+        fulfilled_count = sum(1 for b in remaining_active if b.status == "fulfilled")
+        pending_count = sum(1 for b in remaining_active if b.status in ("pending", "packed"))
+
+        if len(remaining_active) == 0:
+            # No boxes left — full reset
+            order.app_status = "not_processed"
+            plan.status = "draft"
+        elif fulfilled_count > 0 and pending_count == 0 and shipped_count == 0:
+            order.app_status = "fulfilled"
+        elif fulfilled_count > 0 or shipped_count > 0:
+            order.app_status = "partially_fulfilled"
+        elif pending_count > 0:
+            # Unpushed boxes remain — go back to staged
+            order.app_status = "staged"
+        else:
+            order.app_status = "not_processed"
+            plan.status = "draft"
+
+        order.last_synced_at = datetime.now(timezone.utc)
+        if order.assigned_warehouse:
+            affected_warehouses.add(order.assigned_warehouse)
+
+        per_order.append({
+            "shopify_order_id": order_id,
+            "order_number": order.shopify_order_number,
+            "boxes_cancelled": cancelled_count,
+            "new_status": order.app_status,
+            "warnings": ss_errors,
+        })
+
+    # Recompute committed inventory for all affected warehouses
+    for wh in affected_warehouses:
+        _recompute_committed(wh, db)
+
+    db.commit()
+
+    total_cancelled = sum(r["boxes_cancelled"] for r in per_order)
+    total_warnings = sum(len(r["warnings"]) for r in per_order)
+
+    return {
+        "total_orders": len([r for r in per_order if r["boxes_cancelled"] > 0]),
+        "total_boxes_cancelled": total_cancelled,
+        "total_warnings": total_warnings,
+        "orders": per_order,
+    }
+
+
 # ── Update order status ───────────────────────────────────────────────────────
 
 @router.put("/{shopify_order_id}/status", response_model=schemas.ShopifyOrderOut)

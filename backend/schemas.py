@@ -470,6 +470,9 @@ class ShipStationPushBatchRequest(BaseModel):
 class StageBatchRequest(BaseModel):
     order_ids: List[str]
 
+class BulkCancelSSBoxesRequest(BaseModel):
+    order_ids: List[str]
+
 
 # ---------------------------------------------------------------------------
 # Archived Orders
@@ -892,3 +895,61 @@ class POFromProjectionRequest(BaseModel):
     projection_id: int
     product_types: List[str]  # which product types to create PO lines for
     vendor_id: Optional[int] = None  # if not provided, use preferred vendor
+
+
+# ---------------------------------------------------------------------------
+# Receiving Records (Phase 5)
+# ---------------------------------------------------------------------------
+
+class ReceivingRecordCreate(BaseModel):
+    received_date: date
+    received_cases: float
+    received_weight_lbs: float
+    confirmed_pick_sku: Optional[str] = None
+    harvest_date: Optional[date] = None
+    quality_rating: Optional[str] = None   # good | acceptable | poor
+    quality_notes: Optional[str] = None
+
+class ReceivingRecordUpdate(BaseModel):
+    received_date: Optional[date] = None
+    received_cases: Optional[float] = None
+    received_weight_lbs: Optional[float] = None
+    confirmed_pick_sku: Optional[str] = None
+    harvest_date: Optional[date] = None
+    quality_rating: Optional[str] = None
+    quality_notes: Optional[str] = None
+
+class ReceivingRecordResponse(BaseModel):
+    id: int
+    po_line_id: int
+    received_date: date
+    received_cases: float
+    received_weight_lbs: float
+    confirmed_pick_sku: Optional[str] = None
+    confirmed_pieces: Optional[float] = None
+    harvest_date: Optional[date] = None
+    quality_rating: Optional[str] = None
+    quality_notes: Optional[str] = None
+    pushed_to_inventory: bool = False
+    inventory_batch_id: Optional[int] = None
+    product_type: Optional[str] = None  # from PO line for convenience
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+class InventoryPushRequest(BaseModel):
+    warehouse: str = "walnut"
+    batch_code: Optional[str] = None
+
+class InventoryPushResponse(BaseModel):
+    receiving_record_id: int
+    inventory_batch_id: int
+    inventory_adjustment_id: int
+    pick_sku: str
+    quantity_added: float
+    expiration_date: Optional[date] = None
+
+class SkuForProductTypeResponse(BaseModel):
+    pick_sku: str
+    weight_lb: Optional[float] = None
+    days_til_expiration: Optional[float] = None

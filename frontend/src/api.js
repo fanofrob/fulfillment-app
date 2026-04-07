@@ -113,6 +113,8 @@ export const ordersApi = {
   getBatchMargins: (ids) => api.get('/orders/margins', { params: { ids: ids.join(',') } }).then(r => r.data),
   listArchived: () => api.get('/orders/archived').then(r => r.data),
   cancelOrder: (id) => api.post(`/orders/${id}/cancel`).then(r => r.data),
+  bulkCancelSSBoxesPreview: (order_ids) => api.post('/orders/bulk-cancel-shipstation-boxes/preview', { order_ids }).then(r => r.data),
+  bulkCancelSSBoxes: (order_ids) => api.post('/orders/bulk-cancel-shipstation-boxes', { order_ids }).then(r => r.data),
 }
 
 export const shipstationApi = {
