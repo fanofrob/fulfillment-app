@@ -1336,8 +1336,8 @@ def sync_boxes(db: Session = Depends(get_db)):
     db.commit()
 
     # ── Second pass: retry Shopify fulfillments for shipped boxes that may have
-    # failed previously (e.g. missing API scopes). Safe to retry — Shopify
-    # no-ops if the line items are already fulfilled. ─────────────────────────
+    # failed previously. Optimized: check fulfillable quantities per-order first
+    # to avoid redundant Shopify API calls for already-fulfilled items. ──────
     print(f"[sync_boxes] Shopify configured: {shopify_service.is_configured()}")
     if shopify_service.is_configured():
         shipped_boxes = db.query(models.FulfillmentBox).filter(
@@ -1346,6 +1346,8 @@ def sync_boxes(db: Session = Depends(get_db)):
         ).all()
         print(f"[sync_boxes] retry pass: {len(shipped_boxes)} shipped boxes with tracking")
 
+        # Group shipped boxes by order to minimize Shopify API calls
+        order_boxes: dict = {}  # shopify_order_id → [(box, plan, shopify_order)]
         for box in shipped_boxes:
             try:
                 plan = db.query(models.FulfillmentPlan).filter(
@@ -1358,41 +1360,74 @@ def sync_boxes(db: Session = Depends(get_db)):
                 )
                 if not plan or not shopify_order:
                     continue
-
-                box_items = db.query(models.BoxLineItem).filter(
-                    models.BoxLineItem.box_id == box.id
-                ).all()
-                li_ids = []
-                for bi in box_items:
-                    if bi.shopify_line_item_id:
-                        li_ids.append(str(bi.shopify_line_item_id))
-                    elif bi.shopify_sku:
-                        matched_lis = db.query(models.ShopifyLineItem).filter(
-                            models.ShopifyLineItem.shopify_order_id == shopify_order.shopify_order_id,
-                            models.ShopifyLineItem.shopify_sku == bi.shopify_sku,
-                        ).all()
-                        for mli in matched_lis:
-                            if mli.line_item_id and mli.line_item_id not in li_ids:
-                                li_ids.append(str(mli.line_item_id))
-
-                if li_ids:
-                    box_qtys = _compute_box_shopify_qtys(
-                        box_items, shopify_order.shopify_order_id, db
-                    )
-                    result = shopify_service.create_fulfillment_for_box(
-                        shopify_order_id=shopify_order.shopify_order_id,
-                        shopify_line_item_ids=li_ids,
-                        tracking_number=box.tracking_number,
-                        carrier_code=box.carrier,
-                        notify_customer=True,
-                        line_item_quantities=box_qtys,
-                    )
-                    if result:
-                        shopify_fulfillments_created += 1
-                        box.status = "fulfilled"
-                        fulfillment_created_order_ids.add(shopify_order.shopify_order_id)
+                order_boxes.setdefault(shopify_order.shopify_order_id, []).append(
+                    (box, plan, shopify_order)
+                )
             except Exception as e:
-                errors.append(f"Box {box.id} Shopify retry: {str(e)}")
+                errors.append(f"Box {box.id} Shopify retry lookup: {str(e)}")
+
+        for order_id, box_group in order_boxes.items():
+            try:
+                # Check fulfillable quantities once per order instead of per box
+                fresh_qtys = shopify_service.get_order_fulfillable_qtys(order_id)
+                all_fulfilled = all(qty == 0 for qty in fresh_qtys.values())
+
+                if all_fulfilled:
+                    # Items already fulfilled in Shopify — mark boxes without extra API calls
+                    for box, _plan, _so in box_group:
+                        box.status = "fulfilled"
+                    fulfillment_created_order_ids.add(order_id)
+                    print(f"[sync_boxes] retry pass: order {order_id} fully fulfilled in Shopify, marked {len(box_group)} boxes")
+                    continue
+
+                # Some items still need fulfillment — attempt per-box
+                for box, plan, shopify_order in box_group:
+                    try:
+                        box_items = db.query(models.BoxLineItem).filter(
+                            models.BoxLineItem.box_id == box.id
+                        ).all()
+                        li_ids = []
+                        for bi in box_items:
+                            if bi.shopify_line_item_id:
+                                li_ids.append(str(bi.shopify_line_item_id))
+                            elif bi.shopify_sku:
+                                matched_lis = db.query(models.ShopifyLineItem).filter(
+                                    models.ShopifyLineItem.shopify_order_id == shopify_order.shopify_order_id,
+                                    models.ShopifyLineItem.shopify_sku == bi.shopify_sku,
+                                ).all()
+                                for mli in matched_lis:
+                                    if mli.line_item_id and mli.line_item_id not in li_ids:
+                                        li_ids.append(str(mli.line_item_id))
+
+                        if li_ids:
+                            # Skip boxes whose items are already fulfilled
+                            box_items_fulfilled = all(
+                                fresh_qtys.get(li_id, 0) == 0 for li_id in li_ids
+                            )
+                            if box_items_fulfilled:
+                                box.status = "fulfilled"
+                                fulfillment_created_order_ids.add(order_id)
+                                continue
+
+                            box_qtys = _compute_box_shopify_qtys(
+                                box_items, shopify_order.shopify_order_id, db
+                            )
+                            result = shopify_service.create_fulfillment_for_box(
+                                shopify_order_id=shopify_order.shopify_order_id,
+                                shopify_line_item_ids=li_ids,
+                                tracking_number=box.tracking_number,
+                                carrier_code=box.carrier,
+                                notify_customer=True,
+                                line_item_quantities=box_qtys,
+                            )
+                            if result:
+                                shopify_fulfillments_created += 1
+                                box.status = "fulfilled"
+                                fulfillment_created_order_ids.add(order_id)
+                    except Exception as e:
+                        errors.append(f"Box {box.id} Shopify retry: {str(e)}")
+            except Exception as e:
+                errors.append(f"Order {order_id} fulfillable qty check: {str(e)}")
 
     # ── Third pass: re-fetch tracking for shipped-but-no-tracking boxes ─────────
     # These boxes were marked shipped in a prior sync when ShipStation hadn't yet
@@ -1490,14 +1525,21 @@ def sync_boxes(db: Session = Depends(get_db)):
                 refresh_ids.add(p.shopify_order_id)
         refresh_ids |= fulfillment_created_order_ids
 
+        # Include all in_shipstation_shipped orders — they may have been
+        # fulfilled outside this sync run and need their status checked
+        shipped_rows = db.query(models.ShopifyOrder.shopify_order_id).filter(
+            models.ShopifyOrder.app_status == "in_shipstation_shipped",
+        ).all()
+        refresh_ids |= {row[0] for row in shipped_rows}
+
         for order_id in refresh_ids:
             try:
                 fresh_qtys = shopify_service.get_order_fulfillable_qtys(order_id)
                 for li in db.query(models.ShopifyLineItem).filter(
                     models.ShopifyLineItem.shopify_order_id == order_id
                 ).all():
-                    if li.line_item_id in fresh_qtys:
-                        li.fulfillable_quantity = fresh_qtys[li.line_item_id]
+                    # Missing from fresh_qtys means fully fulfilled (qty 0)
+                    li.fulfillable_quantity = fresh_qtys.get(li.line_item_id, 0)
                 db.flush()
 
                 still_needed = db.query(models.ShopifyLineItem).filter(

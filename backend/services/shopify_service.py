@@ -299,13 +299,23 @@ def create_fulfillment_for_box(
 def get_order_fulfillable_qtys(shopify_order_id: str) -> Dict[str, int]:
     """
     Fetch current fulfillable_quantity for each line item on a Shopify order.
+    Uses the fulfillment_orders endpoint (more reliable than /orders/{id}.json
+    which can 404 on deprecated API versions).
     Returns {line_item_id: fulfillable_quantity}.
+    Items fully fulfilled won't appear — callers should treat missing IDs as 0.
     """
-    url = f"{_base_url()}/orders/{shopify_order_id}.json"
-    resp = requests.get(url, headers=_headers(), params={"fields": "line_items"}, timeout=30)
+    url = f"{_base_url()}/orders/{shopify_order_id}/fulfillment_orders.json"
+    resp = requests.get(url, headers=_headers(), timeout=30)
     resp.raise_for_status()
-    order = resp.json().get("order", {})
-    return {str(li["id"]): int(li.get("fulfillable_quantity") or 0) for li in order.get("line_items", [])}
+    fulfillment_orders = resp.json().get("fulfillment_orders", [])
+    qtys: Dict[str, int] = {}
+    for fo in fulfillment_orders:
+        if fo.get("status") in ("open", "in_progress"):
+            for li in fo.get("line_items", []):
+                li_id = str(li.get("line_item_id", ""))
+                if li_id:
+                    qtys[li_id] = qtys.get(li_id, 0) + li.get("fulfillable_quantity", 0)
+    return qtys
 
 
 def get_products() -> List[Dict]:
