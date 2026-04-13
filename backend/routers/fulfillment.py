@@ -1725,6 +1725,11 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
     validated = []        # list of dicts ready for parallel push
     skip_results = []     # orders that failed validation
 
+    # Running inventory balance — decremented as each order is validated so that
+    # later orders in the sorted list see the inventory already committed to
+    # earlier orders.  Keys: (pick_sku, warehouse), seeded lazily from DB.
+    running_inventory: dict[tuple[str, str], float] = {}
+
     for order_id in body.order_ids:
         plan = db.query(models.FulfillmentPlan).filter(
             models.FulfillmentPlan.shopify_order_id == order_id,
@@ -1760,7 +1765,7 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
         carrier_match = _apply_carrier_service_rules(order, db) if order else None
 
         box_tasks = []
-        order_skipped = False
+        order_demand: dict[str, float] = {}  # accumulated SKU demand across all boxes
         for box in pending_boxes:
             items = db.query(models.BoxLineItem).filter(models.BoxLineItem.box_id == box.id).all()
             if not items:
@@ -1789,28 +1794,11 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
             if box_type and box_type.weight_oz:
                 total_weight_oz += box_type.weight_oz
 
-            # Inventory check
+            # Accumulate this box's demand into the order-level total
             if order:
-                box_demand_check: dict = {}
                 for item in items:
                     if item.pick_sku:
-                        box_demand_check[item.pick_sku] = box_demand_check.get(item.pick_sku, 0.0) + item.quantity
-                short_skus = []
-                for pick_sku, qty_needed in box_demand_check.items():
-                    inv = db.query(models.InventoryItem).filter(
-                        models.InventoryItem.pick_sku == pick_sku,
-                        models.InventoryItem.warehouse == order.assigned_warehouse,
-                    ).first()
-                    on_hand = inv.on_hand_qty if inv else 0.0
-                    if on_hand < qty_needed:
-                        short_skus.append(f"{pick_sku} (have {on_hand:.1f}, need {qty_needed:.1f})")
-                if short_skus:
-                    skip_results.append({
-                        "order_id": order_id, "success": False,
-                        "error": f"Insufficient inventory — {', '.join(short_skus)}",
-                    })
-                    order_skipped = True
-                    break
+                        order_demand[item.pick_sku] = order_demand.get(item.pick_sku, 0.0) + item.quantity
 
             box_tasks.append({
                 "box": box,
@@ -1822,8 +1810,33 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                 "shipping_provider_id": carrier_match.get("shipping_provider_id") if carrier_match else None,
             })
 
-        if order_skipped:
-            continue
+        # Check order's total demand against the running inventory balance.
+        # This ensures each order sees inventory already committed to higher-priority
+        # orders earlier in the sorted list, preventing aggregate overselling.
+        if order and order_demand:
+            warehouse = order.assigned_warehouse
+            short_skus = []
+            for pick_sku, qty_needed in order_demand.items():
+                key = (pick_sku, warehouse)
+                if key not in running_inventory:
+                    inv = db.query(models.InventoryItem).filter(
+                        models.InventoryItem.pick_sku == pick_sku,
+                        models.InventoryItem.warehouse == warehouse,
+                    ).first()
+                    running_inventory[key] = inv.on_hand_qty if inv else 0.0
+                if running_inventory[key] < qty_needed:
+                    short_skus.append(
+                        f"{pick_sku} (have {running_inventory[key]:.1f}, need {qty_needed:.1f})"
+                    )
+            if short_skus:
+                skip_results.append({
+                    "order_id": order_id, "success": False,
+                    "error": f"Insufficient inventory — {', '.join(short_skus)}",
+                })
+                continue
+            # Commit this order's demand against the running balance
+            for pick_sku, qty_needed in order_demand.items():
+                running_inventory[(pick_sku, warehouse)] -= qty_needed
 
         if not box_tasks:
             skip_results.append({"order_id": order_id, "success": False, "error": "No pushable boxes"})
