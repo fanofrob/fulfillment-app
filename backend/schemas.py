@@ -153,7 +153,7 @@ class BoxTypeResponse(BoxTypeBase):
 # ---------------------------------------------------------------------------
 
 class PackageCondition(BaseModel):
-    field: str       # 'pactor' | 'zone' | 'tags'
+    field: str       # 'pactor' | 'zone' | 'weight' | 'tags'
     operator: str    # 'lt' | 'lte' | 'gt' | 'gte' | 'eq' | 'neq' |
                      # 'between' | 'contains' | 'not_contains' |
                      # 'is_exactly' | 'is_empty' | 'not_empty'

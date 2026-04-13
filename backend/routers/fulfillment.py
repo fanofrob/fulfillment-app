@@ -248,6 +248,35 @@ def _order_pactor(order: models.ShopifyOrder, db: Session) -> Optional[float]:
     return total if found_any else None
 
 
+def _order_weight(order: models.ShopifyOrder, db: Session) -> Optional[float]:
+    """
+    Calculate the total contents weight (lbs) for an order — box tare excluded.
+    sum(weight_lb[pick_sku] × pick_quantity) across all mapped line items.
+    """
+    rows = db.query(models.PicklistSku).filter(models.PicklistSku.weight_lb.isnot(None)).all()
+    weight_map = {r.pick_sku: r.weight_lb for r in rows}
+    if not weight_map:
+        return None
+
+    line_items = db.query(models.ShopifyLineItem).filter(
+        models.ShopifyLineItem.shopify_order_id == order.shopify_order_id,
+        models.ShopifyLineItem.sku_mapped == True,
+        models.ShopifyLineItem.pick_sku.isnot(None),
+        or_(models.ShopifyLineItem.app_line_status != "short_ship", models.ShopifyLineItem.app_line_status.is_(None)),
+    ).all()
+
+    total = 0.0
+    found_any = False
+    for li in line_items:
+        w = weight_map.get(li.pick_sku)
+        if w is not None:
+            qty = li.fulfillable_quantity if li.fulfillable_quantity is not None else li.quantity
+            total += w * qty * (li.mix_quantity or 1.0)
+            found_any = True
+
+    return total if found_any else None
+
+
 # ── Condition evaluator ───────────────────────────────────────────────────────
 
 def _eval_numeric(operator: str, actual: float, value, value2=None) -> bool:
@@ -306,6 +335,10 @@ def _eval_condition(cond: dict, order: models.ShopifyOrder, db: Session) -> bool
     if field == "pactor":
         pactor = _order_pactor(order, db)
         return _eval_numeric(operator, pactor, value, value2)
+
+    if field == "weight":
+        weight = _order_weight(order, db)
+        return _eval_numeric(operator, weight, value, value2)
 
     if field == "carrier_service":
         match = _apply_carrier_service_rules(order, db)
