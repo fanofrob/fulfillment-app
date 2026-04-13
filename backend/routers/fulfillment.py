@@ -925,19 +925,44 @@ def delete_box(plan_id: int, box_id: int, db: Session = Depends(get_db)):
         models.FulfillmentPlan.id == plan_id
     ).first()
 
-    if active_boxes == 0 and plan:
+    if plan and plan.shopify_order_id:
+        order = db.query(models.ShopifyOrder).filter(
+            models.ShopifyOrder.shopify_order_id == plan.shopify_order_id
+        ).first()
+        if order:
+            from routers.inventory import _restore_inventory_on_cancel, _recompute_committed
+            if active_boxes == 0:
+                plan.status = "draft"
+                if order.app_status in ("in_shipstation_not_shipped", "staged"):
+                    _restore_inventory_on_cancel(order, db)
+                    order.app_status = "not_processed"
+                    db.flush()
+                    _recompute_committed(order.assigned_warehouse, db)
+            else:
+                # Recalculate order status based on remaining active boxes
+                remaining_active = db.query(models.FulfillmentBox).filter(
+                    models.FulfillmentBox.plan_id == plan_id,
+                    models.FulfillmentBox.status != "cancelled",
+                ).all()
+                shipped_count = sum(1 for b in remaining_active if b.status == "shipped")
+                fulfilled_count = sum(1 for b in remaining_active if b.status == "fulfilled")
+                pending_count = sum(1 for b in remaining_active if b.status in ("pending", "packed"))
+
+                if fulfilled_count > 0 and pending_count == 0 and shipped_count == 0:
+                    # Use Shopify's fulfillment status to distinguish partial vs full
+                    if order.fulfillment_status == "fulfilled":
+                        order.app_status = "fulfilled"
+                    else:
+                        order.app_status = "partially_fulfilled"
+                elif fulfilled_count > 0 or shipped_count > 0:
+                    order.app_status = "partially_fulfilled"
+                elif pending_count > 0:
+                    order.app_status = "staged"
+                else:
+                    order.app_status = "not_processed"
+                    plan.status = "draft"
+    elif active_boxes == 0 and plan:
         plan.status = "draft"
-        # Restore inventory and reset order status if this was the last box
-        if plan.shopify_order_id:
-            order = db.query(models.ShopifyOrder).filter(
-                models.ShopifyOrder.shopify_order_id == plan.shopify_order_id
-            ).first()
-            if order and order.app_status in ("in_shipstation_not_shipped", "staged"):
-                from routers.inventory import _restore_inventory_on_cancel, _recompute_committed
-                _restore_inventory_on_cancel(order, db)
-                order.app_status = "not_processed"
-                db.flush()
-                _recompute_committed(order.assigned_warehouse, db)
 
     db.commit()
 
