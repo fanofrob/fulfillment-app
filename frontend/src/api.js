@@ -124,6 +124,7 @@ export const shipstationApi = {
   sync: () => api.post('/shipstation/sync').then(r => r.data),
   getEstimatedDelivery: (orderId) => api.get(`/shipstation/estimated-delivery/${orderId}`).then(r => r.data),
   checkDuplicates: () => api.post('/shipstation/check-duplicates').then(r => r.data),
+  listInShipStationBoxes: () => api.get('/shipstation/in-shipstation-boxes').then(r => r.data),
 }
 
 export const picklistSkusApi = {

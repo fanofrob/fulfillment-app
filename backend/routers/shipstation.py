@@ -398,3 +398,69 @@ def sync(db: Session = Depends(get_db)):
         shipped=result["shipped"],
         errors=result["errors"],
     )
+
+
+# ── In-ShipStation boxes ──────────────────────────────────────────────────────
+
+@router.get("/in-shipstation-boxes")
+def get_in_shipstation_boxes(db: Session = Depends(get_db)):
+    """
+    Returns every individual box currently in ShipStation (status='packed'),
+    enriched with order info, box type name, and pick SKUs.
+    """
+    boxes = (
+        db.query(models.FulfillmentBox)
+        .filter(models.FulfillmentBox.status == "packed")
+        .all()
+    )
+
+    if not boxes:
+        return []
+
+    plan_ids = list({b.plan_id for b in boxes})
+    plans = db.query(models.FulfillmentPlan).filter(models.FulfillmentPlan.id.in_(plan_ids)).all()
+    plan_map = {p.id: p for p in plans}
+
+    order_ids = list({p.shopify_order_id for p in plans})
+    orders = db.query(models.ShopifyOrder).filter(
+        models.ShopifyOrder.shopify_order_id.in_(order_ids)
+    ).all()
+    order_map = {o.shopify_order_id: o for o in orders}
+
+    box_type_ids = list({b.box_type_id for b in boxes if b.box_type_id})
+    box_type_map: dict = {}
+    if box_type_ids:
+        box_types = db.query(models.BoxType).filter(models.BoxType.id.in_(box_type_ids)).all()
+        box_type_map = {bt.id: bt.name for bt in box_types}
+
+    box_ids = [b.id for b in boxes]
+    items = db.query(models.BoxLineItem).filter(models.BoxLineItem.box_id.in_(box_ids)).all()
+    items_by_box: dict = {}
+    for item in items:
+        items_by_box.setdefault(item.box_id, []).append(item.pick_sku)
+
+    result = []
+    for box in boxes:
+        plan = plan_map.get(box.plan_id)
+        if not plan:
+            continue
+        order = order_map.get(plan.shopify_order_id)
+        if not order:
+            continue
+        result.append({
+            "box_id": box.id,
+            "plan_id": box.plan_id,
+            "box_number": box.box_number,
+            "box_type_name": box_type_map.get(box.box_type_id),
+            "pick_skus": sorted(set(items_by_box.get(box.id, []))),
+            "shipstation_order_id": box.shipstation_order_id,
+            "shopify_order_id": order.shopify_order_id,
+            "shopify_order_number": order.shopify_order_number,
+            "customer_name": order.customer_name,
+            "customer_email": order.customer_email,
+            "created_at_shopify": order.created_at_shopify.isoformat() if order.created_at_shopify else None,
+            "tags": order.tags,
+            "shipping_province": order.shipping_province,
+        })
+
+    return result
