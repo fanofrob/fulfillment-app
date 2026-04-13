@@ -12,7 +12,7 @@ Box statuses:   pending | packed | shipped
 Change statuses: pending_approval | approved | rejected
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -1373,11 +1373,13 @@ def sync_boxes(db: Session = Depends(get_db)):
     # to avoid redundant Shopify API calls for already-fulfilled items. ──────
     print(f"[sync_boxes] Shopify configured: {shopify_service.is_configured()}")
     if shopify_service.is_configured():
+        retry_cutoff = datetime.now(timezone.utc) - timedelta(days=14)
         shipped_boxes = db.query(models.FulfillmentBox).filter(
             models.FulfillmentBox.status == "shipped",
             models.FulfillmentBox.tracking_number.isnot(None),
+            models.FulfillmentBox.shipped_at >= retry_cutoff,
         ).all()
-        print(f"[sync_boxes] retry pass: {len(shipped_boxes)} shipped boxes with tracking")
+        print(f"[sync_boxes] retry pass: {len(shipped_boxes)} shipped boxes with tracking (last 14 days)")
 
         # Group shipped boxes by order to minimize Shopify API calls
         order_boxes: dict = {}  # shopify_order_id → [(box, plan, shopify_order)]

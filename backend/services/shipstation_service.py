@@ -10,7 +10,7 @@ The router returns 503 so the UI can show "ShipStation not configured".
 import os
 import requests
 from base64 import b64encode
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
 
 SS_API_KEY    = os.getenv("SS_API_KEY", "").strip()
@@ -133,64 +133,104 @@ def push_order(order, line_items) -> dict:
     return resp.json()
 
 
-def get_shipments(ss_order_ids: List[str]) -> List[Dict]:
+def get_shipments(ss_order_ids: List[str], days: int = 14) -> List[Dict]:
     """
     Fetch shipment info for a list of ShipStation order IDs.
 
-    Two-pass approach:
-    1. Query /shipments?orderId=X  — works for label purchases
-    2. For any order with no shipment record, query GET /orders/{id} directly —
-       catches "Mark as Shipped" (manual) entries which don't appear in /shipments
+    Two date-window calls cover all cases:
+    1. GET /shipments?shipDateStart=<days ago> — catches label purchases
+    2. GET /orders?orderStatus=shipped&modifyDateStart=<days ago> — catches
+       "Mark as Shipped" manual entries which don't appear in /shipments
+
+    Both calls are paginated but each returns at most a few pages regardless of
+    how many order IDs are passed in. Orders not found in either window simply
+    haven't shipped yet — no per-order fallback needed since any order that
+    shipped more than `days` days ago would have been processed by a prior sync.
     """
     if not is_configured():
         raise RuntimeError("ShipStation not configured")
     if not ss_order_ids:
         return []
 
+    target_ids = set(str(oid) for oid in ss_order_ids)
+    ship_date_start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
     all_shipments = []
     found_order_ids: set = set()
 
-    for order_id in ss_order_ids:
+    # ── Pass 1: /shipments date window (label purchases) ─────────────────────
+    page = 1
+    while True:
         resp = requests.get(
             f"{BASE_URL}/shipments",
-            params={"orderId": order_id, "includeShipmentItems": True},
+            params={
+                "shipDateStart": ship_date_start,
+                "includeShipmentItems": True,
+                "pageSize": 500,
+                "page": page,
+            },
             headers=_headers(),
-            timeout=20,
+            timeout=30,
         )
         resp.raise_for_status()
-        shipments = resp.json().get("shipments", [])
-        if shipments:
-            all_shipments.extend(shipments)
-            found_order_ids.add(order_id)
+        data = resp.json()
+        shipments = data.get("shipments", [])
 
-    # Fallback: for orders with no /shipments record, check the order status directly.
-    # ShipStation's "Mark as Shipped" (no label purchase) only updates orderStatus;
-    # it does not create a /shipments entry.
-    for order_id in ss_order_ids:
-        if order_id in found_order_ids:
-            continue
-        resp = requests.get(
-            f"{BASE_URL}/orders/{order_id}",
-            headers=_headers(),
-            timeout=20,
-        )
-        resp.raise_for_status()
-        order = resp.json()
-        if order.get("orderStatus") == "shipped":
-            tracking = order.get("trackingNumber") or order.get("advancedOptions", {}).get("trackingNumber")
-            carrier = order.get("carrierCode")
-            # Print all top-level keys and a few likely tracking fields for debugging
-            print(f"[get_shipments] fallback order keys: {list(order.keys())}")
-            print(f"[get_shipments] trackingNumber={order.get('trackingNumber')!r}, carrierCode={order.get('carrierCode')!r}, serviceCode={order.get('serviceCode')!r}, advancedOptions={order.get('advancedOptions')!r}")
-            # Build a synthetic shipment dict that matches the shape sync_boxes expects
-            all_shipments.append({
-                "orderId": order_id,
-                "trackingNumber": tracking,
-                "carrierCode": carrier,
-                "estimatedDeliveryDate": order.get("shipDate"),
-                "voided": False,
-            })
+        for s in shipments:
+            order_id = str(s.get("orderId", ""))
+            if order_id in target_ids:
+                all_shipments.append(s)
+                found_order_ids.add(order_id)
 
+        total = data.get("total", 0)
+        if page * 500 >= total or not shipments:
+            break
+        page += 1
+
+    # ── Pass 2: /orders date window for "Mark as Shipped" entries ────────────
+    # Only run if there are still unmatched IDs after pass 1.
+    missing_ids = target_ids - found_order_ids
+    if missing_ids:
+        page = 1
+        while True:
+            resp = requests.get(
+                f"{BASE_URL}/orders",
+                params={
+                    "orderStatus": "shipped",
+                    "modifyDateStart": ship_date_start,
+                    "pageSize": 500,
+                    "page": page,
+                },
+                headers=_headers(),
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            orders = data.get("orders", [])
+
+            for order in orders:
+                order_id = str(order.get("orderId", ""))
+                if order_id not in missing_ids:
+                    continue
+                tracking = order.get("trackingNumber") or order.get("advancedOptions", {}).get("trackingNumber")
+                carrier = order.get("carrierCode")
+                print(f"[get_shipments] mark-as-shipped order keys: {list(order.keys())}")
+                print(f"[get_shipments] trackingNumber={order.get('trackingNumber')!r}, carrierCode={order.get('carrierCode')!r}, serviceCode={order.get('serviceCode')!r}, advancedOptions={order.get('advancedOptions')!r}")
+                all_shipments.append({
+                    "orderId": order_id,
+                    "trackingNumber": tracking,
+                    "carrierCode": carrier,
+                    "estimatedDeliveryDate": order.get("shipDate"),
+                    "voided": False,
+                })
+                found_order_ids.add(order_id)
+
+            total = data.get("total", 0)
+            if page * 500 >= total or not orders:
+                break
+            page += 1
+
+    print(f"[get_shipments] found {len(found_order_ids)}/{len(target_ids)} order IDs in {days}-day window, returning {len(all_shipments)} shipments")
     return all_shipments
 
 
