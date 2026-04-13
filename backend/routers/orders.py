@@ -1205,7 +1205,20 @@ def bulk_cancel_ss_boxes(
             order.app_status = "not_processed"
             plan.status = "draft"
         elif fulfilled_count > 0 and pending_count == 0 and shipped_count == 0:
-            order.app_status = "fulfilled"
+            # Only mark fully fulfilled if no Shopify items still need packing.
+            # If boxes were cancelled to re-plan, unfulfilled items remain and the
+            # order should stay partially_fulfilled so auto-plan can pick it up.
+            still_needed = db.query(models.ShopifyLineItem).filter(
+                models.ShopifyLineItem.shopify_order_id == order.shopify_order_id,
+                models.ShopifyLineItem.sku_mapped == True,
+                models.ShopifyLineItem.pick_sku.isnot(None),
+                models.ShopifyLineItem.fulfillable_quantity > 0,
+                or_(
+                    models.ShopifyLineItem.app_line_status != "short_ship",
+                    models.ShopifyLineItem.app_line_status.is_(None),
+                ),
+            ).count()
+            order.app_status = "fulfilled" if still_needed == 0 else "partially_fulfilled"
         elif fulfilled_count > 0 or shipped_count > 0:
             order.app_status = "partially_fulfilled"
         elif pending_count > 0:

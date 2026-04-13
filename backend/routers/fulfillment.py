@@ -2411,13 +2411,69 @@ def bulk_auto_plan(body: BulkAutoPlanRequest = BulkAutoPlanRequest(), db: Sessio
                                     "reason": "no box rule matched",
                                 })
                         else:
-                            skipped += 1
-                            results.append({
-                                "order_id": order.shopify_order_id,
-                                "order_number": order.shopify_order_number,
-                                "action": "skipped",
-                                "reason": "plan already has boxes with types assigned",
-                            })
+                            # Check if box quantities don't match the order — if so and all
+                            # active boxes are still pending (safe to rebuild), re-plan from scratch.
+                            all_pending = all(b.status == "pending" for b in active_boxes)
+                            if all_pending and _check_plan_mismatch(order.shopify_order_id, db):
+                                # Delete existing pending boxes and their items, then rebuild
+                                for b in active_boxes:
+                                    db.query(models.BoxLineItem).filter(models.BoxLineItem.box_id == b.id).delete()
+                                    db.delete(b)
+                                db.flush()
+
+                                shopify_snap = _shopify_items_snapshot(order.shopify_order_id, db)
+                                li_meta: dict[tuple, models.ShopifyLineItem] = {}
+                                for li in db.query(models.ShopifyLineItem).filter(
+                                    models.ShopifyLineItem.shopify_order_id == order.shopify_order_id,
+                                    models.ShopifyLineItem.sku_mapped == True,
+                                    models.ShopifyLineItem.pick_sku.isnot(None),
+                                ).all():
+                                    li_meta[(li.pick_sku, li.line_item_id)] = li
+
+                                box_type_matched = auto_box_type_id is not None
+                                next_num = _next_box_number(plan.id, db)
+                                if auto_box_type_id is not None:
+                                    box = models.FulfillmentBox(plan_id=plan.id, box_number=next_num, status="pending", box_type_id=auto_box_type_id)
+                                    db.add(box)
+                                    db.flush()
+                                    _populate_box_items(box.id, shopify_snap, li_meta, db)
+                                else:
+                                    split_boxes2, split_errors2 = _try_multi_box_split(order, db)
+                                    if split_boxes2:
+                                        box_type_matched = all(b["box_type_id"] is not None for b in split_boxes2)
+                                        for i, box_def in enumerate(split_boxes2, start=next_num):
+                                            box = models.FulfillmentBox(plan_id=plan.id, box_number=i, status="pending", box_type_id=box_def["box_type_id"])
+                                            db.add(box)
+                                            db.flush()
+                                            _populate_box_items(box.id, box_def["items"], li_meta, db)
+                                        if split_errors2:
+                                            err = "; ".join(split_errors2)
+                                            plan.notes = (f"{plan.notes}\n" if plan.notes else "") + f"[Auto-plan error: {err}]"
+                                    else:
+                                        box = models.FulfillmentBox(plan_id=plan.id, box_number=next_num, status="pending", box_type_id=None)
+                                        db.add(box)
+                                        db.flush()
+                                        _populate_box_items(box.id, shopify_snap, li_meta, db)
+
+                                db.commit()
+                                repaired += 1
+                                if not box_type_matched:
+                                    unmatched += 1
+                                results.append({
+                                    "order_id": order.shopify_order_id,
+                                    "order_number": order.shopify_order_number,
+                                    "action": "rebuilt_mismatched_plan",
+                                    "plan_id": plan.id,
+                                    "box_type_matched": box_type_matched,
+                                })
+                            else:
+                                skipped += 1
+                                results.append({
+                                    "order_id": order.shopify_order_id,
+                                    "order_number": order.shopify_order_number,
+                                    "action": "skipped",
+                                    "reason": "plan already has boxes with types assigned",
+                                })
 
         except Exception as e:
             db.rollback()
