@@ -153,7 +153,7 @@ class BoxTypeResponse(BoxTypeBase):
 # ---------------------------------------------------------------------------
 
 class PackageCondition(BaseModel):
-    field: str       # 'pactor' | 'zone' | 'tags'
+    field: str       # 'pactor' | 'zone' | 'weight' | 'tags'
     operator: str    # 'lt' | 'lte' | 'gt' | 'gte' | 'eq' | 'neq' |
                      # 'between' | 'contains' | 'not_contains' |
                      # 'is_exactly' | 'is_empty' | 'not_empty'
@@ -470,6 +470,9 @@ class ShipStationPushBatchRequest(BaseModel):
 class StageBatchRequest(BaseModel):
     order_ids: List[str]
 
+class BulkCancelSSBoxesRequest(BaseModel):
+    order_ids: List[str]
+
 
 # ---------------------------------------------------------------------------
 # Archived Orders
@@ -488,3 +491,465 @@ class ArchivedOrderOut(BaseModel):
     archived_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Projection Periods
+# ---------------------------------------------------------------------------
+
+class ProjectionPeriodBase(BaseModel):
+    name: str
+    start_datetime: datetime
+    end_datetime: datetime
+    fulfillment_start: Optional[datetime] = None
+    fulfillment_end: Optional[datetime] = None
+    status: Optional[str] = "draft"
+    sku_mapping_sheet_tab: Optional[str] = None
+    previous_period_id: Optional[int] = None
+    spoilage_adjustments: Optional[dict] = None
+    notes: Optional[str] = None
+
+class ProjectionPeriodCreate(ProjectionPeriodBase):
+    pass
+
+class ProjectionPeriodUpdate(BaseModel):
+    name: Optional[str] = None
+    start_datetime: Optional[datetime] = None
+    end_datetime: Optional[datetime] = None
+    fulfillment_start: Optional[datetime] = None
+    fulfillment_end: Optional[datetime] = None
+    status: Optional[str] = None
+    sku_mapping_sheet_tab: Optional[str] = None
+    previous_period_id: Optional[int] = None
+    spoilage_adjustments: Optional[dict] = None
+    notes: Optional[str] = None
+
+class ProjectionPeriodResponse(ProjectionPeriodBase):
+    id: int
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Period Short Ship / Inventory Hold Configs
+# ---------------------------------------------------------------------------
+
+class PeriodConfigItem(BaseModel):
+    shopify_sku: str
+
+class PeriodShortShipResponse(BaseModel):
+    id: int
+    period_id: int
+    shopify_sku: str
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+class PeriodInventoryHoldResponse(BaseModel):
+    id: int
+    period_id: int
+    shopify_sku: str
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+class CopyConfigsRequest(BaseModel):
+    source_period_id: int
+
+class ConfigDiffResponse(BaseModel):
+    only_in_source: List[str]
+    only_in_target: List[str]
+    in_both: List[str]
+
+
+# ---------------------------------------------------------------------------
+# Historical Sales
+# ---------------------------------------------------------------------------
+
+class HistoricalSalesResponse(BaseModel):
+    id: int
+    hour_bucket: datetime
+    shopify_sku: str
+    order_count: int
+    quantity_sold: int
+    revenue: float
+
+    model_config = {"from_attributes": True}
+
+class HistoricalSalesIngestionResult(BaseModel):
+    total_orders_processed: int
+    total_sales_rows_upserted: int
+    date_range_start: Optional[datetime] = None
+    date_range_end: Optional[datetime] = None
+    errors: List[str] = []
+
+
+# ---------------------------------------------------------------------------
+# Historical Promotions
+# ---------------------------------------------------------------------------
+
+class HistoricalPromotionBase(BaseModel):
+    name: str
+    start_datetime: datetime
+    end_datetime: datetime
+    scope: Optional[str] = "store_wide"
+    affected_skus: Optional[List[str]] = None
+    discount_type: Optional[str] = None
+    discount_value: Optional[float] = None
+    notes: Optional[str] = None
+    source: Optional[str] = "manual"
+
+class HistoricalPromotionCreate(HistoricalPromotionBase):
+    pass
+
+class HistoricalPromotionUpdate(BaseModel):
+    name: Optional[str] = None
+    start_datetime: Optional[datetime] = None
+    end_datetime: Optional[datetime] = None
+    scope: Optional[str] = None
+    affected_skus: Optional[List[str]] = None
+    discount_type: Optional[str] = None
+    discount_value: Optional[float] = None
+    notes: Optional[str] = None
+    source: Optional[str] = None
+
+class HistoricalPromotionResponse(HistoricalPromotionBase):
+    id: int
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Projection Padding Configs
+# ---------------------------------------------------------------------------
+
+class PaddingConfigBase(BaseModel):
+    product_type: str
+    padding_pct: float = 0.0
+    notes: Optional[str] = None
+
+class PaddingConfigCreate(PaddingConfigBase):
+    pass
+
+class PaddingConfigResponse(PaddingConfigBase):
+    id: int
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Projections
+# ---------------------------------------------------------------------------
+
+class ProjectionGenerateRequest(BaseModel):
+    historical_weeks: Optional[int] = 4
+    excluded_promo_ids: Optional[List[int]] = None
+    promotion_multiplier: Optional[float] = None
+    warehouse: str = "walnut"
+
+class ProjectionLineResponse(BaseModel):
+    id: int
+    product_type: str
+    confirmed_order_count: int = 0
+    confirmed_demand_lbs: float = 0.0
+    projected_order_count: float = 0.0
+    projected_demand_lbs: float = 0.0
+    total_demand_lbs: float = 0.0
+    padding_pct: float = 0.0
+    padded_demand_lbs: float = 0.0
+    on_hand_lbs: float = 0.0
+    expected_on_hand_lbs: float = 0.0
+    on_order_lbs: float = 0.0
+    gap_lbs: float = 0.0
+    gap_cases: Optional[float] = None
+    case_weight_lbs: Optional[float] = None
+    gap_status: str = "ok"
+    detail: Optional[Any] = None
+
+    model_config = {"from_attributes": True}
+
+# Hourly breakdown for a product type within a projection
+class HourlyBucketResponse(BaseModel):
+    hour: datetime
+    projected_orders: float = 0.0
+    projected_lbs: float = 0.0
+
+class HourlyBreakdownResponse(BaseModel):
+    product_type: str
+    projection_id: int
+    period_name: str
+    hours: List[HourlyBucketResponse] = []
+
+# Projection comparison (two projections side-by-side by product type)
+class ComparisonLineResponse(BaseModel):
+    product_type: str
+    # Projection A
+    a_confirmed_demand_lbs: float = 0.0
+    a_projected_demand_lbs: float = 0.0
+    a_total_demand_lbs: float = 0.0
+    a_padded_demand_lbs: float = 0.0
+    a_on_hand_lbs: float = 0.0
+    a_expected_on_hand_lbs: float = 0.0
+    a_gap_lbs: float = 0.0
+    a_gap_cases: Optional[float] = None
+    a_gap_status: str = "ok"
+    # Projection B
+    b_confirmed_demand_lbs: float = 0.0
+    b_projected_demand_lbs: float = 0.0
+    b_total_demand_lbs: float = 0.0
+    b_padded_demand_lbs: float = 0.0
+    b_on_hand_lbs: float = 0.0
+    b_expected_on_hand_lbs: float = 0.0
+    b_gap_lbs: float = 0.0
+    b_gap_cases: Optional[float] = None
+    b_gap_status: str = "ok"
+
+class ProjectionComparisonResponse(BaseModel):
+    projection_a: "ProjectionResponse"
+    projection_b: "ProjectionResponse"
+    lines: List[ComparisonLineResponse] = []
+
+
+class ProjectionResponse(BaseModel):
+    id: int
+    period_id: int
+    generated_at: Optional[datetime] = None
+    shopify_data_as_of: Optional[datetime] = None
+    historical_range_start: Optional[datetime] = None
+    historical_range_end: Optional[datetime] = None
+    methodology_report: Optional[str] = None
+    status: str = "current"
+    total_confirmed_demand_lbs: float = 0.0
+    total_projected_demand_lbs: float = 0.0
+    total_demand_lbs: float = 0.0
+    parameters: Optional[Any] = None
+    lines: Optional[List[ProjectionLineResponse]] = None
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Vendors (Phase 4)
+# ---------------------------------------------------------------------------
+
+class VendorProductBase(BaseModel):
+    product_type: str
+    default_case_weight_lbs: Optional[float] = None
+    default_case_count: Optional[int] = None
+    default_price_per_case: Optional[float] = None
+    default_price_per_lb: Optional[float] = None
+    lead_time_days: Optional[int] = None
+    order_unit: Optional[str] = "case"
+    is_preferred: bool = False
+    notes: Optional[str] = None
+
+class VendorProductCreate(VendorProductBase):
+    pass
+
+class VendorProductUpdate(BaseModel):
+    product_type: Optional[str] = None
+    default_case_weight_lbs: Optional[float] = None
+    default_case_count: Optional[int] = None
+    default_price_per_case: Optional[float] = None
+    default_price_per_lb: Optional[float] = None
+    lead_time_days: Optional[int] = None
+    order_unit: Optional[str] = None
+    is_preferred: Optional[bool] = None
+    notes: Optional[str] = None
+
+class VendorProductResponse(VendorProductBase):
+    id: int
+    vendor_id: int
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+class VendorBase(BaseModel):
+    name: str
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    contact_whatsapp: Optional[str] = None
+    preferred_communication: Optional[str] = None
+    notes: Optional[str] = None
+    is_active: bool = True
+
+class VendorCreate(VendorBase):
+    products: Optional[List[VendorProductCreate]] = None
+
+class VendorUpdate(BaseModel):
+    name: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    contact_whatsapp: Optional[str] = None
+    preferred_communication: Optional[str] = None
+    notes: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class VendorResponse(VendorBase):
+    id: int
+    products: List[VendorProductResponse] = []
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Purchase Orders (Phase 4)
+# ---------------------------------------------------------------------------
+
+class POPeriodAllocationBase(BaseModel):
+    period_id: int
+    allocated_lbs: float = 0.0
+    spoilage_pct: float = 0.0
+
+class POPeriodAllocationCreate(POPeriodAllocationBase):
+    pass
+
+class POPeriodAllocationResponse(POPeriodAllocationBase):
+    id: int
+    po_line_id: int
+    effective_lbs: float = 0.0
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+class POLineBase(BaseModel):
+    product_type: str
+    quantity_cases: float = 0.0
+    case_weight_lbs: Optional[float] = None
+    total_weight_lbs: Optional[float] = None
+    unit_price: Optional[float] = None
+    price_unit: Optional[str] = "case"
+    total_price: Optional[float] = None
+    notes: Optional[str] = None
+
+class POLineCreate(POLineBase):
+    allocations: Optional[List[POPeriodAllocationCreate]] = None
+
+class POLineUpdate(BaseModel):
+    product_type: Optional[str] = None
+    quantity_cases: Optional[float] = None
+    case_weight_lbs: Optional[float] = None
+    unit_price: Optional[float] = None
+    price_unit: Optional[str] = None
+    notes: Optional[str] = None
+
+class POLineResponse(POLineBase):
+    id: int
+    purchase_order_id: int
+    allocations: List[POPeriodAllocationResponse] = []
+    overage_flag: bool = False  # True if rounded-up order >10% over projection gap
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+class PurchaseOrderBase(BaseModel):
+    vendor_id: int
+    status: str = "draft"
+    order_date: Optional[date] = None
+    expected_delivery_date: Optional[date] = None
+    actual_delivery_date: Optional[date] = None
+    delivery_notes: Optional[str] = None
+    communication_method: Optional[str] = None
+    notes: Optional[str] = None
+
+class PurchaseOrderCreate(PurchaseOrderBase):
+    lines: List[POLineCreate] = []
+
+class PurchaseOrderUpdate(BaseModel):
+    vendor_id: Optional[int] = None
+    status: Optional[str] = None
+    order_date: Optional[date] = None
+    expected_delivery_date: Optional[date] = None
+    actual_delivery_date: Optional[date] = None
+    delivery_notes: Optional[str] = None
+    communication_method: Optional[str] = None
+    notes: Optional[str] = None
+
+class PurchaseOrderResponse(PurchaseOrderBase):
+    id: int
+    po_number: str
+    subtotal: Optional[float] = None
+    lines: List[POLineResponse] = []
+    vendor_name: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+class POFromProjectionRequest(BaseModel):
+    """Create a PO pre-filled from projection gap data."""
+    period_id: int
+    projection_id: int
+    product_types: List[str]  # which product types to create PO lines for
+    vendor_id: Optional[int] = None  # if not provided, use preferred vendor
+
+
+# ---------------------------------------------------------------------------
+# Receiving Records (Phase 5)
+# ---------------------------------------------------------------------------
+
+class ReceivingRecordCreate(BaseModel):
+    received_date: date
+    received_cases: float
+    received_weight_lbs: float
+    confirmed_pick_sku: Optional[str] = None
+    harvest_date: Optional[date] = None
+    quality_rating: Optional[str] = None   # good | acceptable | poor
+    quality_notes: Optional[str] = None
+
+class ReceivingRecordUpdate(BaseModel):
+    received_date: Optional[date] = None
+    received_cases: Optional[float] = None
+    received_weight_lbs: Optional[float] = None
+    confirmed_pick_sku: Optional[str] = None
+    harvest_date: Optional[date] = None
+    quality_rating: Optional[str] = None
+    quality_notes: Optional[str] = None
+
+class ReceivingRecordResponse(BaseModel):
+    id: int
+    po_line_id: int
+    received_date: date
+    received_cases: float
+    received_weight_lbs: float
+    confirmed_pick_sku: Optional[str] = None
+    confirmed_pieces: Optional[float] = None
+    harvest_date: Optional[date] = None
+    quality_rating: Optional[str] = None
+    quality_notes: Optional[str] = None
+    pushed_to_inventory: bool = False
+    inventory_batch_id: Optional[int] = None
+    product_type: Optional[str] = None  # from PO line for convenience
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+class InventoryPushRequest(BaseModel):
+    warehouse: str = "walnut"
+    batch_code: Optional[str] = None
+
+class InventoryPushResponse(BaseModel):
+    receiving_record_id: int
+    inventory_batch_id: int
+    inventory_adjustment_id: int
+    pick_sku: str
+    quantity_added: float
+    expiration_date: Optional[date] = None
+
+class SkuForProductTypeResponse(BaseModel):
+    pick_sku: str
+    weight_lb: Optional[float] = None
+    days_til_expiration: Optional[float] = None

@@ -9,6 +9,7 @@ import { servicesByCarrier, findService, serviceKey } from '../shipstationServic
 const FIELDS = [
   { value: 'pactor',          label: 'Pactor',          type: 'number' },
   { value: 'zone',            label: 'Zone',            type: 'number' },
+  { value: 'weight',          label: 'Weight (lbs)',    type: 'number' },
   { value: 'tags',            label: 'Tags',            type: 'string' },
   { value: 'carrier_service', label: 'Carrier Service', type: 'service' },
 ]

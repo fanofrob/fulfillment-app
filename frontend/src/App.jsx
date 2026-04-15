@@ -9,6 +9,11 @@ import CarrierServiceRules from './pages/CarrierServiceRules'
 import Inventory from './pages/Inventory'
 import Orders from './pages/Orders'
 import DemandDashboard from './pages/DemandDashboard'
+import ProjectionPeriods from './pages/ProjectionPeriods'
+import HistoricalPromotions from './pages/HistoricalPromotions'
+import ProjectionDashboard from './pages/ProjectionDashboard'
+import Vendors from './pages/Vendors'
+import PurchaseOrders from './pages/PurchaseOrders'
 import StagingDashboard from './pages/StagingDashboard'
 import './App.css'
 
@@ -32,6 +37,17 @@ export default function App() {
           <li><NavLink to="/staging-dashboard">Staging Dashboard</NavLink></li>
           <li><NavLink to="/demand-dashboard">Demand Dashboard</NavLink></li>
         </ul>
+        <div className="nav-section-label">Projections</div>
+        <ul>
+          <li><NavLink to="/projection-dashboard">Projection Dashboard</NavLink></li>
+          <li><NavLink to="/projection-periods">Projection Periods</NavLink></li>
+          <li><NavLink to="/historical-data">Historical Data</NavLink></li>
+        </ul>
+        <div className="nav-section-label">Procurement</div>
+        <ul>
+          <li><NavLink to="/vendors">Vendors</NavLink></li>
+          <li><NavLink to="/purchase-orders">Purchase Orders</NavLink></li>
+        </ul>
         <div className="nav-section-label">Reference Data</div>
         <ul>
           <li><NavLink to="/picklist-skus">Picklist SKUs</NavLink></li>
@@ -50,6 +66,11 @@ export default function App() {
           <Route path="/orders" element={<Orders />} />
           <Route path="/staging-dashboard" element={<StagingDashboard />} />
           <Route path="/demand-dashboard" element={<DemandDashboard />} />
+          <Route path="/projection-dashboard" element={<ProjectionDashboard />} />
+          <Route path="/projection-periods" element={<ProjectionPeriods />} />
+          <Route path="/historical-data" element={<HistoricalPromotions />} />
+          <Route path="/vendors" element={<Vendors />} />
+          <Route path="/purchase-orders" element={<PurchaseOrders />} />
           <Route path="/picklist-skus" element={<PicklistSkus />} />
           <Route path="/sku-mapping" element={<SkuMapping />} />
           <Route path="/cogs" element={<Cogs />} />

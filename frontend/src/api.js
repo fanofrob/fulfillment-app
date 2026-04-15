@@ -113,6 +113,8 @@ export const ordersApi = {
   getBatchMargins: (ids) => api.get('/orders/margins', { params: { ids: ids.join(',') } }).then(r => r.data),
   listArchived: () => api.get('/orders/archived').then(r => r.data),
   cancelOrder: (id) => api.post(`/orders/${id}/cancel`).then(r => r.data),
+  bulkCancelSSBoxesPreview: (order_ids) => api.post('/orders/bulk-cancel-shipstation-boxes/preview', { order_ids }).then(r => r.data),
+  bulkCancelSSBoxes: (order_ids) => api.post('/orders/bulk-cancel-shipstation-boxes', { order_ids }).then(r => r.data),
 }
 
 export const shipstationApi = {
@@ -122,6 +124,7 @@ export const shipstationApi = {
   sync: () => api.post('/shipstation/sync').then(r => r.data),
   getEstimatedDelivery: (orderId) => api.get(`/shipstation/estimated-delivery/${orderId}`).then(r => r.data),
   checkDuplicates: () => api.post('/shipstation/check-duplicates').then(r => r.data),
+  listInShipStationBoxes: () => api.get('/shipstation/in-shipstation-boxes').then(r => r.data),
 }
 
 export const picklistSkusApi = {
@@ -161,6 +164,47 @@ export const productsApi = {
   sync: () => api.post('/products/sync').then(r => r.data),
 }
 
+export const projectionPeriodsApi = {
+  list: (params) => api.get('/projection-periods/', { params }).then(r => r.data),
+  get: (id) => api.get(`/projection-periods/${id}`).then(r => r.data),
+  create: (data) => api.post('/projection-periods/', data).then(r => r.data),
+  update: (id, data) => api.put(`/projection-periods/${id}`, data).then(r => r.data),
+  delete: (id) => api.delete(`/projection-periods/${id}`).then(r => r.data),
+  suggestDates: () => api.get('/projection-periods/suggest-dates').then(r => r.data),
+  // Short ship configs
+  listShortShip: (periodId) => api.get(`/projection-periods/${periodId}/short-ship`).then(r => r.data),
+  addShortShip: (periodId, data) => api.post(`/projection-periods/${periodId}/short-ship`, data).then(r => r.data),
+  removeShortShip: (periodId, sku) => api.delete(`/projection-periods/${periodId}/short-ship/${encodeURIComponent(sku)}`).then(r => r.data),
+  bulkSetShortShip: (periodId, data) => api.post(`/projection-periods/${periodId}/short-ship/bulk`, data).then(r => r.data),
+  copyShortShip: (periodId, data) => api.post(`/projection-periods/${periodId}/short-ship/copy`, data).then(r => r.data),
+  diffShortShip: (periodId, otherId) => api.get(`/projection-periods/${periodId}/short-ship/diff/${otherId}`).then(r => r.data),
+  importGlobalShortShip: (periodId) => api.post(`/projection-periods/${periodId}/short-ship/import-global`).then(r => r.data),
+  // Inventory hold configs
+  listInventoryHold: (periodId) => api.get(`/projection-periods/${periodId}/inventory-hold`).then(r => r.data),
+  addInventoryHold: (periodId, data) => api.post(`/projection-periods/${periodId}/inventory-hold`, data).then(r => r.data),
+  removeInventoryHold: (periodId, sku) => api.delete(`/projection-periods/${periodId}/inventory-hold/${encodeURIComponent(sku)}`).then(r => r.data),
+  copyInventoryHold: (periodId, data) => api.post(`/projection-periods/${periodId}/inventory-hold/copy`, data).then(r => r.data),
+  diffInventoryHold: (periodId, otherId) => api.get(`/projection-periods/${periodId}/inventory-hold/diff/${otherId}`).then(r => r.data),
+  importGlobalInventoryHold: (periodId) => api.post(`/projection-periods/${periodId}/inventory-hold/import-global`).then(r => r.data),
+  // SKU mappings
+  getSkuMappings: (periodId, params) => api.get(`/projection-periods/${periodId}/sku-mappings`, { params }).then(r => r.data),
+  listSheetsTabs: () => api.get('/projection-periods/sheets/tabs').then(r => r.data),
+}
+
+export const historicalDataApi = {
+  // Sales
+  ingestSales: (params) => api.post('/historical/sales/ingest', null, { params, timeout: 600000 }).then(r => r.data),
+  salesSummary: () => api.get('/historical/sales/summary').then(r => r.data),
+  listSales: (params) => api.get('/historical/sales/', { params }).then(r => r.data),
+  clearSales: () => api.delete('/historical/sales/').then(r => r.data),
+  // Promotions
+  listPromotions: () => api.get('/historical/promotions/').then(r => r.data),
+  getPromotion: (id) => api.get(`/historical/promotions/${id}`).then(r => r.data),
+  createPromotion: (data) => api.post('/historical/promotions/', data).then(r => r.data),
+  updatePromotion: (id, data) => api.put(`/historical/promotions/${id}`, data).then(r => r.data),
+  deletePromotion: (id) => api.delete(`/historical/promotions/${id}`).then(r => r.data),
+}
+
 export const fulfillmentApi = {
   // Carrier service rule evaluation
   getCarrierServiceForOrder: (shopifyOrderId) =>
@@ -195,7 +239,7 @@ export const fulfillmentApi = {
   bulkPush: (data) => api.post('/fulfillment/bulk-push', data).then(r => r.data),
 
   // Streaming bulk push — returns an EventSource-like reader
-  bulkPushStream: ({ order_ids, onProgress, onDone, onError }) => {
+  bulkPushStream: ({ order_ids, onProgress, onStart, onDone, onError }) => {
     const ctrl = new AbortController()
     fetch('http://localhost:8000/api/fulfillment/bulk-push-stream', {
       method: 'POST',
@@ -223,9 +267,9 @@ export const fulfillmentApi = {
               eventType = line.slice(7).trim()
             } else if (line.startsWith('data: ')) {
               const data = JSON.parse(line.slice(6))
-              if (eventType === 'progress' && onProgress) onProgress(data)
+              if (eventType === 'start' && onStart) onStart(data)
+              else if (eventType === 'progress' && onProgress) onProgress(data)
               else if (eventType === 'done' && onDone) onDone(data)
-              else if (eventType === 'start' && onProgress) onProgress(data)
             }
           }
         }
@@ -235,6 +279,9 @@ export const fulfillmentApi = {
       })
     return ctrl // caller can call ctrl.abort() to cancel
   },
+
+  // Poll push job status (survives page refresh)
+  getPushStatus: (jobId) => api.get(`/fulfillment/bulk-push-status/${jobId}`).then(r => r.data),
 
   // Auto-create plans for all unplanned not_processed orders
   bulkAutoPlan: (orderIds) => api.post('/fulfillment/bulk-auto-plan', orderIds ? { order_ids: orderIds } : {}).then(r => r.data),
@@ -246,4 +293,65 @@ export const fulfillmentApi = {
   listChanges: (params) => api.get('/fulfillment/changes', { params }).then(r => r.data),
   approveChange: (id, data) => api.post(`/fulfillment/changes/${id}/approve`, data || {}).then(r => r.data),
   rejectChange: (id, data) => api.post(`/fulfillment/changes/${id}/reject`, data || {}).then(r => r.data),
+}
+
+export const projectionsApi = {
+  generate: (periodId, data = {}) => api.post(`/projections/generate/${periodId}`, data).then(r => r.data),
+  list: (params) => api.get('/projections/', { params }).then(r => r.data),
+  get: (id) => api.get(`/projections/${id}`).then(r => r.data),
+  delete: (id) => api.delete(`/projections/${id}`).then(r => r.data),
+
+  // Hourly breakdown & comparison
+  getHourlyBreakdown: (projectionId, productType) =>
+    api.get(`/projections/${projectionId}/hourly-breakdown`, { params: { product_type: productType } }).then(r => r.data),
+  compare: (id, otherId) =>
+    api.get(`/projections/${id}/compare/${otherId}`).then(r => r.data),
+
+  // Padding configs
+  listPaddingConfigs: () => api.get('/projections/padding-configs').then(r => r.data),
+  upsertPaddingConfig: (data) => api.post('/projections/padding-configs', data).then(r => r.data),
+  deletePaddingConfig: (id) => api.delete(`/projections/padding-configs/${id}`).then(r => r.data),
+}
+
+export const vendorsApi = {
+  list: (params) => api.get('/vendors/', { params }).then(r => r.data),
+  get: (id) => api.get(`/vendors/${id}`).then(r => r.data),
+  create: (data) => api.post('/vendors/', data).then(r => r.data),
+  update: (id, data) => api.put(`/vendors/${id}`, data).then(r => r.data),
+  delete: (id) => api.delete(`/vendors/${id}`).then(r => r.data),
+  // Vendor products
+  addProduct: (vendorId, data) => api.post(`/vendors/${vendorId}/products`, data).then(r => r.data),
+  updateProduct: (vendorId, productId, data) => api.put(`/vendors/${vendorId}/products/${productId}`, data).then(r => r.data),
+  deleteProduct: (vendorId, productId) => api.delete(`/vendors/${vendorId}/products/${productId}`).then(r => r.data),
+  // Lookups
+  getPreferred: (productType) => api.get(`/vendors/preferred/${encodeURIComponent(productType)}`).then(r => r.data),
+  getByProductType: (productType) => api.get(`/vendors/by-product-type/${encodeURIComponent(productType)}`).then(r => r.data),
+}
+
+export const purchaseOrdersApi = {
+  list: (params) => api.get('/purchase-orders/', { params }).then(r => r.data),
+  get: (id) => api.get(`/purchase-orders/${id}`).then(r => r.data),
+  create: (data) => api.post('/purchase-orders/', data).then(r => r.data),
+  update: (id, data) => api.put(`/purchase-orders/${id}`, data).then(r => r.data),
+  delete: (id) => api.delete(`/purchase-orders/${id}`).then(r => r.data),
+  // Lines
+  addLine: (poId, data) => api.post(`/purchase-orders/${poId}/lines`, data).then(r => r.data),
+  updateLine: (poId, lineId, data) => api.put(`/purchase-orders/${poId}/lines/${lineId}`, data).then(r => r.data),
+  deleteLine: (poId, lineId) => api.delete(`/purchase-orders/${poId}/lines/${lineId}`).then(r => r.data),
+  // Allocations
+  setAllocations: (poId, lineId, data) => api.put(`/purchase-orders/${poId}/lines/${lineId}/allocations`, data).then(r => r.data),
+  // From projection
+  createFromProjection: (data) => api.post('/purchase-orders/from-projection', data).then(r => r.data),
+  // On-order summary
+  getOnOrder: (periodId) => api.get(`/purchase-orders/on-order/${periodId}`).then(r => r.data),
+}
+
+export const receivingApi = {
+  listForPO: (poId) => api.get(`/receiving/po/${poId}`).then(r => r.data),
+  receive: (poId, lineId, data) => api.post(`/receiving/po/${poId}/lines/${lineId}/receive`, data).then(r => r.data),
+  update: (recordId, data) => api.put(`/receiving/${recordId}`, data).then(r => r.data),
+  delete: (recordId) => api.delete(`/receiving/${recordId}`).then(r => r.data),
+  getSkusForProductType: (productType) => api.get(`/receiving/skus-for-product-type/${encodeURIComponent(productType)}`).then(r => r.data),
+  pushToInventory: (recordId, data) => api.post(`/receiving/${recordId}/push-to-inventory`, data || {}).then(r => r.data),
+  pushAll: (poId, data) => api.post(`/receiving/po/${poId}/push-all`, data || {}).then(r => r.data),
 }
