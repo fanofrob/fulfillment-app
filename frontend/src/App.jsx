@@ -15,6 +15,7 @@ import ProjectionDashboard from './pages/ProjectionDashboard'
 import Vendors from './pages/Vendors'
 import PurchaseOrders from './pages/PurchaseOrders'
 import StagingDashboard from './pages/StagingDashboard'
+import InventoryCount from './pages/InventoryCount'
 import './App.css'
 
 // Routes that use the full-bleed no-padding layout
@@ -33,6 +34,7 @@ export default function App() {
         <div className="nav-section-label">Operations</div>
         <ul>
           <li><NavLink to="/inventory">Inventory</NavLink></li>
+          <li><NavLink to="/inventory-count">Inventory Count</NavLink></li>
           <li><NavLink to="/orders">Orders</NavLink></li>
           <li><NavLink to="/staging-dashboard">Staging Dashboard</NavLink></li>
           <li><NavLink to="/demand-dashboard">Demand Dashboard</NavLink></li>
@@ -63,6 +65,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/inventory" replace />} />
           <Route path="/inventory" element={<Inventory />} />
+          <Route path="/inventory-count" element={<InventoryCount />} />
           <Route path="/orders" element={<Orders />} />
           <Route path="/staging-dashboard" element={<StagingDashboard />} />
           <Route path="/demand-dashboard" element={<DemandDashboard />} />

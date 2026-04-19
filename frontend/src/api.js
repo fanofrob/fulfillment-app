@@ -359,3 +359,16 @@ export const receivingApi = {
   pushToInventory: (recordId, data) => api.post(`/receiving/${recordId}/push-to-inventory`, data || {}).then(r => r.data),
   pushAll: (poId, data) => api.post(`/receiving/po/${poId}/push-all`, data || {}).then(r => r.data),
 }
+
+export const inventoryCountApi = {
+  scan: (warehouse, imageFiles) => {
+    const form = new FormData()
+    form.append('warehouse', warehouse)
+    imageFiles.forEach(f => form.append('images', f))
+    return api.post('/inventory-count/scan', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+    }).then(r => r.data)
+  },
+  commit: (data) => api.post('/inventory-count/commit', data).then(r => r.data),
+}
