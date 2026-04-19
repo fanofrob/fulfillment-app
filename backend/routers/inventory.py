@@ -41,67 +41,87 @@ def _recompute_committed(warehouse: str, db: Session,
     Recompute committed_qty and available_qty for all items in a warehouse
     based on current open order line items. Call whenever order statuses change.
     """
-    # Aggregate demand per pick_sku from open orders
-    open_orders = db.query(models.ShopifyOrder).filter(
-        models.ShopifyOrder.assigned_warehouse == warehouse,
-        models.ShopifyOrder.app_status.in_(list(COMMITTED_STATUSES)),
-    ).all()
-
     # Get live SKU mapping (same source as demand_analysis) — cached 5 min
     try:
         sku_lookup = sheets_service.get_sku_mapping_lookup(warehouse)
     except Exception:
-        sku_lookup = {}  # Sheets unavailable, fall back to stored mappings below
+        sku_lookup = {}
 
-    # Pre-fetch all fulfillment plans for staged orders
+    # ── Open orders (committed) ───────────────────────────────────────────────
+    open_orders = db.query(models.ShopifyOrder).filter(
+        models.ShopifyOrder.assigned_warehouse == warehouse,
+        models.ShopifyOrder.app_status.in_(list(COMMITTED_STATUSES)),
+    ).all()
     open_order_ids = [o.shopify_order_id for o in open_orders]
+
+    # Batch-fetch all plans for open orders
     plans = db.query(models.FulfillmentPlan).filter(
         models.FulfillmentPlan.shopify_order_id.in_(open_order_ids)
-    ).all()
+    ).all() if open_order_ids else []
     plan_map = {p.shopify_order_id: p for p in plans}
+    plan_ids = [p.id for p in plans]
 
-    # For orders with a plan, build box-item demand (already in pick units)
+    # Batch-fetch all boxes for those plans
+    all_open_boxes = db.query(models.FulfillmentBox).filter(
+        models.FulfillmentBox.plan_id.in_(plan_ids)
+    ).all() if plan_ids else []
+    boxes_by_plan: dict[int, list] = {}
+    for box in all_open_boxes:
+        boxes_by_plan.setdefault(box.plan_id, []).append(box)
+
+    # Batch-fetch box line items for non-cancelled boxes
+    non_cancelled_box_ids = [b.id for b in all_open_boxes if b.status != 'cancelled']
+    all_box_items = db.query(models.BoxLineItem).filter(
+        models.BoxLineItem.box_id.in_(non_cancelled_box_ids)
+    ).all() if non_cancelled_box_ids else []
+    box_items_by_box: dict[int, list] = {}
+    for item in all_box_items:
+        box_items_by_box.setdefault(item.box_id, []).append(item)
+
+    # Build per-order box demand from box line items
     order_box_demand: dict[str, dict[str, float]] = {}
     for plan in plans:
-        non_cancelled_boxes = db.query(models.FulfillmentBox).filter(
-            models.FulfillmentBox.plan_id == plan.id,
-            models.FulfillmentBox.status.notin_(["cancelled"]),
-        ).all()
-        if not non_cancelled_boxes:
-            continue
-        box_ids = [b.id for b in non_cancelled_boxes]
-        box_items = db.query(models.BoxLineItem).filter(
-            models.BoxLineItem.box_id.in_(box_ids),
-        ).all()
-        if not box_items:
+        plan_boxes = [b for b in boxes_by_plan.get(plan.id, []) if b.status != 'cancelled']
+        if not plan_boxes:
             continue
         sku_agg: dict[str, float] = {}
-        for item in box_items:
-            if not item.pick_sku:
-                continue
-            sku_agg[item.pick_sku] = sku_agg.get(item.pick_sku, 0.0) + item.quantity
+        for box in plan_boxes:
+            for item in box_items_by_box.get(box.id, []):
+                if item.pick_sku:
+                    sku_agg[item.pick_sku] = sku_agg.get(item.pick_sku, 0.0) + item.quantity
         if sku_agg:
             order_box_demand[plan.shopify_order_id] = sku_agg
 
     orders_with_plan = set(order_box_demand.keys())
+
+    # Batch-fetch line items for open orders that have no plan
+    orders_without_plan_ids = [o.shopify_order_id for o in open_orders
+                                if o.shopify_order_id not in orders_with_plan]
+    open_line_items_by_order: dict[str, list] = {}
+    if orders_without_plan_ids:
+        for li in db.query(models.ShopifyLineItem).filter(
+            models.ShopifyLineItem.shopify_order_id.in_(orders_without_plan_ids)
+        ).all():
+            open_line_items_by_order.setdefault(li.shopify_order_id, []).append(li)
+
+    # Batch-fetch box types used by open-order boxes
+    open_box_type_ids = {b.box_type_id for b in all_open_boxes if b.box_type_id}
+    open_box_types = {}
+    if open_box_type_ids:
+        open_box_types = {bt.id: bt for bt in db.query(models.BoxType).filter(
+            models.BoxType.id.in_(list(open_box_type_ids))
+        ).all()}
 
     demand: dict[str, float] = {}
     for order in open_orders:
         order_id = order.shopify_order_id
 
         if order_id in orders_with_plan:
-            # Use actual box items (already in pick units) as ground truth
             for pick, qty in order_box_demand[order_id].items():
                 demand[pick] = demand.get(pick, 0.0) + qty
         else:
-            # Fall back to line items × SKU mapping
-            line_items = db.query(models.ShopifyLineItem).filter(
-                models.ShopifyLineItem.shopify_order_id == order_id,
-            ).all()
-            for li in line_items:
-                if not li.shopify_sku:
-                    continue
-                if li.app_line_status == 'short_ship':
+            for li in open_line_items_by_order.get(order_id, []):
+                if not li.shopify_sku or li.app_line_status == 'short_ship':
                     continue
                 qty = (li.fulfillable_quantity if li.fulfillable_quantity is not None
                        else li.quantity)
@@ -109,29 +129,21 @@ def _recompute_committed(warehouse: str, db: Session,
                 if live_mappings:
                     for m in live_mappings:
                         pick = m.get('pick_sku')
-                        if not pick:
-                            continue
-                        mix = m.get('mix_quantity') or 1.0
-                        demand[pick] = demand.get(pick, 0.0) + qty * mix
+                        if pick:
+                            demand[pick] = demand.get(pick, 0.0) + qty * (m.get('mix_quantity') or 1.0)
                 elif li.sku_mapped and li.pick_sku:
-                    needed = qty * (li.mix_quantity or 1.0)
-                    demand[li.pick_sku] = demand.get(li.pick_sku, 0.0) + needed
+                    demand[li.pick_sku] = demand.get(li.pick_sku, 0.0) + qty * (li.mix_quantity or 1.0)
 
-        # Commit 1 unit per box used in this order's fulfillment plan (box material)
+        # Commit 1 unit per box used (box material)
         plan = plan_map.get(order_id)
         if plan:
-            boxes = db.query(models.FulfillmentBox).filter(
-                models.FulfillmentBox.plan_id == plan.id
-            ).all()
-            for box in boxes:
+            for box in boxes_by_plan.get(plan.id, []):
                 if box.box_type_id:
-                    bt = db.query(models.BoxType).filter(
-                        models.BoxType.id == box.box_type_id
-                    ).first()
+                    bt = open_box_types.get(box.box_type_id)
                     if bt and bt.pick_sku:
                         demand[bt.pick_sku] = demand.get(bt.pick_sku, 0.0) + 1.0
 
-    # Also compute shipped_qty from shipped orders
+    # ── Shipped orders ────────────────────────────────────────────────────────
     shipped_q = db.query(models.ShopifyOrder).filter(
         models.ShopifyOrder.assigned_warehouse == warehouse,
         models.ShopifyOrder.app_status.in_(list(SHIPPED_STATUSES)),
@@ -141,47 +153,65 @@ def _recompute_committed(warehouse: str, db: Session,
     if shipped_to:
         shipped_q = shipped_q.filter(models.ShopifyOrder.updated_at <= shipped_to)
     shipped_orders = shipped_q.all()
+    shipped_order_ids = [o.shopify_order_id for o in shipped_orders]
 
     shipped: dict[str, float] = {}
-    for order in shipped_orders:
-        line_items = db.query(models.ShopifyLineItem).filter(
-            models.ShopifyLineItem.shopify_order_id == order.shopify_order_id,
-        ).all()
-        for li in line_items:
-            if not li.shopify_sku:
-                continue
-            if li.app_line_status == 'short_ship':
-                continue
-            qty = (li.fulfillable_quantity if li.fulfillable_quantity is not None
-                   else li.quantity)
-            live_mappings = sku_lookup.get(li.shopify_sku, [])
-            if live_mappings:
-                for m in live_mappings:
-                    pick = m.get('pick_sku')
-                    if not pick:
-                        continue
-                    mix = m.get('mix_quantity') or 1.0
-                    shipped[pick] = shipped.get(pick, 0.0) + qty * mix
-            elif li.sku_mapped and li.pick_sku:
-                # Fallback: use stored mapping if no live mapping available
-                needed = qty * (li.mix_quantity or 1.0)
-                shipped[li.pick_sku] = shipped.get(li.pick_sku, 0.0) + needed
+    if shipped_order_ids:
+        # Batch-fetch all line items for shipped orders
+        shipped_line_items_by_order: dict[str, list] = {}
+        for li in db.query(models.ShopifyLineItem).filter(
+            models.ShopifyLineItem.shopify_order_id.in_(shipped_order_ids)
+        ).all():
+            shipped_line_items_by_order.setdefault(li.shopify_order_id, []).append(li)
 
-        # Count 1 unit per box shipped in this order's fulfillment plan
-        plan = db.query(models.FulfillmentPlan).filter(
-            models.FulfillmentPlan.shopify_order_id == order.shopify_order_id
-        ).first()
-        if plan:
-            boxes = db.query(models.FulfillmentBox).filter(
-                models.FulfillmentBox.plan_id == plan.id
-            ).all()
-            for box in boxes:
+        # Batch-fetch fulfillment plans for shipped orders
+        shipped_plans = db.query(models.FulfillmentPlan).filter(
+            models.FulfillmentPlan.shopify_order_id.in_(shipped_order_ids)
+        ).all()
+        shipped_plan_map = {p.shopify_order_id: p for p in shipped_plans}
+        shipped_plan_ids = [p.id for p in shipped_plans]
+
+        # Batch-fetch boxes and box types for shipped plans
+        shipped_boxes_by_plan: dict[int, list] = {}
+        shipped_box_type_ids: set[int] = set()
+        if shipped_plan_ids:
+            for box in db.query(models.FulfillmentBox).filter(
+                models.FulfillmentBox.plan_id.in_(shipped_plan_ids)
+            ).all():
+                shipped_boxes_by_plan.setdefault(box.plan_id, []).append(box)
                 if box.box_type_id:
-                    bt = db.query(models.BoxType).filter(
-                        models.BoxType.id == box.box_type_id
-                    ).first()
-                    if bt and bt.pick_sku:
-                        shipped[bt.pick_sku] = shipped.get(bt.pick_sku, 0.0) + 1.0
+                    shipped_box_type_ids.add(box.box_type_id)
+
+        shipped_box_types = {}
+        if shipped_box_type_ids:
+            shipped_box_types = {bt.id: bt for bt in db.query(models.BoxType).filter(
+                models.BoxType.id.in_(list(shipped_box_type_ids))
+            ).all()}
+
+        for order in shipped_orders:
+            order_id = order.shopify_order_id
+            for li in shipped_line_items_by_order.get(order_id, []):
+                if not li.shopify_sku or li.app_line_status == 'short_ship':
+                    continue
+                qty = (li.fulfillable_quantity if li.fulfillable_quantity is not None
+                       else li.quantity)
+                live_mappings = sku_lookup.get(li.shopify_sku, [])
+                if live_mappings:
+                    for m in live_mappings:
+                        pick = m.get('pick_sku')
+                        if pick:
+                            shipped[pick] = shipped.get(pick, 0.0) + qty * (m.get('mix_quantity') or 1.0)
+                elif li.sku_mapped and li.pick_sku:
+                    shipped[li.pick_sku] = shipped.get(li.pick_sku, 0.0) + qty * (li.mix_quantity or 1.0)
+
+            # Count 1 unit per box shipped (box material)
+            plan = shipped_plan_map.get(order_id)
+            if plan:
+                for box in shipped_boxes_by_plan.get(plan.id, []):
+                    if box.box_type_id:
+                        bt = shipped_box_types.get(box.box_type_id)
+                        if bt and bt.pick_sku:
+                            shipped[bt.pick_sku] = shipped.get(bt.pick_sku, 0.0) + 1.0
 
     # Update all inventory items for this warehouse
     items = db.query(models.InventoryItem).filter(
@@ -347,6 +377,44 @@ def list_items(
     items = q.order_by(models.InventoryItem.pick_sku).all()
 
     # Build category map from picklist_skus
+    pick_skus = [i.pick_sku for i in items]
+    category_map: dict[str, str | None] = {}
+    if pick_skus:
+        pskus = db.query(models.PicklistSku.pick_sku, models.PicklistSku.category).filter(
+            models.PicklistSku.pick_sku.in_(pick_skus)
+        ).all()
+        category_map = {p.pick_sku: p.category for p in pskus}
+
+    return [
+        {
+            "id": item.id,
+            "pick_sku": item.pick_sku,
+            "warehouse": item.warehouse,
+            "name": item.name,
+            "on_hand_qty": item.on_hand_qty,
+            "committed_qty": item.committed_qty,
+            "available_qty": item.available_qty,
+            "shipped_qty": item.shipped_qty,
+            "days_on_hand": item.days_on_hand,
+            "batch_code": item.batch_code,
+            "updated_at": item.updated_at,
+            "category": category_map.get(item.pick_sku),
+        }
+        for item in items
+    ]
+
+
+@router.get("/weekly-report")
+def weekly_report(
+    warehouse: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Items with on_hand_qty > 0 for the weekly inventory count sheet."""
+    items = db.query(models.InventoryItem).filter(
+        models.InventoryItem.warehouse == warehouse,
+        models.InventoryItem.on_hand_qty > 0,
+    ).order_by(models.InventoryItem.pick_sku).all()
+
     pick_skus = [i.pick_sku for i in items]
     category_map: dict[str, str | None] = {}
     if pick_skus:

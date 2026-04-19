@@ -81,6 +81,10 @@ export const inventoryApi = {
   updateBatch: (batchId, data) =>
     api.put(`/inventory/batches/${batchId}`, data).then(r => r.data),
 
+  // Weekly count report (items with on_hand_qty > 0)
+  weeklyReport: (warehouse) =>
+    api.get('/inventory/weekly-report', { params: { warehouse } }).then(r => r.data),
+
   // Recompute committed from live orders
   recomputeCommitted: (warehouse) =>
     api.post('/inventory/recompute-committed', null, { params: { warehouse } }).then(r => r.data),

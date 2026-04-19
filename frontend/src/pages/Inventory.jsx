@@ -57,7 +57,20 @@ function csvEscape(val) {
 }
 
 async function printWeeklyReport(warehouse) {
-  const items = await inventoryApi.weeklyReport(warehouse)
+  // Open window immediately (synchronous with user gesture) so popup blockers pass.
+  const win = window.open('', '_blank')
+  if (!win) { alert('Pop-up blocked — please allow pop-ups for this site.'); return }
+  win.document.write('<p style="font-family:sans-serif;padding:32px">Loading…</p>')
+
+  let items
+  try {
+    items = await inventoryApi.weeklyReport(warehouse)
+  } catch (err) {
+    win.close()
+    alert('Failed to load weekly report')
+    return
+  }
+
   const now = new Date()
   const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
   const warehouseLabel = warehouse.charAt(0).toUpperCase() + warehouse.slice(1)
@@ -113,7 +126,6 @@ async function printWeeklyReport(warehouse) {
 </body>
 </html>`
 
-  const win = window.open('', '_blank')
   win.document.write(html)
   win.document.close()
   win.focus()
@@ -1035,6 +1047,7 @@ function InventoryInner({ warehouse, onWarehouseChange }) {
       ...(shippedTo ? { shipped_to: shippedTo } : {}),
     }),
     refetchInterval: 30000,
+    placeholderData: (prev) => prev,
   })
 
   const updateMutation = useMutation({
