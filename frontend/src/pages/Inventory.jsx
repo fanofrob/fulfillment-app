@@ -56,6 +56,70 @@ function csvEscape(val) {
   return s
 }
 
+async function printWeeklyReport(warehouse) {
+  const items = await inventoryApi.weeklyReport(warehouse)
+  const now = new Date()
+  const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+  const warehouseLabel = warehouse.charAt(0).toUpperCase() + warehouse.slice(1)
+
+  const fruit = items.filter(i => i.category?.toLowerCase() === 'fruit')
+  const packaging = items.filter(i => i.category?.toLowerCase() === 'packaging')
+  const other = items.filter(i => {
+    const cat = i.category?.toLowerCase()
+    return !cat || (cat !== 'fruit' && cat !== 'packaging')
+  })
+
+  function renderSection(title, rows) {
+    if (!rows.length) return ''
+    return `
+      <h3 style="margin:24px 0 8px;font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:#555;border-bottom:1px solid #ccc;padding-bottom:4px">${title}</h3>
+      <table>
+        <thead><tr>
+          <th>SKU</th><th style="text-align:right">Available</th><th>Batch</th><th style="width:110px">Updated Quantity</th><th style="width:200px">Notes</th>
+        </tr></thead>
+        <tbody>
+          ${rows.map(r => `<tr>
+            <td>${r.pick_sku}</td>
+            <td style="text-align:right">${r.available_qty != null ? Number(r.available_qty).toFixed(1) : '—'}</td>
+            <td>${r.batch_code || ''}</td>
+            <td></td>
+            <td></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>`
+  }
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Weekly Inventory Report — ${warehouseLabel} — ${dateStr}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13.2px; color: #111; margin: 32px; }
+    h1 { font-size: 19.8px; margin: 0 0 4px; }
+    .subtitle { color: #666; font-size: 13.2px; margin-bottom: 24px; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+    th { text-align: left; font-size: 12.1px; font-weight: 600; color: #555; border: 1px solid #ddd; border-bottom: 2px solid #ddd; padding: 4.8px 8px; }
+    td { padding: 4.8px 8px; border: 1px solid #eee; }
+    @media print { body { margin: 16px; } }
+  </style>
+</head>
+<body>
+  <h1>Weekly Inventory Report — ${warehouseLabel}</h1>
+  <div class="subtitle">SKUs with inventory &gt; 0 in the last 7 days &nbsp;·&nbsp; Printed ${dateStr} &nbsp;·&nbsp; ${items.length} SKU${items.length !== 1 ? 's' : ''}</div>
+  ${renderSection('Fruit', fruit)}
+  ${renderSection('Packaging', packaging)}
+  ${renderSection('Other', other)}
+</body>
+</html>`
+
+  const win = window.open('', '_blank')
+  win.document.write(html)
+  win.document.close()
+  win.focus()
+  win.print()
+}
+
 function exportCsv(items, warehouse) {
   const rows = items.map(item => CSV_HEADERS.map(h => csvEscape(item[h])).join(','))
   const csv = [CSV_HEADERS.join(','), ...rows].join('\n')
@@ -1204,6 +1268,13 @@ function InventoryInner({ warehouse, onWarehouseChange }) {
         <span style={{ marginLeft: 'auto', fontSize: 12, color: '#999' }}>
           {table.getFilteredRowModel().rows.length} of {items.length} SKUs
         </span>
+        <button
+          onClick={() => printWeeklyReport(warehouse)}
+          className="btn btn-secondary btn-sm"
+          title="Print SKUs that had inventory > 0 in the last 7 days"
+        >
+          Print Weekly Report
+        </button>
         <button
           onClick={() => exportCsv(items, warehouse)}
           disabled={items.length === 0}
