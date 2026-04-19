@@ -234,12 +234,15 @@ def get_shipments(ss_order_ids: List[str], days: int = 14) -> List[Dict]:
     return all_shipments
 
 
-def push_box(order, box_number: int, box_items, weight_oz=None, box_type=None, carrier_code=None, service_code=None) -> dict:
+def push_box(order, box_number: int, box_items, weight_oz=None, box_type=None, carrier_code=None, service_code=None, shipping_provider_id=None) -> dict:
     """
     Create a ShipStation order for a single fulfillment box.
     box_items: list of BoxLineItem model objects.
     weight_oz: total shipment weight in oz (items + box tare), or None to omit.
     box_type: BoxType model object (for packageCode and dimensions), or None.
+    shipping_provider_id: ShipStation shippingProviderId — required when multiple
+        accounts share the same carrierCode (e.g. USPS wallet se-4946429 vs
+        Stamps.com se-5337414). Sent as advancedOptions.billToMyOtherAccount.
     Order number is formatted as '<shopify_order_number>-Box<N>' so each box
     gets its own ShipStation entry with a distinct tracking number.
     Returns the ShipStation order dict.
@@ -305,6 +308,7 @@ def push_box(order, box_number: int, box_items, weight_oz=None, box_type=None, c
         "internalNotes": f"Shopify {order.shopify_order_number} — Box {box_number}",
         "advancedOptions": {
             "customField3": custom_field_3,
+            **({"billToMyOtherAccount": shipping_provider_id} if shipping_provider_id else {}),
         },
     }
 

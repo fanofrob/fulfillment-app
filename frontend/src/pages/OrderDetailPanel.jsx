@@ -947,7 +947,7 @@ export default function OrderDetailPanel({ order, onClose, onPrev, onNext, hasPr
             <span>Carrier Service</span>
             <span>
               {carrierServiceMatch?.carrier_code ? (() => {
-                const svc = findService(carrierServiceMatch.carrier_code, carrierServiceMatch.service_code)
+                const svc = findService(carrierServiceMatch.carrier_code, carrierServiceMatch.service_code, carrierServiceMatch.shipping_provider_id ?? null)
                 return (
                   <span title={`Rule: ${carrierServiceMatch.rule_name}`} style={{ display: 'inline-flex', flexDirection: 'column', gap: 1 }}>
                     <span style={{ fontSize: 12, fontWeight: 500 }}>

@@ -203,6 +203,7 @@ class CarrierServiceRuleBase(BaseModel):
     name: str
     carrier_code: str
     service_code: str
+    shipping_provider_id: Optional[int] = None  # disambiguates multiple accounts sharing the same carrierCode
     priority: Optional[int] = 0
     is_active: Optional[bool] = True
     conditions: Optional[List[CarrierServiceCondition]] = []
@@ -215,6 +216,7 @@ class CarrierServiceRuleUpdate(BaseModel):
     name: Optional[str] = None
     carrier_code: Optional[str] = None
     service_code: Optional[str] = None
+    shipping_provider_id: Optional[int] = None
     priority: Optional[int] = None
     is_active: Optional[bool] = None
     conditions: Optional[List[CarrierServiceCondition]] = None

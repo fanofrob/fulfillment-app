@@ -384,7 +384,7 @@ def _apply_package_rules(order: models.ShopifyOrder, db: Session) -> Optional[in
 def _apply_carrier_service_rules(order: models.ShopifyOrder, db: Session) -> Optional[dict]:
     """
     Evaluate active CarrierServiceRules (highest priority first) against the order.
-    Returns {rule_id, rule_name, carrier_code, service_code} for the first match, or None.
+    Returns {rule_id, rule_name, carrier_code, service_code, shipping_provider_id} for the first match, or None.
     """
     rules = (
         db.query(models.CarrierServiceRule)
@@ -401,6 +401,7 @@ def _apply_carrier_service_rules(order: models.ShopifyOrder, db: Session) -> Opt
                 "rule_name": rule.name,
                 "carrier_code": rule.carrier_code,
                 "service_code": rule.service_code,
+                "shipping_provider_id": rule.shipping_provider_id,
             }
     return None
 
@@ -1075,6 +1076,7 @@ def push_box(plan_id: int, box_id: int, db: Session = Depends(get_db)):
             box_type=box_type,
             carrier_code=carrier_match.get("carrier_code") if carrier_match else None,
             service_code=carrier_match.get("service_code") if carrier_match else None,
+            shipping_provider_id=carrier_match.get("shipping_provider_id") if carrier_match else None,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"ShipStation error: {str(e)}")
@@ -1817,6 +1819,7 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                 "box_type": box_type,
                 "carrier_code": carrier_match.get("carrier_code") if carrier_match else None,
                 "service_code": carrier_match.get("service_code") if carrier_match else None,
+                "shipping_provider_id": carrier_match.get("shipping_provider_id") if carrier_match else None,
             })
 
         if order_skipped:
@@ -1861,6 +1864,7 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                     box_type=bt["box_type"],
                     carrier_code=bt["carrier_code"],
                     service_code=bt["service_code"],
+                    shipping_provider_id=bt.get("shipping_provider_id"),
                 )
                 return {"box_id": bt["box"].id, "success": True, "ss_result": ss_result}
             except Exception as e:
@@ -2116,6 +2120,7 @@ def bulk_push_plans(body: BulkPushRequest, db: Session = Depends(get_db)):
                     box_type=box_type,
                     carrier_code=carrier_match.get("carrier_code") if carrier_match else None,
                     service_code=carrier_match.get("service_code") if carrier_match else None,
+                    shipping_provider_id=carrier_match.get("shipping_provider_id") if carrier_match else None,
                 )
                 box.shipstation_order_id = str(ss_result.get("orderId", ""))
                 box.shipstation_order_key = ss_result.get("orderKey", "")

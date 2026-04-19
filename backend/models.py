@@ -106,8 +106,9 @@ class CarrierServiceRule(Base):
     __tablename__ = "carrier_service_rules"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
-    carrier_code = Column(String, nullable=False)   # ShipStation carrierCode, e.g. 'stamps_com', 'fedex'
-    service_code = Column(String, nullable=False)   # ShipStation serviceCode, e.g. 'usps_priority_mail'
+    carrier_code = Column(String, nullable=False)        # ShipStation carrierCode, e.g. 'stamps_com', 'fedex'
+    service_code = Column(String, nullable=False)        # ShipStation serviceCode, e.g. 'usps_priority_mail'
+    shipping_provider_id = Column(Integer, nullable=True)  # SS shippingProviderId — disambiguates multiple accounts with same carrierCode (e.g. two Stamps.com/USPS accounts). Sent as advancedOptions.billToMyOtherAccount.
     priority = Column(Integer, nullable=False, default=0)  # higher = evaluated first
     is_active = Column(Boolean, nullable=False, default=True)
     # JSON array of condition objects (same schema as PackageRule conditions)

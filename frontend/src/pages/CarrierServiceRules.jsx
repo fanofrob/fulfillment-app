@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { carrierServiceRulesApi } from '../api'
-import { servicesByCarrier, findService, serviceKey } from '../shipstationServices'
+import { servicesByCarrier, findService, serviceKey, parseServiceKey } from '../shipstationServices'
 
 // ── Field / Operator definitions ──────────────────────────────────────────────
 
@@ -55,8 +55,8 @@ function conditionLabel(c) {
   return `${fieldLabel} ${opLabel} ${c.value}`
 }
 
-function serviceLabel(carrierCode, serviceCode) {
-  const svc = findService(carrierCode, serviceCode)
+function serviceLabel(carrierCode, serviceCode, shippingProviderId = null) {
+  const svc = findService(carrierCode, serviceCode, shippingProviderId)
   if (!svc) return `${carrierCode} / ${serviceCode}`
   return `${svc.carrierLabel} — ${svc.label}`
 }
@@ -69,6 +69,7 @@ const EMPTY_FORM = {
   name: '',
   carrier_code: '',
   service_code: '',
+  shipping_provider_id: null,
   priority: 0,
   is_active: true,
   conditions: [],
@@ -86,7 +87,7 @@ export default function CarrierServiceRules() {
 
   // Derived: the selected catalog key for the service selector
   const selectedKey = form.carrier_code && form.service_code
-    ? `${form.carrier_code}::${form.service_code}`
+    ? serviceKey({ carrierCode: form.carrier_code, shippingProviderId: form.shipping_provider_id ?? null, code: form.service_code })
     : ''
 
   const { data: rules = [], isLoading } = useQuery({
@@ -126,6 +127,7 @@ export default function CarrierServiceRules() {
       name: row.name,
       carrier_code: row.carrier_code,
       service_code: row.service_code,
+      shipping_provider_id: row.shipping_provider_id ?? null,
       priority: row.priority ?? 0,
       is_active: row.is_active ?? true,
       conditions: (row.conditions || []).map(c => ({ ...c, value: c.value ?? '', value2: c.value2 ?? '' })),
@@ -137,11 +139,11 @@ export default function CarrierServiceRules() {
 
   function handleServiceSelect(key) {
     if (!key) {
-      setForm(f => ({ ...f, carrier_code: '', service_code: '' }))
+      setForm(f => ({ ...f, carrier_code: '', service_code: '', shipping_provider_id: null }))
       return
     }
-    const [carrierCode, serviceCode] = key.split('::')
-    setForm(f => ({ ...f, carrier_code: carrierCode, service_code: serviceCode }))
+    const { carrierCode, shippingProviderId, serviceCode } = parseServiceKey(key)
+    setForm(f => ({ ...f, carrier_code: carrierCode, service_code: serviceCode, shipping_provider_id: shippingProviderId }))
   }
 
   // ── Condition mutations ──────────────────────────────────────────────────────
@@ -188,6 +190,7 @@ export default function CarrierServiceRules() {
       name: form.name.trim(),
       carrier_code: form.carrier_code,
       service_code: form.service_code,
+      shipping_provider_id: form.shipping_provider_id ?? null,
       priority: parseInt(form.priority) || 0,
       is_active: form.is_active,
       notes: form.notes.trim() || null,
@@ -273,7 +276,7 @@ export default function CarrierServiceRules() {
                   <td style={{ fontWeight: 500 }}>{row.name}</td>
                   <td>
                     <span className="mono" style={{ background: '#f3f4f6', padding: '2px 8px', borderRadius: 4, fontSize: 12 }}>
-                      {serviceLabel(row.carrier_code, row.service_code)}
+                      {serviceLabel(row.carrier_code, row.service_code, row.shipping_provider_id ?? null)}
                     </span>
                   </td>
                   <td>

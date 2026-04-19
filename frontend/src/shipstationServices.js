@@ -2,20 +2,36 @@
  * ShipStation carrier services catalog.
  * `carrierCode` is the exact ShipStation carrierCode for the API.
  * `code` is the exact ShipStation serviceCode for the API.
+ * `shippingProviderId` (optional) — disambiguates accounts that share the same
+ *   carrierCode. Sent as advancedOptions.billToMyOtherAccount on createorder.
+ *   - se-4946429 = USPS by ShipStation (wallet, default when omitted)
+ *   - se-5337414 = Stamps.com (own account, $20k+ balance)
  */
 
 export const SS_SERVICES = [
-  // ── USPS (via Stamps.com) ────────────────────────────────────────────────────
-  { carrierCode: 'stamps_com', carrierLabel: 'USPS',   code: 'usps_first_class_mail',                        label: 'First Class Mail' },
-  { carrierCode: 'stamps_com', carrierLabel: 'USPS',   code: 'usps_priority_mail',                           label: 'Priority Mail' },
-  { carrierCode: 'stamps_com', carrierLabel: 'USPS',   code: 'usps_priority_mail_express',                   label: 'Priority Mail Express' },
-  { carrierCode: 'stamps_com', carrierLabel: 'USPS',   code: 'usps_ground_advantage',                        label: 'Ground Advantage' },
-  { carrierCode: 'stamps_com', carrierLabel: 'USPS',   code: 'usps_parcel_select',                           label: 'Parcel Select Ground' },
-  { carrierCode: 'stamps_com', carrierLabel: 'USPS',   code: 'usps_media_mail',                              label: 'Media Mail' },
-  { carrierCode: 'stamps_com', carrierLabel: 'USPS',   code: 'usps_library_mail',                            label: 'Library Mail' },
-  { carrierCode: 'stamps_com', carrierLabel: 'USPS',   code: 'usps_first_class_package_international_service', label: 'First Class Package International' },
-  { carrierCode: 'stamps_com', carrierLabel: 'USPS',   code: 'usps_priority_mail_international',             label: 'Priority Mail International' },
-  { carrierCode: 'stamps_com', carrierLabel: 'USPS',   code: 'usps_priority_mail_express_international',     label: 'Priority Mail Express International' },
+  // ── USPS via ShipStation wallet (se-4946429) — default if no provider set ────
+  { carrierCode: 'stamps_com', shippingProviderId: 4946429, carrierLabel: 'USPS — ShipStation', code: 'usps_first_class_mail',                          label: 'First Class Mail' },
+  { carrierCode: 'stamps_com', shippingProviderId: 4946429, carrierLabel: 'USPS — ShipStation', code: 'usps_priority_mail',                             label: 'Priority Mail' },
+  { carrierCode: 'stamps_com', shippingProviderId: 4946429, carrierLabel: 'USPS — ShipStation', code: 'usps_priority_mail_express',                     label: 'Priority Mail Express' },
+  { carrierCode: 'stamps_com', shippingProviderId: 4946429, carrierLabel: 'USPS — ShipStation', code: 'usps_ground_advantage',                          label: 'Ground Advantage' },
+  { carrierCode: 'stamps_com', shippingProviderId: 4946429, carrierLabel: 'USPS — ShipStation', code: 'usps_parcel_select',                             label: 'Parcel Select Ground' },
+  { carrierCode: 'stamps_com', shippingProviderId: 4946429, carrierLabel: 'USPS — ShipStation', code: 'usps_media_mail',                                label: 'Media Mail' },
+  { carrierCode: 'stamps_com', shippingProviderId: 4946429, carrierLabel: 'USPS — ShipStation', code: 'usps_library_mail',                              label: 'Library Mail' },
+  { carrierCode: 'stamps_com', shippingProviderId: 4946429, carrierLabel: 'USPS — ShipStation', code: 'usps_first_class_package_international_service',  label: 'First Class Package International' },
+  { carrierCode: 'stamps_com', shippingProviderId: 4946429, carrierLabel: 'USPS — ShipStation', code: 'usps_priority_mail_international',               label: 'Priority Mail International' },
+  { carrierCode: 'stamps_com', shippingProviderId: 4946429, carrierLabel: 'USPS — ShipStation', code: 'usps_priority_mail_express_international',       label: 'Priority Mail Express International' },
+
+  // ── USPS via Stamps.com own account (se-5337414) ─────────────────────────────
+  { carrierCode: 'stamps_com', shippingProviderId: 5337414, carrierLabel: 'USPS — Stamps.com',  code: 'usps_first_class_mail',                          label: 'First Class Mail' },
+  { carrierCode: 'stamps_com', shippingProviderId: 5337414, carrierLabel: 'USPS — Stamps.com',  code: 'usps_priority_mail',                             label: 'Priority Mail' },
+  { carrierCode: 'stamps_com', shippingProviderId: 5337414, carrierLabel: 'USPS — Stamps.com',  code: 'usps_priority_mail_express',                     label: 'Priority Mail Express' },
+  { carrierCode: 'stamps_com', shippingProviderId: 5337414, carrierLabel: 'USPS — Stamps.com',  code: 'usps_ground_advantage',                          label: 'Ground Advantage' },
+  { carrierCode: 'stamps_com', shippingProviderId: 5337414, carrierLabel: 'USPS — Stamps.com',  code: 'usps_parcel_select',                             label: 'Parcel Select Ground' },
+  { carrierCode: 'stamps_com', shippingProviderId: 5337414, carrierLabel: 'USPS — Stamps.com',  code: 'usps_media_mail',                                label: 'Media Mail' },
+  { carrierCode: 'stamps_com', shippingProviderId: 5337414, carrierLabel: 'USPS — Stamps.com',  code: 'usps_library_mail',                              label: 'Library Mail' },
+  { carrierCode: 'stamps_com', shippingProviderId: 5337414, carrierLabel: 'USPS — Stamps.com',  code: 'usps_first_class_package_international_service',  label: 'First Class Package International' },
+  { carrierCode: 'stamps_com', shippingProviderId: 5337414, carrierLabel: 'USPS — Stamps.com',  code: 'usps_priority_mail_international',               label: 'Priority Mail International' },
+  { carrierCode: 'stamps_com', shippingProviderId: 5337414, carrierLabel: 'USPS — Stamps.com',  code: 'usps_priority_mail_express_international',       label: 'Priority Mail Express International' },
 
   // ── FedEx ────────────────────────────────────────────────────────────────────
   { carrierCode: 'fedex',      carrierLabel: 'FedEx',  code: 'fedex_ground',                                 label: 'FedEx Ground' },
@@ -52,24 +68,61 @@ export const SS_SERVICES = [
   { carrierCode: 'amazon_shipping_us', carrierLabel: 'Amazon Shipping', code: 'amazon_shipping_expedited',   label: 'Amazon Shipping Expedited' },
 ]
 
-/** Unique carrier codes in display order */
-export const SERVICE_CARRIERS = [...new Set(SS_SERVICES.map(s => s.carrierCode))]
+/**
+ * Unique display groups in order — uses carrierLabel so USPS — ShipStation
+ * and USPS — Stamps.com appear as separate optgroups.
+ */
+export const SERVICE_GROUPS = [...new Map(
+  SS_SERVICES.map(s => [
+    `${s.carrierCode}::${s.shippingProviderId ?? ''}`,
+    { carrierCode: s.carrierCode, shippingProviderId: s.shippingProviderId ?? null, carrierLabel: s.carrierLabel },
+  ])
+).values()]
 
-/** Services grouped by carrierCode for <optgroup> rendering */
+/** Services grouped by carrierLabel for <optgroup> rendering */
 export function servicesByCarrier() {
-  return SERVICE_CARRIERS.map(carrierCode => ({
+  return SERVICE_GROUPS.map(({ carrierCode, shippingProviderId, carrierLabel }) => ({
     carrierCode,
-    carrierLabel: SS_SERVICES.find(s => s.carrierCode === carrierCode)?.carrierLabel ?? carrierCode,
-    services: SS_SERVICES.filter(s => s.carrierCode === carrierCode),
+    shippingProviderId,
+    carrierLabel,
+    services: SS_SERVICES.filter(s =>
+      s.carrierCode === carrierCode &&
+      (s.shippingProviderId ?? null) === shippingProviderId
+    ),
   }))
 }
 
-/** Look up a single service entry */
-export function findService(carrierCode, serviceCode) {
-  return SS_SERVICES.find(s => s.carrierCode === carrierCode && s.code === serviceCode) ?? null
+/**
+ * Look up a single service entry by carrierCode + serviceCode + optional providerId.
+ * Falls back to first match on carrierCode+serviceCode for backward compat.
+ */
+export function findService(carrierCode, serviceCode, shippingProviderId = null) {
+  return (
+    SS_SERVICES.find(s =>
+      s.carrierCode === carrierCode &&
+      s.code === serviceCode &&
+      (s.shippingProviderId ?? null) === shippingProviderId
+    ) ??
+    SS_SERVICES.find(s => s.carrierCode === carrierCode && s.code === serviceCode) ??
+    null
+  )
 }
 
-/** Catalog key used as <option> value: "carrierCode::serviceCode" */
+/**
+ * Catalog key used as <option> value.
+ * Format: "carrierCode::providerId::serviceCode" — providerId is empty string when absent.
+ */
 export function serviceKey(svc) {
-  return `${svc.carrierCode}::${svc.code}`
+  return `${svc.carrierCode}::${svc.shippingProviderId ?? ''}::${svc.code}`
+}
+
+/** Parse a serviceKey back into its parts */
+export function parseServiceKey(key) {
+  if (!key) return { carrierCode: '', shippingProviderId: null, serviceCode: '' }
+  const [carrierCode, providerPart, serviceCode] = key.split('::')
+  return {
+    carrierCode,
+    shippingProviderId: providerPart ? parseInt(providerPart, 10) : null,
+    serviceCode,
+  }
 }
