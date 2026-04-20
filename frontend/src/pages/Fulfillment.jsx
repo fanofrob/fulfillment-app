@@ -130,7 +130,8 @@ function BoxCard({ plan, box, orderLineItems, boxTypes = [], onRefresh }) {
 
   function addDraftItem() {
     if (!addSku || !addQty) return
-    const meta = orderLineItems.find(li => li.pick_sku === addSku)
+    const matches = orderLineItems.filter(li => li.pick_sku === addSku)
+    const meta = matches[0]
     setDraftItems(items => [
       ...items,
       {
@@ -138,7 +139,9 @@ function BoxCard({ plan, box, orderLineItems, boxTypes = [], onRefresh }) {
         quantity: parseFloat(addQty),
         shopify_sku: meta?.shopify_sku || null,
         product_title: meta?.product_title || null,
-        shopify_line_item_id: meta?.line_item_id || null,
+        // When multiple line items share this pick_sku, leave shopify_line_item_id null
+        // so the backend splits the quantity proportionally across all matching line items.
+        shopify_line_item_id: matches.length === 1 ? (meta?.line_item_id || null) : null,
       },
     ])
     setAddSku('')
