@@ -172,7 +172,8 @@ function parseCsv(text) {
 // ─── CsvImportModal ──────────────────────────────────────────────────────────
 
 function CsvImportModal({ items, onApply, onClose }) {
-  const [diffs, setDiffs] = useState(null)  // null = no file yet
+  const [mode, setMode] = useState('set')  // 'set' | 'add' | 'subtract'
+  const [rawRows, setRawRows] = useState(null)  // null = no file yet
   const [note, setNote] = useState('')
   const [applying, setApplying] = useState(false)
   const [result, setResult] = useState(null)  // { ok, errors }
@@ -185,11 +186,28 @@ function CsvImportModal({ items, onApply, onClose }) {
     return m
   }, [items])
 
+  const diffs = useMemo(() => {
+    if (!rawRows) return null
+    const changes = []
+    for (const { sku, csvVal } of rawRows) {
+      const current = itemMap[sku]
+      if (!current) continue
+      const currentQty = parseFloat(current.on_hand_qty) || 0
+      let newOnHand
+      if (mode === 'set') newOnHand = csvVal
+      else if (mode === 'add') newOnHand = currentQty + csvVal
+      else newOnHand = currentQty - csvVal
+      if (newOnHand === currentQty) continue
+      changes.push({ item: current, csvVal, newOnHand })
+    }
+    return changes
+  }, [rawRows, mode, itemMap])
+
   const onFile = (e) => {
     const file = e.target.files[0]
     if (!file) return
     setParseError('')
-    setDiffs(null)
+    setRawRows(null)
     setResult(null)
     const reader = new FileReader()
     reader.onload = (ev) => {
@@ -199,18 +217,15 @@ function CsvImportModal({ items, onApply, onClose }) {
           setParseError('CSV must have columns: pick_sku, on_hand_qty')
           return
         }
-        const changes = []
+        const parsed = []
         for (const row of rows) {
           const sku = row.pick_sku?.trim()
           if (!sku) continue
-          const current = itemMap[sku]
-          if (!current) continue  // skip unknown SKUs
-          const newVal = parseFloat(row.on_hand_qty)
-          if (isNaN(newVal)) continue
-          if (newVal === parseFloat(current.on_hand_qty)) continue
-          changes.push({ item: current, newOnHand: newVal })
+          const csvVal = parseFloat(row.on_hand_qty)
+          if (isNaN(csvVal)) continue
+          parsed.push({ sku, csvVal })
         }
-        setDiffs(changes)
+        setRawRows(parsed)
       } catch {
         setParseError('Failed to parse CSV. Check the file format.')
       }
@@ -235,6 +250,12 @@ function CsvImportModal({ items, onApply, onClose }) {
     setResult({ ok, errors })
   }
 
+  const modeDescriptions = {
+    set: 'Set each SKU\'s on-hand quantity to the CSV value.',
+    add: 'Add the CSV value to each SKU\'s current on-hand quantity.',
+    subtract: 'Subtract the CSV value from each SKU\'s current on-hand quantity.',
+  }
+
   return (
     <div className="modal-overlay">
       <div className="modal" style={{ width: 560 }}>
@@ -244,8 +265,34 @@ function CsvImportModal({ items, onApply, onClose }) {
           <>
             <p style={{ fontSize: 13, color: '#888', marginBottom: 16 }}>
               Upload a CSV with <code>pick_sku</code> and <code>on_hand_qty</code> columns.
-              Only rows with changed quantities will be updated.
             </p>
+
+            <div className="form-group" style={{ marginBottom: 16 }}>
+              <label>Update Mode</label>
+              <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+                {[['set', 'Set to value'], ['add', 'Add'], ['subtract', 'Subtract']].map(([val, label]) => (
+                  <button
+                    key={val}
+                    type="button"
+                    onClick={() => setMode(val)}
+                    style={{
+                      padding: '5px 14px',
+                      borderRadius: 6,
+                      border: '1px solid',
+                      fontSize: 13,
+                      cursor: 'pointer',
+                      borderColor: mode === val ? '#2563eb' : '#d1d5db',
+                      background: mode === val ? '#eff6ff' : '#fff',
+                      color: mode === val ? '#1d4ed8' : '#374151',
+                      fontWeight: mode === val ? 600 : 400,
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div style={{ fontSize: 12, color: '#6b7280', marginTop: 6 }}>{modeDescriptions[mode]}</div>
+            </div>
 
             <div className="form-group">
               <label>CSV File</label>
@@ -271,17 +318,19 @@ function CsvImportModal({ items, onApply, onClose }) {
                           <tr>
                             <th style={{ textAlign: 'left', padding: '6px 10px', background: '#f9fafb' }}>Pick SKU</th>
                             <th style={{ textAlign: 'right', padding: '6px 10px', background: '#f9fafb' }}>Current</th>
+                            {mode !== 'set' && <th style={{ textAlign: 'right', padding: '6px 10px', background: '#f9fafb' }}>{mode === 'add' ? '+ Amount' : '− Amount'}</th>}
                             <th style={{ textAlign: 'right', padding: '6px 10px', background: '#f9fafb' }}>New</th>
                             <th style={{ textAlign: 'right', padding: '6px 10px', background: '#f9fafb' }}>Change</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {diffs.map(({ item, newOnHand }) => {
+                          {diffs.map(({ item, csvVal, newOnHand }) => {
                             const delta = newOnHand - (item.on_hand_qty ?? 0)
                             return (
                               <tr key={item.pick_sku}>
                                 <td style={{ padding: '5px 10px' }} className="mono">{item.pick_sku}</td>
                                 <td style={{ textAlign: 'right', padding: '5px 10px' }}>{formatQty(item.on_hand_qty)}</td>
+                                {mode !== 'set' && <td style={{ textAlign: 'right', padding: '5px 10px', color: '#6b7280' }}>{formatQty(csvVal)}</td>}
                                 <td style={{ textAlign: 'right', padding: '5px 10px', fontWeight: 600 }}>{formatQty(newOnHand)}</td>
                                 <td style={{ textAlign: 'right', padding: '5px 10px', fontWeight: 600, color: delta >= 0 ? '#16a34a' : '#dc2626' }}>
                                   {delta >= 0 ? '+' : ''}{formatQty(delta)}
