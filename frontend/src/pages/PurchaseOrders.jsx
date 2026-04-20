@@ -1,6 +1,6 @@
-import { useState, useMemo } from 'react'
+import React, { useState, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { purchaseOrdersApi, vendorsApi, projectionPeriodsApi } from '../api'
+import { purchaseOrdersApi, vendorsApi, projectionPeriodsApi, receivingApi } from '../api'
 
 const PO_STATUSES = ['draft', 'placed', 'in_transit', 'partially_received', 'delivered', 'imported', 'reconciled']
 const STATUS_COLORS = {
@@ -48,6 +48,11 @@ export default function PurchaseOrders() {
   const [newLines, setNewLines] = useState([])
   const [statusFilter, setStatusFilter] = useState('')
   const [allocations, setAllocations] = useState([])
+  // Receiving state
+  const [receivingLineId, setReceivingLineId] = useState(null)
+  const [receivingForm, setReceivingForm] = useState({ received_cases: '', received_weight_lbs: '', harvest_date: '', confirmed_pick_sku: '', quality_rating: '', quality_notes: '' })
+  const [receivingRecords, setReceivingRecords] = useState([])
+  const [availableSkus, setAvailableSkus] = useState([])
 
   const { data: pos = [], isLoading } = useQuery({
     queryKey: ['purchase-orders', statusFilter],
@@ -100,8 +105,30 @@ export default function PurchaseOrders() {
     onSuccess: (_, vars) => { qc.invalidateQueries(['purchase-orders']); refreshDetail(vars.poId); setShowAllocModal(null) },
   })
 
+  // Receiving mutations
+  const receiveMut = useMutation({
+    mutationFn: ({ poId, lineId, data }) => receivingApi.receive(poId, lineId, data),
+    onSuccess: (_, vars) => { loadReceivingRecords(vars.poId); refreshDetail(vars.poId); setReceivingLineId(null) },
+  })
+  const pushMut = useMutation({
+    mutationFn: (recordId) => receivingApi.pushToInventory(recordId),
+    onSuccess: () => { if (showDetailModal) { loadReceivingRecords(showDetailModal.id); refreshDetail(showDetailModal.id) } },
+  })
+  const pushAllMut = useMutation({
+    mutationFn: (poId) => receivingApi.pushAll(poId),
+    onSuccess: () => { if (showDetailModal) { loadReceivingRecords(showDetailModal.id); refreshDetail(showDetailModal.id) } },
+  })
+  const deleteRecMut = useMutation({
+    mutationFn: (recordId) => receivingApi.delete(recordId),
+    onSuccess: () => { if (showDetailModal) { loadReceivingRecords(showDetailModal.id); refreshDetail(showDetailModal.id) } },
+  })
+
+  function loadReceivingRecords(poId) {
+    receivingApi.listForPO(poId).then(setReceivingRecords).catch(() => setReceivingRecords([]))
+  }
+
   function refreshDetail(poId) {
-    purchaseOrdersApi.get(poId).then(po => setShowDetailModal(po))
+    purchaseOrdersApi.get(poId).then(po => { setShowDetailModal(po); qc.invalidateQueries(['purchase-orders']) })
   }
 
   function closeCreateModal() {
@@ -193,6 +220,37 @@ export default function PurchaseOrders() {
     setAllocMut.mutate({ poId: showAllocModal.poId, lineId: showAllocModal.lineId, data })
   }
 
+  function openReceiveForm(line) {
+    setReceivingLineId(line.id)
+    setReceivingForm({ received_cases: '', received_weight_lbs: '', harvest_date: '', confirmed_pick_sku: '', quality_rating: '', quality_notes: '' })
+    receivingApi.getSkusForProductType(line.product_type).then(setAvailableSkus).catch(() => setAvailableSkus([]))
+  }
+
+  function handleReceiveSubmit(poId, lineId) {
+    const data = {
+      received_date: new Date().toISOString().slice(0, 10),
+      received_cases: Number(receivingForm.received_cases) || 0,
+      received_weight_lbs: Number(receivingForm.received_weight_lbs) || 0,
+      confirmed_pick_sku: receivingForm.confirmed_pick_sku || null,
+      harvest_date: receivingForm.harvest_date || null,
+      quality_rating: receivingForm.quality_rating || null,
+      quality_notes: receivingForm.quality_notes || null,
+    }
+    receiveMut.mutate({ poId, lineId, data })
+  }
+
+  // Receiving records grouped by line
+  function getRecordsForLine(lineId) {
+    return receivingRecords.filter(r => r.po_line_id === lineId)
+  }
+
+  function getReceivedWeight(lineId) {
+    return getRecordsForLine(lineId).reduce((sum, r) => sum + (r.received_weight_lbs || 0), 0)
+  }
+
+  const canReceive = showDetailModal && ['placed', 'in_transit', 'partially_received'].includes(showDetailModal.status)
+  const hasUnpushedRecords = receivingRecords.some(r => !r.pushed_to_inventory && r.confirmed_pick_sku)
+
   // Product types from vendor products
   const vendorProductTypes = poForm.vendor_id
     ? (vendorMap[Number(poForm.vendor_id)]?.products?.map(p => p.product_type) || [])
@@ -242,7 +300,7 @@ export default function PurchaseOrders() {
         </thead>
         <tbody>
           {pos.map(po => (
-            <tr key={po.id} style={{ borderBottom: '1px solid #f3f4f6', cursor: 'pointer' }} onClick={() => setShowDetailModal(po)}>
+            <tr key={po.id} style={{ borderBottom: '1px solid #f3f4f6', cursor: 'pointer' }} onClick={() => { setShowDetailModal(po); loadReceivingRecords(po.id) }}>
               <td style={{ padding: '8px', fontWeight: 600 }}>{po.po_number}</td>
               <td style={{ padding: '8px' }}>{po.vendor_name || '—'}</td>
               <td style={{ padding: '8px' }}>
@@ -256,7 +314,7 @@ export default function PurchaseOrders() {
               <td style={{ padding: '8px' }}>{po.lines?.length || 0}</td>
               <td style={{ padding: '8px' }}>{formatCurrency(po.subtotal)}</td>
               <td style={{ padding: '8px' }}>
-                <button className="btn btn-sm" onClick={e => { e.stopPropagation(); setShowDetailModal(po) }}>View</button>
+                <button className="btn btn-sm" onClick={e => { e.stopPropagation(); setShowDetailModal(po); loadReceivingRecords(po.id) }}>View</button>
               </td>
             </tr>
           ))}
@@ -407,34 +465,172 @@ export default function PurchaseOrders() {
                   <th style={{ padding: '6px 8px' }}>Total Wt</th>
                   <th style={{ padding: '6px 8px' }}>Unit Price</th>
                   <th style={{ padding: '6px 8px' }}>Total</th>
+                  <th style={{ padding: '6px 8px' }}>Received</th>
                   <th style={{ padding: '6px 8px' }}>Alloc</th>
                   <th style={{ padding: '6px 8px' }}></th>
                 </tr>
               </thead>
               <tbody>
-                {showDetailModal.lines?.map(line => (
-                  <tr key={line.id} style={{ borderBottom: '1px solid #f3f4f6' }}>
-                    <td style={{ padding: '6px 8px', fontWeight: 500 }}>
-                      {line.product_type}
-                      {line.overage_flag && <span style={{ color: '#f59e0b', marginLeft: 6, fontSize: 11 }}>OVERAGE</span>}
-                    </td>
-                    <td style={{ padding: '6px 8px' }}>{line.quantity_cases}</td>
-                    <td style={{ padding: '6px 8px' }}>{line.case_weight_lbs ?? '—'} lbs</td>
-                    <td style={{ padding: '6px 8px' }}>{line.total_weight_lbs?.toFixed(1) ?? '—'} lbs</td>
-                    <td style={{ padding: '6px 8px' }}>{formatCurrency(line.unit_price)}/{line.price_unit}</td>
-                    <td style={{ padding: '6px 8px' }}>{formatCurrency(line.total_price)}</td>
-                    <td style={{ padding: '6px 8px' }}>
-                      <button className="btn btn-xs" onClick={() => openAllocations(showDetailModal.id, line)}>
-                        {line.allocations?.length || 0} period{line.allocations?.length !== 1 ? 's' : ''}
-                      </button>
-                    </td>
-                    <td style={{ padding: '6px 8px' }}>
-                      {showDetailModal.status === 'draft' && (
-                        <button className="btn btn-xs btn-danger" onClick={() => deleteLineMut.mutate({ poId: showDetailModal.id, lineId: line.id })}>Del</button>
+                {showDetailModal.lines?.map(line => {
+                  const lineRecords = getRecordsForLine(line.id)
+                  const recvWt = getReceivedWeight(line.id)
+                  const pct = line.total_weight_lbs ? Math.round((recvWt / line.total_weight_lbs) * 100) : 0
+                  return (
+                    <React.Fragment key={line.id}>
+                      <tr style={{ borderBottom: '1px solid #f3f4f6' }}>
+                        <td style={{ padding: '6px 8px', fontWeight: 500 }}>
+                          {line.product_type}
+                          {line.overage_flag && <span style={{ color: '#f59e0b', marginLeft: 6, fontSize: 11 }}>OVERAGE</span>}
+                        </td>
+                        <td style={{ padding: '6px 8px' }}>{line.quantity_cases}</td>
+                        <td style={{ padding: '6px 8px' }}>{line.case_weight_lbs ?? '—'} lbs</td>
+                        <td style={{ padding: '6px 8px' }}>{line.total_weight_lbs?.toFixed(1) ?? '—'} lbs</td>
+                        <td style={{ padding: '6px 8px' }}>{formatCurrency(line.unit_price)}/{line.price_unit}</td>
+                        <td style={{ padding: '6px 8px' }}>{formatCurrency(line.total_price)}</td>
+                        <td style={{ padding: '6px 8px' }}>
+                          {lineRecords.length > 0 ? (
+                            <span style={{ color: pct >= 100 ? '#16a34a' : '#d97706', fontWeight: 500 }}>
+                              {recvWt.toFixed(1)} lbs ({pct}%)
+                            </span>
+                          ) : (
+                            <span style={{ color: '#9ca3af' }}>—</span>
+                          )}
+                        </td>
+                        <td style={{ padding: '6px 8px' }}>
+                          <button className="btn btn-xs" onClick={() => openAllocations(showDetailModal.id, line)}>
+                            {line.allocations?.length || 0} period{line.allocations?.length !== 1 ? 's' : ''}
+                          </button>
+                        </td>
+                        <td style={{ padding: '6px 8px', display: 'flex', gap: 4 }}>
+                          {canReceive && (
+                            <button className="btn btn-xs btn-primary" onClick={() => openReceiveForm(line)}>Receive</button>
+                          )}
+                          {showDetailModal.status === 'draft' && (
+                            <button className="btn btn-xs btn-danger" onClick={() => deleteLineMut.mutate({ poId: showDetailModal.id, lineId: line.id })}>Del</button>
+                          )}
+                        </td>
+                      </tr>
+
+                      {/* Receiving form for this line */}
+                      {receivingLineId === line.id && (
+                        <tr><td colSpan={9} style={{ padding: '8px', background: '#f9fafb' }}>
+                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 8, marginBottom: 8 }}>
+                            <div className="form-group" style={{ margin: 0 }}>
+                              <label style={{ fontSize: 11 }}>Cases Received</label>
+                              <input type="number" step="0.1" value={receivingForm.received_cases}
+                                onChange={e => setReceivingForm({ ...receivingForm, received_cases: e.target.value })} />
+                            </div>
+                            <div className="form-group" style={{ margin: 0 }}>
+                              <label style={{ fontSize: 11 }}>Weight (lbs)</label>
+                              <input type="number" step="0.1" value={receivingForm.received_weight_lbs}
+                                onChange={e => setReceivingForm({ ...receivingForm, received_weight_lbs: e.target.value })} />
+                            </div>
+                            <div className="form-group" style={{ margin: 0 }}>
+                              <label style={{ fontSize: 11 }}>Harvest Date</label>
+                              <input type="date" value={receivingForm.harvest_date}
+                                onChange={e => setReceivingForm({ ...receivingForm, harvest_date: e.target.value })} />
+                            </div>
+                            <div className="form-group" style={{ margin: 0 }}>
+                              <label style={{ fontSize: 11 }}>Confirmed SKU</label>
+                              <select value={receivingForm.confirmed_pick_sku}
+                                onChange={e => setReceivingForm({ ...receivingForm, confirmed_pick_sku: e.target.value })}>
+                                <option value="">Select SKU...</option>
+                                {availableSkus.map(s => (
+                                  <option key={s.pick_sku} value={s.pick_sku}>
+                                    {s.pick_sku} ({s.weight_lb ? `${s.weight_lb} lb/pc` : 'no weight'})
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                          </div>
+                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: 8, marginBottom: 8 }}>
+                            <div className="form-group" style={{ margin: 0 }}>
+                              <label style={{ fontSize: 11 }}>Quality</label>
+                              <select value={receivingForm.quality_rating}
+                                onChange={e => setReceivingForm({ ...receivingForm, quality_rating: e.target.value })}>
+                                <option value="">—</option>
+                                <option value="good">Good</option>
+                                <option value="acceptable">Acceptable</option>
+                                <option value="poor">Poor</option>
+                              </select>
+                            </div>
+                            <div className="form-group" style={{ margin: 0 }}>
+                              <label style={{ fontSize: 11 }}>Quality Notes</label>
+                              <input value={receivingForm.quality_notes}
+                                onChange={e => setReceivingForm({ ...receivingForm, quality_notes: e.target.value })}
+                                placeholder="Condition notes..." />
+                            </div>
+                          </div>
+                          {receivingForm.confirmed_pick_sku && receivingForm.received_weight_lbs && (() => {
+                            const sku = availableSkus.find(s => s.pick_sku === receivingForm.confirmed_pick_sku)
+                            if (sku?.weight_lb) return (
+                              <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 8 }}>
+                                Calculated pieces: {(Number(receivingForm.received_weight_lbs) / sku.weight_lb).toFixed(1)}
+                              </div>
+                            )
+                            return null
+                          })()}
+                          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                            <button className="btn btn-sm" onClick={() => setReceivingLineId(null)}>Cancel</button>
+                            <button className="btn btn-sm btn-primary"
+                              disabled={!receivingForm.received_cases || !receivingForm.received_weight_lbs}
+                              onClick={() => handleReceiveSubmit(showDetailModal.id, line.id)}>
+                              Save Receipt
+                            </button>
+                          </div>
+                        </td></tr>
                       )}
-                    </td>
-                  </tr>
-                ))}
+
+                      {/* Receiving history for this line */}
+                      {lineRecords.length > 0 && (
+                        <tr><td colSpan={9} style={{ padding: '0 8px 8px 24px' }}>
+                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                            <thead>
+                              <tr style={{ color: '#6b7280' }}>
+                                <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>Date</th>
+                                <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>Cases</th>
+                                <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>Weight</th>
+                                <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>SKU</th>
+                                <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>Pieces</th>
+                                <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>Quality</th>
+                                <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>Status</th>
+                                <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {lineRecords.map(rec => (
+                                <tr key={rec.id} style={{ borderTop: '1px solid #f3f4f6' }}>
+                                  <td style={{ padding: '4px 6px' }}>{formatDate(rec.received_date)}</td>
+                                  <td style={{ padding: '4px 6px' }}>{rec.received_cases}</td>
+                                  <td style={{ padding: '4px 6px' }}>{rec.received_weight_lbs} lbs</td>
+                                  <td style={{ padding: '4px 6px' }}>{rec.confirmed_pick_sku || <span style={{ color: '#d97706' }}>Pending</span>}</td>
+                                  <td style={{ padding: '4px 6px' }}>{rec.confirmed_pieces?.toFixed(1) ?? '—'}</td>
+                                  <td style={{ padding: '4px 6px' }}>{rec.quality_rating || '—'}</td>
+                                  <td style={{ padding: '4px 6px' }}>
+                                    {rec.pushed_to_inventory ? (
+                                      <span style={{ color: '#16a34a', fontWeight: 500 }}>Pushed</span>
+                                    ) : (
+                                      <span style={{ color: '#d97706' }}>Pending</span>
+                                    )}
+                                  </td>
+                                  <td style={{ padding: '4px 6px', display: 'flex', gap: 4 }}>
+                                    {!rec.pushed_to_inventory && rec.confirmed_pick_sku && (
+                                      <button className="btn btn-xs btn-primary" onClick={() => pushMut.mutate(rec.id)}
+                                        disabled={pushMut.isPending}>Push</button>
+                                    )}
+                                    {!rec.pushed_to_inventory && (
+                                      <button className="btn btn-xs btn-danger" onClick={() => { if (confirm('Delete this receiving record?')) deleteRecMut.mutate(rec.id) }}>Del</button>
+                                    )}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </td></tr>
+                      )}
+                    </React.Fragment>
+                  )
+                })}
               </tbody>
             </table>
 
@@ -466,6 +662,12 @@ export default function PurchaseOrders() {
             )}
 
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 20 }}>
+              {hasUnpushedRecords && (
+                <button className="btn btn-primary" onClick={() => pushAllMut.mutate(showDetailModal.id)}
+                  disabled={pushAllMut.isPending}>
+                  Push All to Inventory
+                </button>
+              )}
               {showDetailModal.status === 'draft' && (
                 <button className="btn btn-danger" onClick={() => { if (confirm('Delete this PO?')) deleteMut.mutate(showDetailModal.id) }}>Delete PO</button>
               )}
