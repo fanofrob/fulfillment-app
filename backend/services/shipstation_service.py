@@ -315,7 +315,8 @@ def push_box(order, box_number: int, box_items, weight_oz=None, box_type=None, c
     if weight_oz is not None:
         payload["weight"] = {"value": round(weight_oz, 2), "units": "ounces"}
 
-    if carrier_code:
+    # ShipStation rejects carrierCode without serviceCode — only send carrier when both present.
+    if carrier_code and service_code:
         payload["carrierCode"] = carrier_code
     if service_code:
         payload["serviceCode"] = service_code
