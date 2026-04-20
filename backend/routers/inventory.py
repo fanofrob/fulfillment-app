@@ -750,7 +750,7 @@ def demand_analysis(
     for plan in plans:
         non_cancelled_boxes = db.query(models.FulfillmentBox).filter(
             models.FulfillmentBox.plan_id == plan.id,
-            models.FulfillmentBox.status.notin_(["cancelled"]),
+            models.FulfillmentBox.status.notin_(["cancelled", "shipped", "fulfilled"]),
         ).all()
         if not non_cancelled_boxes:
             continue
@@ -917,13 +917,14 @@ def staged_shortages(
     ).all()
     plan_map = {p.shopify_order_id: p for p in plans}
 
-    # Boxes for these plans (exclude cancelled and already shipped)
+    # Boxes for these plans (exclude cancelled, shipped, and fulfilled —
+    # their inventory has already been deducted)
     plan_ids = [p.id for p in plans]
     boxes = []
     if plan_ids:
         boxes = db.query(models.FulfillmentBox).filter(
             models.FulfillmentBox.plan_id.in_(plan_ids),
-            models.FulfillmentBox.status.notin_(["cancelled", "shipped"]),
+            models.FulfillmentBox.status.notin_(["cancelled", "shipped", "fulfilled"]),
         ).all()
 
     box_ids = [b.id for b in boxes]
