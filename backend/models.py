@@ -670,3 +670,23 @@ class PurchaseOrderPeriodAllocation(Base):
     effective_lbs  = Column(Float, nullable=False, default=0.0)  # allocated_lbs × (1 - spoilage_pct)
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
     updated_at     = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+# ── Receiving (Phase 5) ──────────────────────────────────────────────────────
+
+class ReceivingRecord(Base):
+    """Records actual goods received against a PO line item."""
+    __tablename__ = "receiving_records"
+    id                  = Column(Integer, primary_key=True, index=True)
+    po_line_id          = Column(Integer, ForeignKey("purchase_order_lines.id"), nullable=False, index=True)
+    received_date       = Column(Date, nullable=False)
+    received_cases      = Column(Float, nullable=False)
+    received_weight_lbs = Column(Float, nullable=False)
+    confirmed_pick_sku  = Column(String, nullable=True)
+    confirmed_pieces    = Column(Float, nullable=True)
+    harvest_date        = Column(Date, nullable=True)
+    quality_rating      = Column(String, nullable=True)   # good | acceptable | poor
+    quality_notes       = Column(Text, nullable=True)
+    pushed_to_inventory = Column(Boolean, nullable=False, default=False)
+    inventory_batch_id  = Column(Integer, ForeignKey("inventory_batches.id"), nullable=True)
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
