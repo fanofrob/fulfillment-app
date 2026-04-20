@@ -140,7 +140,27 @@
       "Bash(git --version)",
       "Bash(brew --version)",
       "Bash(ls \"/Users/robertfan/Claude Code/fulfillment-app/backend/\"*.env)",
-      "Bash(ls \"/Users/robertfan/Claude Code/fulfillment-app/backend/\"*.json)"
+      "Bash(ls \"/Users/robertfan/Claude Code/fulfillment-app/backend/\"*.json)",
+      "Bash(time curl *)",
+      "Bash(curl -s \"http://localhost:8000/api/inventory/items?warehouse=walnut&shipped_from=2026-04-19&shipped_to=2026-04-19\")",
+      "Bash(curl -s \"http://localhost:8000/api/inventory/items?warehouse=walnut\")",
+      "Bash(curl -s \"http://localhost:8000/api/inventory/items?warehouse=walnut&shipped_from=2026-04-19\")",
+      "Bash(wait)",
+      "Read(//tmp/**)",
+      "Bash(curl -s \"http://localhost:8000/api/inventory/weekly-report?warehouse=walnut\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5173/)",
+      "Bash(node -e ' *)",
+      "Bash(git ls-tree *)",
+      "Bash(awk '/^diff --git a\\\\/frontend\\\\/src\\\\/pages\\\\/Inventory.jsx/,/^diff --git a\\\\/frontend\\\\/src\\\\/pages\\\\/PurchaseOrders.jsx/')",
+      "Bash(awk '/^diff --git a\\\\/backend\\\\/routers\\\\/inventory.py/,/^diff --git/')",
+      "Bash(awk '/^diff --git a\\\\/backend\\\\/routers\\\\/inventory.py/,/^diff --git a\\\\/backend\\\\/services/')",
+      "Bash(awk '/^diff --git a\\\\/backend\\\\/models.py/,/^diff --git a\\\\/backend\\\\/routers/')",
+      "Bash(awk '/^diff --git a\\\\/frontend\\\\/src\\\\/pages\\\\/Fulfillment.jsx/,/^diff --git a\\\\/frontend\\\\/src\\\\/pages\\\\/Inventory.jsx/')",
+      "Bash(awk '/^diff --git a\\\\/backend\\\\/services\\\\/shipstation_service.py/,/^diff --git/')",
+      "Bash(awk '/^diff --git a\\\\/backend\\\\/services\\\\/shipstation_service.py/,/^diff --git a\\\\/frontend/')",
+      "Bash(awk '/^diff --git a\\\\/frontend\\\\/src\\\\/pages\\\\/Inventory.jsx/,/^diff --git a\\\\/frontend\\\\/src\\\\/pages\\\\/PurchaseOrders.jsx/' echo \"Main uncommitted size:\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
