@@ -69,8 +69,9 @@ def _recompute_committed(warehouse: str, db: Session,
     for box in all_open_boxes:
         boxes_by_plan.setdefault(box.plan_id, []).append(box)
 
-    # Batch-fetch box line items for non-cancelled boxes
-    non_cancelled_box_ids = [b.id for b in all_open_boxes if b.status != 'cancelled']
+    # Batch-fetch box line items for boxes still contributing to committed demand.
+    # Exclude shipped/fulfilled because their inventory has already been deducted.
+    non_cancelled_box_ids = [b.id for b in all_open_boxes if b.status not in ('cancelled', 'shipped', 'fulfilled')]
     all_box_items = db.query(models.BoxLineItem).filter(
         models.BoxLineItem.box_id.in_(non_cancelled_box_ids)
     ).all() if non_cancelled_box_ids else []
@@ -81,7 +82,7 @@ def _recompute_committed(warehouse: str, db: Session,
     # Build per-order box demand from box line items
     order_box_demand: dict[str, dict[str, float]] = {}
     for plan in plans:
-        plan_boxes = [b for b in boxes_by_plan.get(plan.id, []) if b.status != 'cancelled']
+        plan_boxes = [b for b in boxes_by_plan.get(plan.id, []) if b.status not in ('cancelled', 'shipped', 'fulfilled')]
         if not plan_boxes:
             continue
         sku_agg: dict[str, float] = {}
