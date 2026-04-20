@@ -230,7 +230,7 @@ def _build_sku_mapping_lookup(
     # Fallback: use default warehouse mapping + enrich with product_type from DB
     base_lookup = sheets_service.get_sku_mapping_lookup(warehouse)
     # The base lookup doesn't include product_type, so enrich from SkuMapping table
-    pt_map = {}
+    pt_map = sheets_service.CaseInsensitiveSkuDict()
     db_mappings = db.query(models.SkuMapping).filter(
         models.SkuMapping.warehouse == warehouse
     ).all()
@@ -238,7 +238,7 @@ def _build_sku_mapping_lookup(
         if m.shopify_sku and m.product_type:
             pt_map[m.shopify_sku] = m.product_type
 
-    enriched = {}
+    enriched = sheets_service.CaseInsensitiveSkuDict()
     for sku, entries in base_lookup.items():
         enriched[sku] = []
         for e in entries:

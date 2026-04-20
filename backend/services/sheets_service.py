@@ -88,6 +88,58 @@ def _parse_date(val):
 
 # ── SKU Mappings ──────────────────────────────────────────────────────────────
 
+
+class CaseInsensitiveSkuDict(dict):
+    """Dict with case-insensitive string-key lookups.
+
+    Iteration preserves the original-case key as first inserted. `get`, `[]`,
+    `in`, and `__delitem__` fold case before matching. Used for SKU lookups
+    because Shopify may return a SKU with different casing than the Sheet row.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._ci: dict[str, str] = {}
+
+    def __setitem__(self, key, value):
+        if isinstance(key, str):
+            prior = self._ci.get(key.lower())
+            if prior is not None and prior != key:
+                super().__delitem__(prior)
+            self._ci[key.lower()] = key
+        super().__setitem__(key, value)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            actual = self._ci.get(key.lower())
+            if actual is None:
+                raise KeyError(key)
+            return super().__getitem__(actual)
+        return super().__getitem__(key)
+
+    def __contains__(self, key):
+        if isinstance(key, str):
+            return key.lower() in self._ci
+        return super().__contains__(key)
+
+    def __delitem__(self, key):
+        if isinstance(key, str):
+            actual = self._ci.pop(key.lower(), None)
+            if actual is None:
+                raise KeyError(key)
+            super().__delitem__(actual)
+        else:
+            super().__delitem__(key)
+
+    def get(self, key, default=None):
+        if isinstance(key, str):
+            actual = self._ci.get(key.lower())
+            if actual is None:
+                return default
+            return super().__getitem__(actual)
+        return super().get(key, default)
+
+
 def get_sku_mappings(warehouse: str, search: str = None, skip: int = 0, limit: int = 50, errors_only: bool = False):
     tab_names = {
         "walnut":    "INPUT_bundles_cvr_walnut",
@@ -210,7 +262,7 @@ def get_period_sku_mapping_lookup(tab_name: str) -> dict:
     the product_type field needed by the projection engine.
     """
     rows = get_period_sku_mappings(tab_name, skip=0, limit=100000)
-    result: dict = {}
+    result = CaseInsensitiveSkuDict()
     for r in rows:
         sku = r.get("shopify_sku")
         if not sku:
@@ -527,7 +579,7 @@ def _fetch_sku_type_data() -> dict:
         ws = client.open_by_key(SPREADSHEET_IDS["inventory"]).worksheet("INPUT_SKU_TYPE")
         all_values = ws.get_all_values()
         if not all_values or len(all_values) < 2:
-            return {"helper_map": {}, "no_bundle_set": set()}
+            return {"helper_map": CaseInsensitiveSkuDict(), "no_bundle_set": set()}
 
         header = [str(h).strip().lower() for h in all_values[1]]
 
@@ -535,12 +587,12 @@ def _fetch_sku_type_data() -> dict:
             sku_col = header.index("sku")
         except ValueError:
             print("[WARN] INPUT_SKU_TYPE: 'SKU' column not found in header row")
-            return {"helper_map": {}, "no_bundle_set": set()}
+            return {"helper_map": CaseInsensitiveSkuDict(), "no_bundle_set": set()}
 
         helper_col    = next((i for i, h in enumerate(header) if h == "sku helper"),    None)
         bundle_col    = next((i for i, h in enumerate(header) if h == "bundle needed"), None)
 
-        helper_map    = {}
+        helper_map    = CaseInsensitiveSkuDict()
         no_bundle_set = set()
 
         for row in all_values[2:]:
@@ -582,7 +634,7 @@ def get_sku_mapping_lookup(warehouse: str) -> dict:
     inherit the same pick_sku mapping without needing their own row in the bundles table.
     """
     rows = get_sku_mappings(warehouse, skip=0, limit=100000)
-    result: dict = {}
+    result = CaseInsensitiveSkuDict()
     for r in rows:
         sku = r.get("shopify_sku")
         if not sku:
