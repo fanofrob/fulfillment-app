@@ -95,6 +95,11 @@ export const inventoryApi = {
 
   stagedShortages: (warehouse) =>
     api.get('/inventory/staged-shortages', { params: warehouse ? { warehouse } : {} }).then(r => r.data),
+
+  stagedBoxesByPickSku: (pick_sku, warehouse) =>
+    api.get('/inventory/staged-boxes-by-pick-sku', {
+      params: warehouse ? { pick_sku, warehouse } : { pick_sku },
+    }).then(r => r.data),
 }
 
 export const shopifyAuthApi = {

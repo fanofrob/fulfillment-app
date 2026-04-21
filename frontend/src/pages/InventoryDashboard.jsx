@@ -1,4 +1,5 @@
 import { useState, useMemo } from 'react'
+import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { inventoryApi } from '../api'
 
@@ -51,7 +52,7 @@ function InventoryPivot({ items }) {
 
 // ── Section B: Issue SKUs ──────────────────────────────────────────────────────
 
-function IssueSkus({ analysis }) {
+function IssueSkus({ analysis, warehouse }) {
   // Only pick SKUs where ending balance (on_hand - total_demand) < 0
   const issues = analysis
     .filter(a => a.on_hand_qty - a.total_demand < 0)
@@ -79,7 +80,15 @@ function IssueSkus({ analysis }) {
               <>
                 {/* Pick SKU group header */}
                 <tr key={`${item.pick_sku}-hdr`} className="row-group-header">
-                  <td className="mono">{item.pick_sku}</td>
+                  <td className="mono">
+                    <Link
+                      to={`/staging-dashboard/issue/${encodeURIComponent(item.pick_sku)}?warehouse=${encodeURIComponent(warehouse)}`}
+                      style={{ color: '#dc2626', textDecoration: 'underline', textDecorationStyle: 'dotted' }}
+                      title={`View staged orders containing ${item.pick_sku}`}
+                    >
+                      {item.pick_sku}
+                    </Link>
+                  </td>
                   <td />
                   <td style={{ textAlign: 'right', fontWeight: 600 }}>{fmt(ending)}</td>
                 </tr>
@@ -286,7 +295,7 @@ export default function InventoryDashboard() {
         <>
         <div className="inv-dash-grid">
           <InventoryPivot items={items} />
-          <IssueSkus analysis={analysis} />
+          <IssueSkus analysis={analysis} warehouse={warehouse} />
           <InventoryTransactions analysis={analysis} />
         </div>
 

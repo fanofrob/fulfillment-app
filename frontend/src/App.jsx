@@ -15,6 +15,7 @@ import ProjectionDashboard from './pages/ProjectionDashboard'
 import Vendors from './pages/Vendors'
 import PurchaseOrders from './pages/PurchaseOrders'
 import StagingDashboard from './pages/StagingDashboard'
+import IssueSkuDetail from './pages/IssueSkuDetail'
 import InventoryCount from './pages/InventoryCount'
 import './App.css'
 
@@ -68,6 +69,7 @@ export default function App() {
           <Route path="/inventory-count" element={<InventoryCount />} />
           <Route path="/orders" element={<Orders />} />
           <Route path="/staging-dashboard" element={<StagingDashboard />} />
+          <Route path="/staging-dashboard/issue/:pickSku" element={<IssueSkuDetail />} />
           <Route path="/demand-dashboard" element={<DemandDashboard />} />
           <Route path="/projection-dashboard" element={<ProjectionDashboard />} />
           <Route path="/projection-periods" element={<ProjectionPeriods />} />
