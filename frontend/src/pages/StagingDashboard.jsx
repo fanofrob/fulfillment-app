@@ -400,9 +400,11 @@ function StagedOrdersTab() {
         }
       },
       onError: (err) => {
-        setPushState(prev => ({ ...prev, active: false, done: false, error: err?.message || 'Unknown error' }))
-        localStorage.removeItem('pushJob')
-        alert(`Push failed: ${err?.message || 'Unknown error'}`)
+        // SSE stream hiccupped, but the backend job may still be running.
+        // Keep the button locked (active stays true) and let the poller
+        // (useEffect on pushState.jobId) drive progress + "done" detection.
+        // Only surface the error; don't clear jobId / localStorage here.
+        setPushState(prev => ({ ...prev, error: err?.message || 'Stream disconnected — reconnecting via poller' }))
       },
     })
   }

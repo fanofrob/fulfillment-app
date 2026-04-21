@@ -1030,6 +1030,13 @@ def push_box(plan_id: int, box_id: int, db: Session = Depends(get_db)):
     if not box:
         raise HTTPException(status_code=404, detail="Box not found")
 
+    # Idempotency guard: if this box has already been pushed, don't create a duplicate.
+    if box.shipstation_order_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Box already pushed to ShipStation (orderId={box.shipstation_order_id})",
+        )
+
     items = db.query(models.BoxLineItem).filter(models.BoxLineItem.box_id == box_id).all()
     if not items:
         raise HTTPException(status_code=400, detail="Box has no items — add items before pushing")
@@ -1110,12 +1117,14 @@ def push_box(plan_id: int, box_id: int, db: Session = Depends(get_db)):
     box.shipstation_order_key = ss_result.get("orderKey", "")
     box.status = "packed"
 
-    if order and order.app_status == "staged":
+    if order and order.app_status in ("staged", "partially_fulfilled"):
+        was_first_push = order.app_status == "staged"
         order.app_status = "in_shipstation_not_shipped"
-        db.flush()
-        from routers.inventory import _auto_deduct_on_ship, _recompute_committed
-        _auto_deduct_on_ship(order, db)
-        _recompute_committed(order.assigned_warehouse, db)
+        if was_first_push:
+            db.flush()
+            from routers.inventory import _auto_deduct_on_ship, _recompute_committed
+            _auto_deduct_on_ship(order, db)
+            _recompute_committed(order.assigned_warehouse, db)
 
     if plan.status == "draft":
         plan.status = "active"
@@ -1746,6 +1755,22 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
     if not shipstation_service.is_configured():
         raise HTTPException(status_code=503, detail="ShipStation not configured")
 
+    # Reject overlapping jobs — prevents a second click (before the first finishes)
+    # from launching a concurrent background thread that races the first on the
+    # same boxes and creates duplicate ShipStation shipments.
+    busy_orders: set[int] = set()
+    for _jid, _j in _push_jobs.items():
+        if _j.get("status") == "running":
+            busy_orders.update(_j.get("order_ids", []))
+    overlap = sorted(set(body.order_ids) & busy_orders)
+    if overlap:
+        preview = ", ".join(str(x) for x in overlap[:5])
+        more = "" if len(overlap) <= 5 else f" (+{len(overlap) - 5} more)"
+        raise HTTPException(
+            status_code=409,
+            detail=f"A push is already in progress for orders: {preview}{more}. Wait for it to finish.",
+        )
+
     # ── Phase 1: validate all orders & gather push-ready data (DB only) ──────
     validated = []        # list of dicts ready for parallel push
     skip_results = []     # orders that failed validation
@@ -1882,6 +1907,7 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
     job_id = uuid.uuid4().hex[:8]
     job = {
         "status": "running",
+        "order_ids": list(body.order_ids),   # for overlap rejection on concurrent pushes
         "pushed": 0,
         "failed": len(skip_results),
         "total": total_orders,
@@ -1892,6 +1918,28 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
 
     def _push_one_box(order, bt):
         """Push a single box with rate limiting and retry on 429."""
+        box_id = bt["box"].id
+        # Idempotency guard: re-read this box in a fresh session right before the HTTP
+        # POST. If another concurrent push (or a prior run) has already committed a
+        # shipstation_order_id, skip — don't create a duplicate ShipStation shipment.
+        check_db = SessionLocal()
+        try:
+            fresh = check_db.query(models.FulfillmentBox).filter(
+                models.FulfillmentBox.id == box_id
+            ).first()
+            if fresh and fresh.shipstation_order_id:
+                return {
+                    "box_id": box_id,
+                    "success": True,
+                    "ss_result": {
+                        "orderId": fresh.shipstation_order_id,
+                        "orderKey": fresh.shipstation_order_key or "",
+                    },
+                    "skipped_already_pushed": True,
+                }
+        finally:
+            check_db.close()
+
         max_retries = 3
         for attempt in range(max_retries):
             _ss_rate_wait()
@@ -1904,13 +1952,13 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                     service_code=bt["service_code"],
                     shipping_provider_id=bt.get("shipping_provider_id"),
                 )
-                return {"box_id": bt["box"].id, "success": True, "ss_result": ss_result}
+                return {"box_id": box_id, "success": True, "ss_result": ss_result}
             except Exception as e:
                 err_str = str(e)
                 if "429" in err_str and attempt < max_retries - 1:
                     time.sleep(5 * (attempt + 1))
                     continue
-                return {"box_id": bt["box"].id, "success": False, "error": err_str}
+                return {"box_id": box_id, "success": False, "error": err_str}
 
     def _push_one_order(entry):
         results = []
@@ -1953,12 +2001,14 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                         if boxes_pushed > 0 and plan and plan.status == "draft":
                             plan.status = "active"
 
-                        if boxes_pushed > 0 and order and order.app_status == "staged":
+                        if boxes_pushed > 0 and order and order.app_status in ("staged", "partially_fulfilled"):
+                            was_first_push = order.app_status == "staged"
                             order.app_status = "in_shipstation_not_shipped"
-                            gen_db.flush()
-                            from routers.inventory import _auto_deduct_on_ship, _recompute_committed as _rc
-                            _auto_deduct_on_ship(order, gen_db)
-                            _rc(order.assigned_warehouse, gen_db)
+                            if was_first_push:
+                                gen_db.flush()
+                                from routers.inventory import _auto_deduct_on_ship, _recompute_committed as _rc
+                                _auto_deduct_on_ship(order, gen_db)
+                                _rc(order.assigned_warehouse, gen_db)
 
                         gen_db.commit()
                     finally:
@@ -2146,6 +2196,11 @@ def bulk_push_plans(body: BulkPushRequest, db: Session = Depends(get_db)):
         box_errors = []
 
         for box in pending_boxes:
+            # Idempotency guard — skip if another path already pushed this box.
+            db.refresh(box)
+            if box.shipstation_order_id:
+                continue
+
             items = db.query(models.BoxLineItem).filter(models.BoxLineItem.box_id == box.id).all()
             if not items:
                 continue
@@ -2193,12 +2248,14 @@ def bulk_push_plans(body: BulkPushRequest, db: Session = Depends(get_db)):
         if boxes_pushed > 0 and plan.status == "draft":
             plan.status = "active"
 
-        if boxes_pushed > 0 and order and order.app_status == "staged":
+        if boxes_pushed > 0 and order and order.app_status in ("staged", "partially_fulfilled"):
+            was_first_push = order.app_status == "staged"
             order.app_status = "in_shipstation_not_shipped"
-            db.flush()
-            from routers.inventory import _auto_deduct_on_ship, _recompute_committed as _recompute_committed_inv
-            _auto_deduct_on_ship(order, db)
-            _recompute_committed_inv(order.assigned_warehouse, db)
+            if was_first_push:
+                db.flush()
+                from routers.inventory import _auto_deduct_on_ship, _recompute_committed as _recompute_committed_inv
+                _auto_deduct_on_ship(order, db)
+                _recompute_committed_inv(order.assigned_warehouse, db)
 
         db.commit()
 
