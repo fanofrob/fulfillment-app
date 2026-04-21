@@ -1972,59 +1972,102 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
             with ThreadPoolExecutor(max_workers=8) as pool:
                 futures = {pool.submit(_push_one_order, entry): entry for entry in validated}
                 for future in as_completed(futures):
-                    entry, box_results = future.result()
-                    order_id = entry["order_id"]
-
-                    boxes_pushed = sum(1 for r in box_results if r["success"])
-                    boxes_failed = sum(1 for r in box_results if not r["success"])
-
-                    gen_db = SessionLocal()
+                    order_id = None
                     try:
-                        order = gen_db.query(models.ShopifyOrder).filter(
-                            models.ShopifyOrder.shopify_order_id == order_id
-                        ).first()
-                        plan = gen_db.query(models.FulfillmentPlan).filter(
-                            models.FulfillmentPlan.shopify_order_id == order_id,
-                            models.FulfillmentPlan.status.notin_(["cancelled", "completed"]),
-                        ).first()
+                        entry, box_results = future.result()
+                        order_id = entry["order_id"]
 
-                        for br in box_results:
-                            if br["success"]:
-                                box = gen_db.query(models.FulfillmentBox).filter(
-                                    models.FulfillmentBox.id == br["box_id"]
+                        boxes_pushed = sum(1 for r in box_results if r["success"])
+                        boxes_failed = sum(1 for r in box_results if not r["success"])
+
+                        # ── Transaction 1: link boxes to their SS orders ─────────
+                        # This MUST commit. If it doesn't, the SS order exists but
+                        # the DB has no record, the idempotency guard is bypassed
+                        # on a re-click, and we get duplicate shipments. Kept tiny
+                        # and isolated so it can't be rolled back by a later error.
+                        link_error = None
+                        try:
+                            link_db = SessionLocal()
+                            try:
+                                for br in box_results:
+                                    if not br["success"]:
+                                        continue
+                                    ss_order_id = str(br["ss_result"].get("orderId", ""))
+                                    if not ss_order_id:
+                                        continue
+                                    box = link_db.query(models.FulfillmentBox).filter(
+                                        models.FulfillmentBox.id == br["box_id"]
+                                    ).first()
+                                    if box and not box.shipstation_order_id:
+                                        box.shipstation_order_id = ss_order_id
+                                        box.shipstation_order_key = br["ss_result"].get("orderKey", "") or ""
+                                        box.status = "packed"
+                                link_db.commit()
+                            finally:
+                                link_db.close()
+                        except Exception as e:
+                            link_error = str(e)
+                            print(f"[bulk-push] ERROR linking boxes for order {order_id}: {e}")
+
+                        # ── Transaction 2: plan/order status + inventory deduct ──
+                        # Recoverable — if this fails, the box links from
+                        # transaction 1 are still saved, and
+                        # fix_stuck_packed_box_status.py can repair the status.
+                        try:
+                            status_db = SessionLocal()
+                            try:
+                                order = status_db.query(models.ShopifyOrder).filter(
+                                    models.ShopifyOrder.shopify_order_id == order_id
                                 ).first()
-                                if box:
-                                    box.shipstation_order_id = str(br["ss_result"].get("orderId", ""))
-                                    box.shipstation_order_key = br["ss_result"].get("orderKey", "")
-                                    box.status = "packed"
+                                plan = status_db.query(models.FulfillmentPlan).filter(
+                                    models.FulfillmentPlan.shopify_order_id == order_id,
+                                    models.FulfillmentPlan.status.notin_(["cancelled", "completed"]),
+                                ).first()
 
-                        if boxes_pushed > 0 and plan and plan.status == "draft":
-                            plan.status = "active"
+                                if boxes_pushed > 0 and plan and plan.status == "draft":
+                                    plan.status = "active"
 
-                        if boxes_pushed > 0 and order and order.app_status in ("staged", "partially_fulfilled"):
-                            was_first_push = order.app_status == "staged"
-                            order.app_status = "in_shipstation_not_shipped"
-                            if was_first_push:
-                                gen_db.flush()
-                                from routers.inventory import _auto_deduct_on_ship, _recompute_committed as _rc
-                                _auto_deduct_on_ship(order, gen_db)
-                                _rc(order.assigned_warehouse, gen_db)
+                                if boxes_pushed > 0 and order and order.app_status in ("staged", "partially_fulfilled"):
+                                    was_first_push = order.app_status == "staged"
+                                    order.app_status = "in_shipstation_not_shipped"
+                                    if was_first_push:
+                                        status_db.flush()
+                                        from routers.inventory import _auto_deduct_on_ship, _recompute_committed as _rc
+                                        _auto_deduct_on_ship(order, status_db)
+                                        _rc(order.assigned_warehouse, status_db)
 
-                        gen_db.commit()
-                    finally:
-                        gen_db.close()
+                                status_db.commit()
+                            finally:
+                                status_db.close()
+                        except Exception as e:
+                            print(f"[bulk-push] WARN status update failed for order {order_id}: {e}")
 
-                    success = boxes_failed == 0 and boxes_pushed > 0
-                    if success:
-                        job["pushed"] += 1
-                    else:
+                        success = boxes_failed == 0 and boxes_pushed > 0 and link_error is None
+                        if success:
+                            job["pushed"] += 1
+                        else:
+                            job["failed"] += 1
+
+                        err = None
+                        if not success:
+                            if link_error:
+                                err = f"DB link error: {link_error}"
+                            elif box_results:
+                                err = box_results[0].get("error")
+                        job["progress_log"].append({
+                            "order_id": order_id,
+                            "success": success,
+                            **({"error": err} if err else {}),
+                        })
+                    except Exception as e:
+                        # One bad future must not abort the whole push loop.
+                        print(f"[bulk-push] ERROR processing order {order_id}: {e}")
                         job["failed"] += 1
-
-                    job["progress_log"].append({
-                        "order_id": order_id,
-                        "success": success,
-                        **({"error": box_results[0].get("error")} if not success and box_results else {}),
-                    })
+                        job["progress_log"].append({
+                            "order_id": order_id,
+                            "success": False,
+                            "error": f"Unexpected error: {e}",
+                        })
         except Exception as e:
             print(f"[bulk-push] background thread error: {e}")
         finally:
