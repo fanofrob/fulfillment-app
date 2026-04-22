@@ -34,7 +34,7 @@ HERE = Path(__file__).resolve().parent
 BACKEND = HERE.parent
 sys.path.insert(0, str(BACKEND))
 
-from sqlalchemy import create_engine, text  # noqa: E402
+from sqlalchemy import create_engine, event, text  # noqa: E402
 import models  # noqa: E402
 
 
@@ -47,7 +47,16 @@ def _normalize_url(url: str) -> str:
 def _make_engine(url: str):
     if url.startswith("sqlite"):
         return create_engine(url, connect_args={"check_same_thread": False})
-    return create_engine(url, pool_pre_ping=True)
+    engine = create_engine(url, pool_pre_ping=True)
+    # SQLite tolerates orphan FKs; Postgres doesn't. Disable constraint checks
+    # per session during the bulk load so historical orphan rows still migrate.
+    # `session_replication_role = replica` is the standard Postgres trick for
+    # bulk data loads (requires superuser; Railway's default user qualifies).
+    @event.listens_for(engine, "connect")
+    def _pg_disable_fks(dbapi_conn, _record):
+        with dbapi_conn.cursor() as cur:
+            cur.execute("SET session_replication_role = 'replica'")
+    return engine
 
 
 def _count_rows(engine, tables):
