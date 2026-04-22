@@ -687,9 +687,18 @@ def pull_orders(body: schemas.PullOrdersRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Google Sheets credentials not configured")
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"Google Sheets error: {type(e).__name__}: {e}")
 
-    raw_orders = shopify_service.get_unfulfilled_orders()
-    on_hold_ids = shopify_service.get_on_hold_order_ids()
+    try:
+        raw_orders = shopify_service.get_unfulfilled_orders()
+        on_hold_ids = shopify_service.get_on_hold_order_ids()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"Shopify error: {type(e).__name__}: {e}")
     now = datetime.now(timezone.utc)
 
     created = 0
