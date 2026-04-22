@@ -1059,7 +1059,7 @@ export default function Orders() {
         {shopifyStatus && !shopifyStatus.connected && (
           <div className="setup-banner" style={{ margin: '0 0 12px' }}>
             Shopify not connected.{' '}
-            <a href="http://localhost:8000/api/shopify/connect">Connect Shopify →</a>
+            <a href="/api/shopify/connect">Connect Shopify →</a>
           </div>
         )}
         {pullMutation.isSuccess && (

@@ -15,6 +15,7 @@ dist/
 *.db-wal
 
 # Secrets & credentials — NEVER commit these
+.env
 backend/.env
 backend/ .env
 backend/credentials.env

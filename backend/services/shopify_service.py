@@ -2,9 +2,10 @@
 Shopify service — pulls unfulfilled orders from the Shopify Admin REST API.
 
 Authentication:
-  - Set SHOPIFY_API_KEY + SHOPIFY_API_SECRET in .env, then visit /api/shopify/connect
-    to run the OAuth flow. The resulting access token is saved to shopify_token.json.
-  - Or set SHOPIFY_ACCESS_TOKEN directly in .env (legacy / manual).
+  - Set SHOPIFY_API_KEY + SHOPIFY_API_SECRET in env, then visit /api/shopify/connect
+    to run the OAuth flow. The resulting access token is saved to the app_config DB table
+    (survives restarts; works on ephemeral filesystems like Railway).
+  - Or set SHOPIFY_ACCESS_TOKEN directly in env (legacy / manual override).
 """
 import os
 import json
@@ -17,41 +18,98 @@ SHOPIFY_API_KEY     = os.getenv("SHOPIFY_API_KEY", "").strip()
 SHOPIFY_API_SECRET  = os.getenv("SHOPIFY_API_SECRET", "").strip()
 API_VERSION = "2024-01"
 
-# Path to persisted token file (written by OAuth callback, git-ignored)
-_TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "shopify_token.json")
+# Legacy on-disk token file — only read once on first startup if DB has no token,
+# then migrated into the app_config table. Will not exist on Railway.
+_LEGACY_TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "shopify_token.json")
 
-# In-memory cache so we don't hit the file on every request
+_TOKEN_KEY = "shopify_access_token"
+
+# In-memory cache so we don't hit the DB on every request
 _cached_token: Optional[str] = None
 
 
+def _load_token_from_db() -> Optional[str]:
+    """Read token from the app_config table. Imports are local to avoid
+    circular imports at module load."""
+    from database import SessionLocal
+    from models import AppConfig
+    db = SessionLocal()
+    try:
+        row = db.query(AppConfig).filter(AppConfig.key == _TOKEN_KEY).first()
+        return row.value if row and row.value else None
+    finally:
+        db.close()
+
+
+def _save_token_to_db(token: Optional[str]) -> None:
+    from database import SessionLocal
+    from models import AppConfig
+    db = SessionLocal()
+    try:
+        row = db.query(AppConfig).filter(AppConfig.key == _TOKEN_KEY).first()
+        if row is None:
+            row = AppConfig(key=_TOKEN_KEY, value=token)
+            db.add(row)
+        else:
+            row.value = token
+        db.commit()
+    finally:
+        db.close()
+
+
+def _migrate_legacy_token_file() -> Optional[str]:
+    """One-shot: if the old shopify_token.json exists and DB has no token yet,
+    copy it into the DB so existing local installs keep working after the refactor."""
+    if not os.path.exists(_LEGACY_TOKEN_FILE):
+        return None
+    try:
+        with open(_LEGACY_TOKEN_FILE) as f:
+            data = json.load(f)
+        token = data.get("access_token")
+        if not token:
+            return None
+        _save_token_to_db(token)
+        return token
+    except Exception:
+        return None
+
+
 def get_access_token() -> Optional[str]:
-    """Return the access token, checking env var then token file."""
+    """Return the access token, checking env var, in-memory cache, then DB.
+    Also migrates from the legacy shopify_token.json on first call if needed."""
     global _cached_token
-    # 1. Env var (legacy / manual override)
+    # 1. Env var (manual override — useful for first-time Railway setup)
     env_token = os.getenv("SHOPIFY_ACCESS_TOKEN", "").strip()
     if env_token:
         return env_token
     # 2. In-memory cache
     if _cached_token:
         return _cached_token
-    # 3. Token file written by OAuth callback
-    if os.path.exists(_TOKEN_FILE):
-        try:
-            with open(_TOKEN_FILE) as f:
-                data = json.load(f)
-                _cached_token = data.get("access_token")
-                return _cached_token
-        except Exception:
-            pass
+    # 3. DB
+    db_token = _load_token_from_db()
+    if db_token:
+        _cached_token = db_token
+        return _cached_token
+    # 4. Legacy JSON file (only matters on the original dev machine — migrate it in)
+    migrated = _migrate_legacy_token_file()
+    if migrated:
+        _cached_token = migrated
+        return _cached_token
     return None
 
 
 def save_access_token(token: str):
-    """Persist token to file and update in-memory cache."""
+    """Persist token to DB and update in-memory cache."""
     global _cached_token
     _cached_token = token
-    with open(_TOKEN_FILE, "w") as f:
-        json.dump({"access_token": token, "shop": SHOPIFY_SHOP_DOMAIN}, f)
+    _save_token_to_db(token)
+
+
+def clear_access_token():
+    """Remove the stored token (forces re-auth)."""
+    global _cached_token
+    _cached_token = None
+    _save_token_to_db(None)
 
 
 def is_configured() -> bool:

@@ -690,3 +690,13 @@ class ReceivingRecord(Base):
     pushed_to_inventory = Column(Boolean, nullable=False, default=False)
     inventory_batch_id  = Column(Integer, ForeignKey("inventory_batches.id"), nullable=True)
     created_at          = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AppConfig(Base):
+    """Key/value store for runtime secrets and config that must survive restarts
+    (e.g. Shopify OAuth access token). Used instead of on-disk JSON because
+    Railway filesystems are ephemeral."""
+    __tablename__ = "app_config"
+    key        = Column(String, primary_key=True)
+    value      = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
