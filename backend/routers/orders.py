@@ -685,6 +685,8 @@ def pull_orders(body: schemas.PullOrdersRequest, db: Session = Depends(get_db)):
         sku_lookup = sheets_service.get_sku_mapping_lookup(body.warehouse)
     except FileNotFoundError:
         raise HTTPException(status_code=503, detail="Google Sheets credentials not configured")
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     raw_orders = shopify_service.get_unfulfilled_orders()
     on_hold_ids = shopify_service.get_on_hold_order_ids()

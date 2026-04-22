@@ -1,8 +1,12 @@
 """
 Google Sheets service — reads live data from GHF spreadsheets.
-Requires credentials.json (service account) in the backend/ directory.
+
+Credentials resolution order:
+  1. GOOGLE_CREDENTIALS_JSON env var (full JSON payload) — used on Railway
+  2. credentials.json file in the backend/ directory — used for local dev
 """
 import os
+import json
 import time
 import gspread
 from google.oauth2.service_account import Credentials
@@ -25,15 +29,28 @@ _cache: dict = {}
 _client = None
 
 
+def _load_credentials() -> Credentials:
+    env_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if env_json:
+        try:
+            info = json.loads(env_json)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"GOOGLE_CREDENTIALS_JSON env var is set but is not valid JSON: {e}"
+            )
+        return Credentials.from_service_account_info(info, scopes=SCOPES)
+    if os.path.exists(CREDENTIALS_PATH):
+        return Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=SCOPES)
+    raise FileNotFoundError(
+        "Google credentials not found. Set GOOGLE_CREDENTIALS_JSON env var "
+        f"(Railway) or place credentials.json at {CREDENTIALS_PATH} (local dev)."
+    )
+
+
 def _get_client():
     global _client
     if _client is None:
-        if not os.path.exists(CREDENTIALS_PATH):
-            raise FileNotFoundError(
-                f"credentials.json not found at {CREDENTIALS_PATH}. "
-                "Please follow setup instructions to create a Google service account."
-            )
-        creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=SCOPES)
+        creds = _load_credentials()
         _client = gspread.authorize(creds)
     return _client
 
@@ -668,4 +685,4 @@ def get_sku_mapping_lookup(warehouse: str) -> dict:
 
 
 def is_configured() -> bool:
-    return os.path.exists(CREDENTIALS_PATH)
+    return bool(os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()) or os.path.exists(CREDENTIALS_PATH)

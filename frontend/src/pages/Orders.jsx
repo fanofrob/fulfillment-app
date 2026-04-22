@@ -585,6 +585,12 @@ export default function Orders() {
       qc.invalidateQueries(['orders'])
       qc.invalidateQueries(['orders-archived'])
     },
+    onError: (err) => {
+      const detail = err?.response?.data?.detail || err?.message || 'Unknown error'
+      setSyncBanner({ type: 'error', message: `Pull failed: ${detail}` })
+      if (syncBannerTimer.current) clearTimeout(syncBannerTimer.current)
+      syncBannerTimer.current = setTimeout(() => setSyncBanner(null), 10000)
+    },
   })
 
   const syncSSMutation = useMutation({
