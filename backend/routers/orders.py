@@ -926,9 +926,36 @@ def pull_orders(body: schemas.PullOrdersRequest, db: Session = Depends(get_db)):
         .all()
     )
     for stale in stale_orders:
+        # Clean up fulfillment-plan graph before deleting the order — Postgres
+        # enforces the FKs, so deleting the order directly would fail.
+        plan_ids = [
+            pid for (pid,) in db.query(models.FulfillmentPlan.id).filter(
+                models.FulfillmentPlan.shopify_order_id == stale.shopify_order_id
+            ).all()
+        ]
+        if plan_ids:
+            box_ids = [
+                bid for (bid,) in db.query(models.FulfillmentBox.id).filter(
+                    models.FulfillmentBox.plan_id.in_(plan_ids)
+                ).all()
+            ]
+            if box_ids:
+                db.query(models.BoxLineItem).filter(
+                    models.BoxLineItem.box_id.in_(box_ids)
+                ).delete(synchronize_session=False)
+                db.query(models.FulfillmentBox).filter(
+                    models.FulfillmentBox.id.in_(box_ids)
+                ).delete(synchronize_session=False)
+            db.query(models.LineItemChangeEvent).filter(
+                models.LineItemChangeEvent.plan_id.in_(plan_ids)
+            ).delete(synchronize_session=False)
+            db.query(models.FulfillmentPlan).filter(
+                models.FulfillmentPlan.id.in_(plan_ids)
+            ).delete(synchronize_session=False)
+
         db.query(models.ShopifyLineItem).filter(
             models.ShopifyLineItem.shopify_order_id == stale.shopify_order_id
-        ).delete()
+        ).delete(synchronize_session=False)
         db.delete(stale)
         deleted += 1
 
