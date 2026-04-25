@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 import models
+from routers.inventory import sync_inventory_with_picklist
 from services import sheets_service
 
 router = APIRouter()
@@ -91,16 +92,10 @@ def get_missing_cogs_skus(db: Session = Depends(get_db)):
         )
         order_count = len(affected)
         revenue_at_risk = sum(o.total_price or 0 for o in affected)
-        results.append({
-            "pick_sku": sku_rec.pick_sku,
-            "customer_description": sku_rec.customer_description,
-            "weight_lb": sku_rec.weight_lb,
-            "cost_per_lb": sku_rec.cost_per_lb,
-            "cost_per_case": sku_rec.cost_per_case,
-            "case_weight_lb": sku_rec.case_weight_lb,
-            "affected_order_count": order_count,
-            "revenue_at_risk": revenue_at_risk,
-        })
+        row = _to_dict(sku_rec)
+        row["affected_order_count"] = order_count
+        row["revenue_at_risk"] = revenue_at_risk
+        results.append(row)
 
     results.sort(key=lambda x: x["affected_order_count"], reverse=True)
     return results
@@ -160,7 +155,17 @@ def sync_from_sheets(db: Session = Depends(get_db)):
     db.commit()
     # Invalidate the in-memory pactor cache so fulfillment rules re-read from DB
     sheets_service.invalidate("picklist_pactors")
-    return {"created": created, "updated": updated, "total": len(rows)}
+
+    # Mirror new picklist SKUs into inventory (per-warehouse, qty=0).
+    inv_result = sync_inventory_with_picklist(db)
+    db.commit()
+
+    return {
+        "created": created,
+        "updated": updated,
+        "total": len(rows),
+        "inventory_created": inv_result["created"],
+    }
 
 
 @router.put("/{item_id}")

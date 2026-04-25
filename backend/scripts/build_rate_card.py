@@ -5,6 +5,7 @@ Weights 1-30 lbs. Outputs CSV and prints a formatted table.
 Usage:
     python scripts/build_rate_card.py
 """
+from __future__ import annotations
 
 import os
 import csv

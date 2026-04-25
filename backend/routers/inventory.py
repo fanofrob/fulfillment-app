@@ -5,6 +5,8 @@ Inventory is the app's source of truth. on_hand_qty is manually managed via
 adjustments. committed_qty is auto-computed from open orders.
 available_qty = on_hand_qty - committed_qty.
 """
+from __future__ import annotations
+
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 
@@ -672,6 +674,52 @@ def recompute_committed(
         "items_updated": len(items),
         "message": "Committed quantities recomputed from open orders",
     }
+
+
+# ── Picklist sync ────────────────────────────────────────────────────────────
+
+WAREHOUSES = ["walnut", "northlake"]
+
+
+def sync_inventory_with_picklist(db: Session) -> dict:
+    """
+    Ensure every PicklistSku has a corresponding InventoryItem in each warehouse.
+    Creates missing rows with on_hand_qty=0; never deletes. Idempotent.
+    Caller is responsible for commit.
+    """
+    pskus = db.query(models.PicklistSku).all()
+    existing = {
+        (i.pick_sku, i.warehouse)
+        for i in db.query(models.InventoryItem.pick_sku, models.InventoryItem.warehouse).all()
+    }
+    created_by_wh: dict[str, int] = {wh: 0 for wh in WAREHOUSES}
+    for ps in pskus:
+        for wh in WAREHOUSES:
+            if (ps.pick_sku, wh) in existing:
+                continue
+            db.add(models.InventoryItem(
+                pick_sku=ps.pick_sku,
+                warehouse=wh,
+                name=ps.customer_description,
+                on_hand_qty=0.0,
+                committed_qty=0.0,
+                available_qty=0.0,
+                shipped_qty=0.0,
+            ))
+            created_by_wh[wh] += 1
+    db.flush()
+    return {"picklist_count": len(pskus), "created": created_by_wh}
+
+
+@router.post("/sync-with-picklist")
+def sync_with_picklist(db: Session = Depends(get_db)):
+    """
+    Create an InventoryItem (qty=0) for every PicklistSku × warehouse combo that
+    doesn't yet exist. Safe to re-run; never deletes.
+    """
+    result = sync_inventory_with_picklist(db)
+    db.commit()
+    return result
 
 
 # ── Demand analysis ───────────────────────────────────────────────────────────

@@ -77,17 +77,19 @@ def shopify_callback(request: Request, code: str = None, state: str = None, hmac
     if not code:
         raise HTTPException(status_code=400, detail="No code returned from Shopify.")
 
-    # Validate HMAC signature (Shopify signs the callback params)
+    # Validate HMAC signature (Shopify signs the callback params).
+    # Shopify's Client Secret may be stored with or without the "shpss_" prefix;
+    # try both forms so either works.
     query_params = dict(request.query_params)
     received_hmac = query_params.pop("hmac", None)
     if received_hmac and shopify_service.SHOPIFY_API_SECRET:
-        message = "&".join(f"{k}={v}" for k, v in sorted(query_params.items()))
-        expected = hmac.new(
-            shopify_service.SHOPIFY_API_SECRET.encode(),
-            message.encode(),
-            hashlib.sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(expected, received_hmac):
+        message = "&".join(f"{k}={v}" for k, v in sorted(query_params.items())).encode()
+        secret = shopify_service.SHOPIFY_API_SECRET
+        candidates = {secret, secret[6:] if secret.startswith("shpss_") else f"shpss_{secret}"}
+        if not any(
+            hmac.compare_digest(hmac.new(c.encode(), message, hashlib.sha256).hexdigest(), received_hmac)
+            for c in candidates
+        ):
             raise HTTPException(status_code=403, detail="HMAC validation failed.")
 
     # Exchange code for access token

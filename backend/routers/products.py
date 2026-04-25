@@ -21,6 +21,8 @@ recomputed so the inventory count stays accurate.
 Orders in ShipStation (in_shipstation_not_shipped/in_shipstation_shipped) are
 never modified.
 """
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from typing import List, Optional
 

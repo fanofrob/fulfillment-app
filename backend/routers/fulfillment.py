@@ -11,6 +11,7 @@ Plan statuses:  draft | active | needs_review | needs_reconfiguration | complete
 Box statuses:   pending | packed | shipped
 Change statuses: pending_approval | approved | rejected
 """
+from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List

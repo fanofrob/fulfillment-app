@@ -6,6 +6,8 @@ Authentication:
     to run the OAuth flow. The resulting access token is saved to shopify_token.json.
   - Or set SHOPIFY_ACCESS_TOKEN directly in .env (legacy / manual).
 """
+from __future__ import annotations
+
 import os
 import json
 import requests
@@ -332,7 +334,7 @@ def get_products() -> List[Dict]:
     params = {
         "limit": 250,
         "fields": "id,title,product_type,variants,status",
-        "status": "any",   # include draft products, not just active
+        "status": "active,archived,draft",   # Shopify rejects "any"; comma-list returns all
     }
 
     all_products = []
@@ -400,6 +402,27 @@ def should_auto_archive(raw: Dict) -> bool:
             return False
 
     return True
+
+
+def should_exclude_from_historical(raw: Dict) -> bool:
+    """
+    Returns True if this raw Shopify order should NOT be counted in historical
+    sales or daily order totals. Excludes:
+      - Auto-archived orders (subscription pass + free "Choose Your Gift" items)
+      - Orders whose only line items are the monthly-priority-pass SKU
+    """
+    if should_auto_archive(raw):
+        return True
+
+    line_items = raw.get("line_items", [])
+    if not line_items:
+        return False
+
+    non_pass = [
+        li for li in line_items
+        if str(li.get("sku") or "").strip() != "monthly-priority-pass"
+    ]
+    return len(non_pass) == 0
 
 
 def transform_order(raw: Dict, sku_lookup: Dict) -> Dict:
