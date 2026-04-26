@@ -147,13 +147,31 @@ export default function HistoricalPromotions() {
             {ingesting ? 'Ingesting...' : (salesSummary?.total_rows ? 'Sync New Orders' : 'Ingest All Historical Sales')}
           </button>
           {salesSummary?.total_rows > 0 && (
-            <button className="btn btn-danger btn-sm" onClick={async () => {
-              if (confirm('Delete all historical sales data? You can re-ingest afterwards.')) {
-                await historicalDataApi.clearSales()
-                qc.invalidateQueries(['sales-summary'])
-                setIngestResult(null)
-              }
-            }}>Clear All Data</button>
+            <>
+              <a
+                className="btn btn-secondary btn-sm"
+                href="http://localhost:8000/api/historical/daily-orders/export"
+                download
+              >Export Daily Orders (CSV)</a>
+              <a
+                className="btn btn-secondary btn-sm"
+                href="http://localhost:8000/api/historical/sales/export"
+                download
+              >Export Hourly Sales (CSV)</a>
+              <a
+                className="btn btn-secondary btn-sm"
+                href="http://localhost:8000/api/historical/orders/export"
+                download
+                title="One row per order line: order number, SKU, tags, quantity, price"
+              >Export Orders + SKUs + Tags (CSV)</a>
+              <button className="btn btn-danger btn-sm" onClick={async () => {
+                if (confirm('Delete all historical sales data? You can re-ingest afterwards.')) {
+                  await historicalDataApi.clearSales()
+                  qc.invalidateQueries(['sales-summary'])
+                  setIngestResult(null)
+                }
+              }}>Clear All Data</button>
+            </>
           )}
         </div>
 

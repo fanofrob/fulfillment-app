@@ -195,6 +195,28 @@ function StagedOrdersTab() {
     },
   })
 
+  const [recomputeResult, setRecomputeResult] = useState(null)
+  const recomputeMut = useMutation({
+    mutationFn: () => ordersApi.recompute(),
+    onSuccess: (data) => {
+      const parts = []
+      if (data.lines_updated > 0) parts.push(`${data.lines_updated} line${data.lines_updated !== 1 ? 's' : ''} updated`)
+      const replanned = (data.orders_replanned_created || 0) + (data.orders_replanned_repaired || 0)
+      if (replanned > 0) parts.push(`${replanned} replanned`)
+      const unstaged = (data.orders_unstaged_plan_issues || 0) + (data.orders_unstaged_short_ship || 0) + (data.orders_unstaged_inv_hold || 0) + (data.orders_unstaged_hold || 0) + (data.orders_unstaged_dnss || 0)
+      if (unstaged > 0) parts.push(`${unstaged} unstaged`)
+      setRecomputeResult(parts.length === 0 ? 'No changes needed' : parts.join(', '))
+      qc.invalidateQueries(['orders-staged'])
+      qc.invalidateQueries(['orders'])
+      qc.invalidateQueries(['staged-shortages'])
+      setTimeout(() => setRecomputeResult(null), 8000)
+    },
+    onError: (err) => {
+      setRecomputeResult(`Error: ${err?.response?.data?.detail || err?.message || 'Unknown'}`)
+      setTimeout(() => setRecomputeResult(null), 8000)
+    },
+  })
+
   const { data: orderRules = [] } = useQuery({
     queryKey: ['order-rules'],
     queryFn: () => rulesApi.listOrders(),
@@ -456,8 +478,21 @@ function StagedOrdersTab() {
         </div>
       </div>
 
-      {/* Bulk Unstage Issues + Refresh */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+      {/* Recompute + Bulk Unstage Issues */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+        <button
+          className="btn btn-secondary btn-sm"
+          onClick={() => recomputeMut.mutate()}
+          disabled={recomputeMut.isPending}
+          title="Re-resolve SKU mappings, re-apply short-ship/inventory-hold, replan affected orders, and unstage anything that no longer fits — without pulling from Shopify."
+        >
+          {recomputeMut.isPending ? 'Recomputing…' : '↻ Recompute Orders'}
+        </button>
+        {recomputeResult && (
+          <span style={{ fontSize: 12, color: recomputeResult.startsWith('Error') ? '#dc2626' : '#16a34a', fontWeight: 500 }}>
+            {recomputeResult.startsWith('Error') ? '' : '✓ '}{recomputeResult}
+          </span>
+        )}
         {issueOrders.length > 0 && (
           <button
             className="btn btn-sm"

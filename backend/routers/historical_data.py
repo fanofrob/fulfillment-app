@@ -2,10 +2,13 @@
 Historical Data router — ingestion of historical sales from Shopify and
 CRUD for historical promotion tagging.
 """
+import csv
+import io
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func as sqlfunc
 
@@ -39,10 +42,12 @@ def ingest_historical_sales(
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid date format: {since}")
     else:
-        # Find latest existing data for incremental sync
+        # Find latest existing data for incremental sync.
+        # Floor to midnight so we re-fetch the full day and daily order counts
+        # stay correct (partial-day fetches would undercount).
         latest = db.query(sqlfunc.max(models.HistoricalSales.hour_bucket)).scalar()
         if latest:
-            start_date = latest
+            start_date = latest.replace(hour=0, minute=0, second=0, microsecond=0)
         else:
             start_date = None  # pull everything
 
@@ -56,8 +61,29 @@ def ingest_historical_sales(
             "errors": [],
         }
 
-    # Aggregate into hourly buckets
-    buckets = _aggregate_to_hourly(orders)
+    # Aggregate into hourly buckets + daily distinct-order counts + per-line-item rows
+    buckets, daily_orders, line_items = _aggregate_to_hourly(orders)
+
+    # Upsert daily distinct-order counts
+    for day, order_count in daily_orders.items():
+        existing_day = (
+            db.query(models.HistoricalDailyOrders)
+            .filter(models.HistoricalDailyOrders.day == day)
+            .first()
+        )
+        if existing_day:
+            existing_day.order_count = order_count
+        else:
+            db.add(models.HistoricalDailyOrders(day=day, order_count=order_count))
+
+    # Replace per-line-item rows for the affected date range so re-ingestion
+    # stays idempotent (Shopify returns all orders >= created_at_min).
+    if line_items:
+        earliest = min(li["created_at_shopify"] for li in line_items)
+        db.query(models.HistoricalOrderLineItem).filter(
+            models.HistoricalOrderLineItem.created_at_shopify >= earliest
+        ).delete(synchronize_session=False)
+        db.bulk_insert_mappings(models.HistoricalOrderLineItem, line_items)
 
     # Upsert into historical_sales
     upserted = 0
@@ -144,10 +170,127 @@ def list_sales(
     return q.offset(skip).limit(limit).all()
 
 
+@router.get("/sales/export")
+def export_sales_csv(
+    start: Optional[str] = Query(None, description="ISO datetime"),
+    end: Optional[str] = Query(None, description="ISO datetime"),
+    db: Session = Depends(get_db),
+):
+    """Stream historical_sales as CSV for external comparison."""
+    q = db.query(models.HistoricalSales).order_by(
+        models.HistoricalSales.hour_bucket, models.HistoricalSales.shopify_sku
+    )
+    if start:
+        q = q.filter(models.HistoricalSales.hour_bucket >= datetime.fromisoformat(start))
+    if end:
+        q = q.filter(models.HistoricalSales.hour_bucket <= datetime.fromisoformat(end))
+
+    def rows():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["hour_bucket", "shopify_sku", "order_count", "quantity_sold", "revenue"])
+        yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+        for r in q.yield_per(1000):
+            w.writerow([
+                r.hour_bucket.isoformat() if r.hour_bucket else "",
+                r.shopify_sku,
+                r.order_count,
+                r.quantity_sold,
+                f"{r.revenue:.2f}",
+            ])
+            yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+
+    filename = f"historical_sales_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+    return StreamingResponse(
+        rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/daily-orders/export")
+def export_daily_orders_csv(db: Session = Depends(get_db)):
+    """Stream historical_daily_orders as CSV — one row per calendar day."""
+    q = db.query(models.HistoricalDailyOrders).order_by(models.HistoricalDailyOrders.day)
+
+    def rows():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["day", "order_count"])
+        yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+        for r in q.yield_per(1000):
+            w.writerow([r.day.isoformat() if r.day else "", r.order_count])
+            yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+
+    filename = f"historical_daily_orders_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+    return StreamingResponse(
+        rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/orders/export")
+def export_orders_csv(
+    start: Optional[str] = Query(None, description="ISO date/datetime"),
+    end: Optional[str] = Query(None, description="ISO date/datetime"),
+    db: Session = Depends(get_db),
+):
+    """
+    Stream per-line-item historical orders as CSV: one row per order line.
+    Columns: order_number, shopify_order_id, created_at, tags, financial_status,
+    fulfillment_status, shopify_sku, product_title, variant_title, quantity, price, discount.
+    """
+    q = db.query(models.HistoricalOrderLineItem).order_by(
+        models.HistoricalOrderLineItem.created_at_shopify,
+        models.HistoricalOrderLineItem.shopify_order_id,
+    )
+    if start:
+        q = q.filter(models.HistoricalOrderLineItem.created_at_shopify >= datetime.fromisoformat(start))
+    if end:
+        q = q.filter(models.HistoricalOrderLineItem.created_at_shopify <= datetime.fromisoformat(end))
+
+    def rows():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([
+            "order_number", "shopify_order_id", "created_at", "tags",
+            "financial_status", "fulfillment_status",
+            "shopify_sku", "product_title", "variant_title",
+            "quantity", "price", "discount",
+        ])
+        yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+        for r in q.yield_per(1000):
+            w.writerow([
+                r.shopify_order_number or "",
+                r.shopify_order_id,
+                r.created_at_shopify.isoformat() if r.created_at_shopify else "",
+                r.tags or "",
+                r.financial_status or "",
+                r.fulfillment_status or "",
+                r.shopify_sku or "",
+                r.product_title or "",
+                r.variant_title or "",
+                r.quantity,
+                f"{r.price:.2f}",
+                f"{r.discount:.2f}",
+            ])
+            yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+
+    filename = f"historical_orders_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+    return StreamingResponse(
+        rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.delete("/sales/")
 def clear_sales(db: Session = Depends(get_db)):
     """Delete all historical sales data (for re-ingestion)."""
     count = db.query(models.HistoricalSales).delete()
+    db.query(models.HistoricalDailyOrders).delete()
+    db.query(models.HistoricalOrderLineItem).delete()
     db.commit()
     return {"deleted": count}
 
@@ -253,14 +396,24 @@ def _fetch_shopify_orders_for_history(since: datetime = None) -> list:
     return all_orders
 
 
-def _aggregate_to_hourly(orders: list) -> dict:
+def _aggregate_to_hourly(orders: list) -> tuple[dict, dict, list]:
     """
-    Aggregate raw Shopify orders into hourly buckets by SKU.
-    Returns: {(hour_bucket_datetime, shopify_sku): {order_count, quantity_sold, revenue}}
+    Aggregate raw Shopify orders into hourly buckets by SKU + daily distinct-order counts
+    + flat per-line-item records for CSV export.
+    Returns:
+      buckets: {(hour_bucket, shopify_sku): {order_count, quantity_sold, revenue}}
+      daily_orders: {date: distinct_order_count}
+      line_items: list of dicts ready for HistoricalOrderLineItem bulk insert
     """
     buckets = {}
+    daily_order_ids: dict = {}
+    line_item_rows: list = []
 
     for order in orders:
+        # Skip subscription priority-pass orders (auto-archived + pass-only)
+        if shopify_service.should_exclude_from_historical(order):
+            continue
+
         created_at_str = order.get("created_at", "")
         if not created_at_str:
             continue
@@ -269,35 +422,59 @@ def _aggregate_to_hourly(orders: list) -> dict:
         except ValueError:
             continue
 
-        # Truncate to hour
         hour_bucket = created_at.replace(minute=0, second=0, microsecond=0)
+        day = created_at.date()
+        order_id = order.get("id")
+        if order_id is not None:
+            daily_order_ids.setdefault(day, set()).add(order_id)
 
-        # Track which SKUs appear in this order (for order_count)
+        order_number = order.get("name") or order.get("order_number")
+        tags = order.get("tags") or ""
+        financial_status = order.get("financial_status")
+        fulfillment_status = order.get("fulfillment_status")
+
         skus_in_order = set()
 
         for li in order.get("line_items", []):
             sku = li.get("sku") or ""
+            qty = li.get("quantity", 0)
+            unit_price = float(li.get("price", 0) or 0)
+            price = unit_price * qty
+            discount = 0.0
+            for disc in li.get("discount_allocations", []):
+                discount += float(disc.get("amount", 0) or 0)
+
+            # Per-line-item record (even if SKU is blank — capture everything)
+            line_item_rows.append({
+                "shopify_order_id":     str(order_id) if order_id is not None else "",
+                "shopify_order_number": str(order_number) if order_number is not None else None,
+                "created_at_shopify":   created_at,
+                "tags":                 tags,
+                "financial_status":     financial_status,
+                "fulfillment_status":   fulfillment_status,
+                "shopify_sku":          sku or None,
+                "product_title":        li.get("title") or None,
+                "variant_title":        li.get("variant_title") or None,
+                "quantity":             qty,
+                "price":                price,
+                "discount":             discount,
+            })
+
+            # Aggregate buckets only for real SKUs
             if not sku:
                 continue
-            qty = li.get("quantity", 0)
-            price = float(li.get("price", 0)) * qty
-            discount = 0
-            for disc in li.get("discount_allocations", []):
-                discount += float(disc.get("amount", 0))
             revenue = price - discount
-
             key = (hour_bucket, sku)
             if key not in buckets:
                 buckets[key] = {"order_count": 0, "quantity_sold": 0, "revenue": 0.0}
-
             buckets[key]["quantity_sold"] += qty
             buckets[key]["revenue"] += revenue
             skus_in_order.add(sku)
 
-        # Increment order_count for each SKU that appeared
         for sku in skus_in_order:
             key = (hour_bucket, sku)
             if key in buckets:
                 buckets[key]["order_count"] += 1
 
-    return buckets
+    daily_orders = {d: len(ids) for d, ids in daily_order_ids.items()}
+    return buckets, daily_orders, line_item_rows

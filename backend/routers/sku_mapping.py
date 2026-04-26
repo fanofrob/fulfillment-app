@@ -9,77 +9,6 @@ from services import sheets_service
 router = APIRouter()
 
 
-def _unstage_orders_with_changed_skus(db: Session) -> int:
-    """
-    After a SKU mapping cache refresh, re-check all staged orders.
-    Any staged order whose line items would now resolve to different pick_skus
-    is moved back to not_processed and committed inventory is recomputed.
-    Returns the count of orders unstaged.
-    """
-    from routers.inventory import _recompute_committed
-
-    staged_orders = (
-        db.query(models.ShopifyOrder)
-        .filter(models.ShopifyOrder.app_status == "staged")
-        .all()
-    )
-    if not staged_orders:
-        return 0
-
-    # Cache lookups per warehouse so we only hit Sheets once each
-    wh_lookups: dict = {}
-    def get_lookup(wh: str) -> dict:
-        if wh not in wh_lookups:
-            try:
-                wh_lookups[wh] = sheets_service.get_sku_mapping_lookup(wh)
-            except Exception:
-                wh_lookups[wh] = {}
-        return wh_lookups[wh]
-
-    orders_unstaged = 0
-    affected_warehouses: set = set()
-
-    for order in staged_orders:
-        wh = order.assigned_warehouse or "walnut"
-        sku_lookup = get_lookup(wh)
-
-        line_items = (
-            db.query(models.ShopifyLineItem)
-            .filter(models.ShopifyLineItem.shopify_order_id == order.shopify_order_id)
-            .all()
-        )
-
-        # Group current pick_skus by shopify_sku
-        current_by_shopify: dict = {}
-        for li in line_items:
-            if li.shopify_sku:
-                current_by_shopify.setdefault(li.shopify_sku, set()).add(li.pick_sku)
-
-        changed = False
-        for shopify_sku, current_pick_skus in current_by_shopify.items():
-            new_mappings = sku_lookup.get(shopify_sku)
-            if new_mappings is None:
-                new_pick_skus = {None}
-            else:
-                new_pick_skus = {m.get("pick_sku") for m in new_mappings}
-            if new_pick_skus != current_pick_skus:
-                changed = True
-                break
-
-        if changed:
-            order.app_status = "not_processed"
-            orders_unstaged += 1
-            if order.assigned_warehouse:
-                affected_warehouses.add(order.assigned_warehouse)
-
-    if orders_unstaged:
-        db.flush()
-        for wh in affected_warehouses:
-            _recompute_committed(wh, db)
-
-    return orders_unstaged
-
-
 @router.get("/")
 def list_sku_mappings(
     warehouse: Optional[str] = Query(None),
@@ -100,12 +29,27 @@ def list_sku_mappings(
 
 @router.post("/refresh")
 def refresh_sku_cache(db: Session = Depends(get_db)):
+    """
+    Invalidate the SKU mapping cache and recompute all open orders so they
+    reflect the latest mappings (re-resolves pick_skus, re-applies short-ship,
+    replans changed orders, unstages anything that no longer fits).
+    """
     sheets_service.invalidate("sku_walnut")
     sheets_service.invalidate("sku_northlake")
     sheets_service.invalidate("sku_type_data")
-    orders_unstaged = _unstage_orders_with_changed_skus(db)
-    db.commit()
-    return {"status": "cache cleared", "orders_unstaged": orders_unstaged}
+
+    from services.order_recompute import recompute_open_orders
+    result = recompute_open_orders(db)
+    return {
+        "status": "cache cleared",
+        # Legacy field — equivalent to "orders that no longer match staging requirements".
+        "orders_unstaged": (
+            result["orders_unstaged_plan_issues"]
+            + result["orders_unstaged_short_ship"]
+            + result["orders_unstaged_inv_hold"]
+        ),
+        **result,
+    }
 
 
 @router.get("/resolve")

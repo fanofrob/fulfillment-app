@@ -363,7 +363,7 @@ function GmGroupSection({ title, group, settings, missingCostSkus, showShippingB
 
 // ── Box Section ────────────────────────────────────────────────────────────────
 
-function BoxSection({ plan, box, lineItems, boxTypes, pactorMap, ssConfigured, shippingBoxes, qc, order }) {
+function BoxSection({ plan, box, lineItems, boxTypes, pactorMap, ssConfigured, shippingBoxes, qc, order, isPreview = false }) {
   const [editing, setEditing] = useState(false)
   const [draftItems, setDraftItems] = useState([])
   const [addItemId, setAddItemId] = useState('')
@@ -477,7 +477,7 @@ function BoxSection({ plan, box, lineItems, boxTypes, pactorMap, ssConfigured, s
         {box.tracking_number && (
           <span className="mono" style={{ fontSize: 11, color: '#16a34a' }}>{box.tracking_number}</span>
         )}
-        {!isShipped && boxTypes.length > 0 && (
+        {!isPreview && !isShipped && boxTypes.length > 0 && (
           <select
             value={box.box_type_id ?? ''}
             onChange={e => updateBoxMut.mutate({ box_type_id: e.target.value ? parseInt(e.target.value) : null })}
@@ -488,19 +488,24 @@ function BoxSection({ plan, box, lineItems, boxTypes, pactorMap, ssConfigured, s
             {boxTypes.map(bt => <option key={bt.id} value={bt.id}>{bt.name}</option>)}
           </select>
         )}
+        {isPreview && box.box_type_id && (
+          <span style={{ fontSize: 11, color: '#6b7280' }}>
+            {boxTypes.find(bt => bt.id === box.box_type_id)?.name || ''}
+          </span>
+        )}
         {!isShipped && !box.box_type_id && (
           <span style={{ fontSize: 11, color: '#d97706' }} title="No package rule matched this box">⚠ No rule</span>
         )}
-        {isShipped && box.box_type_id && (
+        {!isPreview && isShipped && box.box_type_id && (
           <span style={{ fontSize: 11, color: '#6b7280' }}>
             {boxTypes.find(bt => bt.id === box.box_type_id)?.name || ''}
           </span>
         )}
         <div style={{ flex: 1 }} />
-        {!editing && !isShipped && !isCancelled && (
+        {!isPreview && !editing && !isShipped && !isCancelled && (
           <button className="btn btn-sm" onClick={startEdit} style={{ fontSize: 11 }}>Edit Items</button>
         )}
-        {!isPacked && !isShipped && !isCancelled && !editing && ssConfigured !== false && (
+        {!isPreview && !isPacked && !isShipped && !isCancelled && !editing && ssConfigured !== false && (
           <button
             className="btn btn-sm btn-primary"
             onClick={() => pushBoxMut.mutate()}
@@ -510,7 +515,7 @@ function BoxSection({ plan, box, lineItems, boxTypes, pactorMap, ssConfigured, s
             {pushBoxMut.isPending ? 'Pushing…' : '→ ShipStation'}
           </button>
         )}
-        {!isPacked && !isShipped && !isCancelled && !editing && (
+        {!isPreview && !isPacked && !isShipped && !isCancelled && !editing && (
           <button
             className="btn btn-sm btn-danger"
             onClick={() => {
@@ -522,7 +527,7 @@ function BoxSection({ plan, box, lineItems, boxTypes, pactorMap, ssConfigured, s
             {deleteBoxMut.isPending ? '…' : '✕'}
           </button>
         )}
-        {(isPacked || isShipped) && !isCancelled && !editing && (
+        {!isPreview && (isPacked || isShipped) && !isCancelled && !editing && (
           <button
             className="btn btn-sm btn-danger"
             onClick={() => {
@@ -648,7 +653,7 @@ function BoxSection({ plan, box, lineItems, boxTypes, pactorMap, ssConfigured, s
 
 // ── Plan Section ───────────────────────────────────────────────────────────────
 
-function PlanSection({ plan, lineItems, boxTypes, pactorMap, ssConfigured, shippingBoxes, onUpdatePlan, onAddBox, onResetUnpushed, resetUnpushedPending, qc, order }) {
+function PlanSection({ plan, lineItems, boxTypes, pactorMap, ssConfigured, shippingBoxes, onUpdatePlan, onAddBox, onResetUnpushed, resetUnpushedPending, qc, order, isPreview = false }) {
   const PLAN_STATUS = {
     draft:                  { label: 'Draft',           cls: 'badge-not-processed' },
     active:                 { label: 'Active',          cls: 'badge-fulfilled' },
@@ -667,7 +672,7 @@ function PlanSection({ plan, lineItems, boxTypes, pactorMap, ssConfigured, shipp
     <div>
       <div className="ss-plan-toolbar">
         <span className={`badge ${planCfg.cls}`} style={{ fontSize: 11 }}>{planCfg.label}</span>
-        {plan.status === 'active' && (
+        {!isPreview && plan.status === 'active' && (
           <button
             className="btn btn-sm"
             onClick={() => onUpdatePlan({ status: 'completed' })}
@@ -677,12 +682,12 @@ function PlanSection({ plan, lineItems, boxTypes, pactorMap, ssConfigured, shipp
             Mark Completed
           </button>
         )}
-        {plan.status === 'completed' && hasUnfulfilled && (
+        {!isPreview && plan.status === 'completed' && hasUnfulfilled && (
           <button className="btn btn-sm btn-danger" onClick={() => onUpdatePlan({ status: 'draft' })} title="Plan is marked completed but order still has unfulfilled items">
             Reopen Plan
           </button>
         )}
-        {(plan.boxes || []).some(b => b.status === 'pending') && (
+        {!isPreview && (plan.boxes || []).some(b => b.status === 'pending') && (
           <button className="btn btn-sm btn-danger" onClick={onResetUnpushed} disabled={resetUnpushedPending} style={{ fontSize: 12 }}>
             {resetUnpushedPending ? 'Deleting…' : 'Reset Unpushed'}
           </button>
@@ -692,15 +697,17 @@ function PlanSection({ plan, lineItems, boxTypes, pactorMap, ssConfigured, shipp
             {showCancelled ? `Hide Cancelled (${cancelledCount})` : `Show Cancelled (${cancelledCount})`}
           </button>
         )}
-        <button className="btn btn-sm" onClick={onAddBox} style={{ marginLeft: 'auto' }}>+ Add Box</button>
+        {!isPreview && (
+          <button className="btn btn-sm" onClick={onAddBox} style={{ marginLeft: 'auto' }}>+ Add Box</button>
+        )}
       </div>
 
       {plan.boxes?.length === 0 ? (
         <p style={{ color: '#9ca3af', fontSize: 13, marginTop: 8 }}>No boxes yet. Click "+ Add Box" to start.</p>
       ) : (
-        visibleBoxes.map(box => (
+        visibleBoxes.map((box, idx) => (
           <BoxSection
-            key={box.id}
+            key={box.id ?? `preview-${idx}`}
             plan={plan}
             box={box}
             lineItems={lineItems}
@@ -710,6 +717,7 @@ function PlanSection({ plan, lineItems, boxTypes, pactorMap, ssConfigured, shipp
             shippingBoxes={shippingBoxes}
             qc={qc}
             order={order}
+            isPreview={isPreview}
           />
         ))
       )}
@@ -719,17 +727,26 @@ function PlanSection({ plan, lineItems, boxTypes, pactorMap, ssConfigured, shipp
 
 // ── Order Detail Panel ─────────────────────────────────────────────────────────
 
-export default function OrderDetailPanel({ order, onClose, onPrev, onNext, hasPrev, hasNext, holdTags, ssConfigured }) {
+export default function OrderDetailPanel({ order, onClose, onPrev, onNext, hasPrev, hasNext, holdTags, ssConfigured, previewMappingTab = null }) {
   const qc = useQueryClient()
 
+  // When previewMappingTab is set, the backend re-resolves pick SKUs and box
+  // configs against that sheet tab (no DB writes). Cache key includes the tab
+  // so React Query refetches when it changes.
   const { data: orderDetail } = useQuery({
-    queryKey: ['order-detail', order.shopify_order_id],
-    queryFn: () => ordersApi.get(order.shopify_order_id),
+    queryKey: ['order-detail', order.shopify_order_id, previewMappingTab],
+    queryFn: () => ordersApi.get(
+      order.shopify_order_id,
+      previewMappingTab ? { mapping_tab: previewMappingTab } : undefined,
+    ),
   })
 
   const { data: plans, isLoading: plansLoading } = useQuery({
-    queryKey: ['plans', order.shopify_order_id],
-    queryFn: () => fulfillmentApi.listPlans({ shopify_order_id: order.shopify_order_id }),
+    queryKey: ['plans', order.shopify_order_id, previewMappingTab],
+    queryFn: () => fulfillmentApi.listPlans({
+      shopify_order_id: order.shopify_order_id,
+      ...(previewMappingTab ? { mapping_tab: previewMappingTab } : {}),
+    }),
   })
 
   const { data: boxTypes = [] } = useQuery({
@@ -1141,7 +1158,26 @@ export default function OrderDetailPanel({ order, onClose, onPrev, onNext, hasPr
 
         {/* Fulfillment Plan */}
         <div className="ss-detail-section">
-          <div className="ss-detail-section-title">Fulfillment Plan</div>
+          <div className="ss-detail-section-title">
+            Fulfillment Plan
+            {plan?.is_preview && (
+              <span
+                style={{
+                  marginLeft: 8, padding: '2px 8px', borderRadius: 999, fontSize: 10,
+                  fontWeight: 700, letterSpacing: 0.3,
+                  background: '#fef3c7', color: '#92400e',
+                }}
+                title={`Preview — boxes recomputed against mapping tab "${plan.mapping_tab}". Stored plan unchanged. Click Confirm Selected on this order to commit this layout.`}
+              >
+                PREVIEW · {plan.mapping_tab}
+              </span>
+            )}
+          </div>
+          {plan?.is_preview && plan.notes && (
+            <div style={{ background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 6, padding: '6px 10px', marginBottom: 8, fontSize: 12, color: '#92400e' }}>
+              {plan.notes}
+            </div>
+          )}
           {plansLoading ? (
             <div style={{ color: '#9ca3af', fontSize: 13 }}>Loading…</div>
           ) : !plan ? (
@@ -1164,7 +1200,7 @@ export default function OrderDetailPanel({ order, onClose, onPrev, onNext, hasPr
               lineItems={lineItems}
               boxTypes={boxTypes}
               pactorMap={pactorMap}
-              ssConfigured={ssConfigured}
+              ssConfigured={ssConfigured && !plan.is_preview}
               shippingBoxes={margin?.shipping_boxes}
               onUpdatePlan={(data) => updatePlanMut.mutate({ id: plan.id, data })}
               onAddBox={() => addBoxMut.mutate(plan.id)}
@@ -1177,6 +1213,7 @@ export default function OrderDetailPanel({ order, onClose, onPrev, onNext, hasPr
               resetUnpushedPending={deleteUnpushedMut.isPending}
               qc={qc}
               order={order}
+              isPreview={!!plan.is_preview}
             />
           )}
         </div>

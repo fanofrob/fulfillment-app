@@ -2,8 +2,8 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { projectionPeriodsApi } from '../api'
 
-const STATUS_COLORS = { draft: '#f3f4f6', active: '#dcfce7', closed: '#fee2e2' }
-const STATUS_TEXT_COLORS = { draft: '#6b7280', active: '#166534', closed: '#991b1b' }
+const STATUS_COLORS = { draft: '#f3f4f6', active: '#dcfce7', closed: '#fee2e2', archived: '#e5e7eb' }
+const STATUS_TEXT_COLORS = { draft: '#6b7280', active: '#166534', closed: '#991b1b', archived: '#374151' }
 
 const EMPTY_FORM = {
   name: '', start_datetime: '', end_datetime: '',
@@ -36,10 +36,11 @@ export default function ProjectionPeriods() {
   const [skuInput, setSkuInput] = useState('')
   const [copySource, setCopySource] = useState('')
   const [diffTarget, setDiffTarget] = useState('')
+  const [showArchived, setShowArchived] = useState(false)
 
   const { data: periods = [], isLoading } = useQuery({
-    queryKey: ['projection-periods'],
-    queryFn: () => projectionPeriodsApi.list(),
+    queryKey: ['projection-periods', { includeArchived: showArchived }],
+    queryFn: () => projectionPeriodsApi.list({ include_archived: showArchived }),
   })
   const { data: suggestedDates } = useQuery({
     queryKey: ['suggest-dates'],
@@ -83,6 +84,16 @@ export default function ProjectionPeriods() {
     mutationFn: projectionPeriodsApi.delete,
     onSuccess: () => { qc.invalidateQueries(['projection-periods']); setSelectedPeriod(null) },
   })
+  const archiveMut = useMutation({
+    mutationFn: projectionPeriodsApi.archive,
+    onSuccess: () => { qc.invalidateQueries(['projection-periods']); setSelectedPeriod(null) },
+    onError: (err) => alert(`Archive failed: ${err?.response?.data?.detail || err?.message || 'Unknown error'}`),
+  })
+  const unarchiveMut = useMutation({
+    mutationFn: projectionPeriodsApi.unarchive,
+    onSuccess: () => qc.invalidateQueries(['projection-periods']),
+    onError: (err) => alert(`Unarchive failed: ${err?.response?.data?.detail || err?.message || 'Unknown error'}`),
+  })
 
   const addShortShipMut = useMutation({
     mutationFn: ({ periodId, sku }) => projectionPeriodsApi.addShortShip(periodId, { shopify_sku: sku }),
@@ -120,12 +131,23 @@ export default function ProjectionPeriods() {
 
   function openCreate() {
     setEditing(null)
+    const now = new Date()
+    const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000)
     const f = { ...EMPTY_FORM }
+    f.fulfillment_start = toLocalInput(ninetyDaysAgo.toISOString())
+    f.fulfillment_end = toLocalInput(now.toISOString())
+    f.start_datetime = toLocalInput(now.toISOString())
     if (suggestedDates?.current_week) {
-      f.start_datetime = toLocalInput(suggestedDates.current_week.start)
       f.end_datetime = toLocalInput(suggestedDates.current_week.end)
       const weekNum = Math.ceil((new Date(suggestedDates.current_week.start).getTime() - new Date(new Date().getFullYear(), 0, 1).getTime()) / (7 * 86400000))
       f.name = `Week ${weekNum} - Period 1`
+    } else {
+      const day = now.getDay()
+      const daysUntilTue = (2 - day + 7) % 7 || 7
+      const tuesday = new Date(now)
+      tuesday.setDate(now.getDate() + daysUntilTue)
+      tuesday.setHours(23, 59, 0, 0)
+      f.end_datetime = toLocalInput(tuesday.toISOString())
     }
     setForm(f)
     setShowModal(true)
@@ -190,8 +212,16 @@ export default function ProjectionPeriods() {
         <p>Manage projection periods and their per-period short ship / inventory hold configurations.</p>
       </div>
 
-      <div className="toolbar">
+      <div className="toolbar" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <button className="btn btn-primary" onClick={openCreate}>+ New Period</button>
+        <label style={{ fontSize: 13, color: '#374151', display: 'flex', alignItems: 'center', gap: 6, marginLeft: 8 }}>
+          <input
+            type="checkbox"
+            checked={showArchived}
+            onChange={e => { setShowArchived(e.target.checked); setSelectedPeriod(null) }}
+          />
+          Show archived
+        </label>
       </div>
 
       {/* Periods Table */}
@@ -203,9 +233,8 @@ export default function ProjectionPeriods() {
             <thead>
               <tr>
                 <th>Name</th>
-                <th>Start</th>
-                <th>End</th>
-                <th>Fulfillment</th>
+                <th>Confirmed Demand</th>
+                <th>Projections Period</th>
                 <th>Status</th>
                 <th>SKU Mapping Tab</th>
                 <th>Configs</th>
@@ -213,13 +242,19 @@ export default function ProjectionPeriods() {
               </tr>
             </thead>
             <tbody>
-              {periods.map(p => (
-                <tr key={p.id} style={selectedPeriod === p.id ? { background: '#eff6ff' } : {}}>
+              {periods.map(p => {
+                const isArchived = p.status === 'archived'
+                return (
+                <tr key={p.id} style={{
+                  ...(selectedPeriod === p.id ? { background: '#eff6ff' } : {}),
+                  ...(isArchived ? { opacity: 0.7 } : {}),
+                }}>
                   <td style={{ fontWeight: 600 }}>{p.name}</td>
-                  <td>{formatDate(p.start_datetime)}</td>
-                  <td>{formatDate(p.end_datetime)}</td>
-                  <td>
-                    {p.fulfillment_start ? `${formatDate(p.fulfillment_start)} - ${formatDate(p.fulfillment_end)}` : '—'}
+                  <td style={{ fontSize: 13 }}>
+                    {p.fulfillment_start ? `${formatDate(p.fulfillment_start)} → ${formatDate(p.fulfillment_end)}` : '—'}
+                  </td>
+                  <td style={{ fontSize: 13 }}>
+                    {formatDate(p.start_datetime)} → {formatDate(p.end_datetime)}
                   </td>
                   <td>
                     <span style={{
@@ -234,20 +269,40 @@ export default function ProjectionPeriods() {
                     <button
                       className="btn btn-secondary btn-sm"
                       onClick={() => { setSelectedPeriod(selectedPeriod === p.id ? null : p.id); setDiffTarget('') }}
+                      disabled={isArchived}
+                      title={isArchived ? 'Archived periods are read-only' : undefined}
                     >
                       {selectedPeriod === p.id ? 'Hide' : 'Configure'}
                     </button>
                   </td>
                   <td>
-                    <button className="btn btn-secondary btn-sm" onClick={() => openEdit(p)}>Edit</button>{' '}
-                    {p.status !== 'active' && (
-                      <button className="btn btn-danger btn-sm" onClick={() => {
-                        if (confirm(`Delete period "${p.name}"?`)) deleteMut.mutate(p.id)
-                      }}>Del</button>
+                    {!isArchived && (
+                      <>
+                        <button className="btn btn-secondary btn-sm" onClick={() => openEdit(p)}>Edit</button>{' '}
+                      </>
+                    )}
+                    {!isArchived && p.status !== 'active' && (
+                      <>
+                        <button className="btn btn-secondary btn-sm" onClick={() => {
+                          if (confirm(`Archive period "${p.name}"? It will be hidden from the default list and become read-only.`)) {
+                            archiveMut.mutate(p.id)
+                          }
+                        }} disabled={archiveMut.isPending}>Archive</button>{' '}
+                        <button className="btn btn-danger btn-sm" onClick={() => {
+                          if (confirm(`Delete period "${p.name}"?`)) deleteMut.mutate(p.id)
+                        }}>Del</button>
+                      </>
+                    )}
+                    {isArchived && (
+                      <button className="btn btn-secondary btn-sm" onClick={() => {
+                        if (confirm(`Unarchive period "${p.name}"? It will return to draft status.`)) {
+                          unarchiveMut.mutate(p.id)
+                        }
+                      }} disabled={unarchiveMut.isPending}>Unarchive</button>
                     )}
                   </td>
                 </tr>
-              ))}
+              )})}
             </tbody>
           </table>
         )}
@@ -386,32 +441,42 @@ export default function ProjectionPeriods() {
                   <input type="text" required value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
                     style={{ width: '100%', padding: '6px 10px', border: '1px solid #d1d5db', borderRadius: 6 }} />
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                  <div>
-                    <label>Period Start</label>
-                    <input type="datetime-local" required value={form.start_datetime}
-                      onChange={e => setForm(f => ({ ...f, start_datetime: e.target.value }))}
-                      style={{ width: '100%', padding: '6px 10px', border: '1px solid #d1d5db', borderRadius: 6 }} />
+                <div style={{ border: '1px solid #bfdbfe', borderRadius: 8, padding: 12, background: '#eff6ff' }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: '#1d4ed8', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 10 }}>
+                    Confirmed Demand
                   </div>
-                  <div>
-                    <label>Period End</label>
-                    <input type="datetime-local" required value={form.end_datetime}
-                      onChange={e => setForm(f => ({ ...f, end_datetime: e.target.value }))}
-                      style={{ width: '100%', padding: '6px 10px', border: '1px solid #d1d5db', borderRadius: 6 }} />
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                    <div>
+                      <label>Start</label>
+                      <input type="datetime-local" value={form.fulfillment_start}
+                        onChange={e => setForm(f => ({ ...f, fulfillment_start: e.target.value }))}
+                        style={{ width: '100%', padding: '6px 10px', border: '1px solid #bfdbfe', borderRadius: 6 }} />
+                    </div>
+                    <div>
+                      <label>End</label>
+                      <input type="datetime-local" value={form.fulfillment_end}
+                        onChange={e => setForm(f => ({ ...f, fulfillment_end: e.target.value }))}
+                        style={{ width: '100%', padding: '6px 10px', border: '1px solid #bfdbfe', borderRadius: 6 }} />
+                    </div>
                   </div>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                  <div>
-                    <label>Fulfillment Start (optional)</label>
-                    <input type="datetime-local" value={form.fulfillment_start}
-                      onChange={e => setForm(f => ({ ...f, fulfillment_start: e.target.value }))}
-                      style={{ width: '100%', padding: '6px 10px', border: '1px solid #d1d5db', borderRadius: 6 }} />
+                <div style={{ border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, background: '#f0fdf4' }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: '#15803d', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 10 }}>
+                    Projections Period
                   </div>
-                  <div>
-                    <label>Fulfillment End (optional)</label>
-                    <input type="datetime-local" value={form.fulfillment_end}
-                      onChange={e => setForm(f => ({ ...f, fulfillment_end: e.target.value }))}
-                      style={{ width: '100%', padding: '6px 10px', border: '1px solid #d1d5db', borderRadius: 6 }} />
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                    <div>
+                      <label>Start</label>
+                      <input type="datetime-local" required value={form.start_datetime}
+                        onChange={e => setForm(f => ({ ...f, start_datetime: e.target.value }))}
+                        style={{ width: '100%', padding: '6px 10px', border: '1px solid #bbf7d0', borderRadius: 6 }} />
+                    </div>
+                    <div>
+                      <label>End</label>
+                      <input type="datetime-local" required value={form.end_datetime}
+                        onChange={e => setForm(f => ({ ...f, end_datetime: e.target.value }))}
+                        style={{ width: '100%', padding: '6px 10px', border: '1px solid #bbf7d0', borderRadius: 6 }} />
+                    </div>
                   </div>
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>

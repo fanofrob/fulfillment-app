@@ -2,6 +2,8 @@
 Google Sheets service — reads live data from GHF spreadsheets.
 Requires credentials.json (service account) in the backend/ directory.
 """
+from __future__ import annotations
+
 import os
 import time
 import gspread
@@ -260,6 +262,10 @@ def get_period_sku_mapping_lookup(tab_name: str) -> dict:
     Returns {shopify_sku: [{"pick_sku": str, "mix_quantity": float, "product_type": str}, ...]}
     for a period-specific Google Sheets tab. Mirrors get_sku_mapping_lookup() but preserves
     the product_type field needed by the projection engine.
+
+    Applies the same helper-indirection + no-bundle layering as the warehouse path so
+    Shopify variant SKUs (`-5lb_2`, `-1lb_pos`, …) inherit the canonical SKU's mapping
+    instead of being silently dropped from projections.
     """
     rows = get_period_sku_mappings(tab_name, skip=0, limit=100000)
     result = CaseInsensitiveSkuDict()
@@ -274,6 +280,20 @@ def get_period_sku_mapping_lookup(tab_name: str) -> dict:
             "mix_quantity": r.get("mix_quantity") or 1.0,
             "product_type": r.get("product_type"),
         })
+
+    try:
+        sku_type = _fetch_sku_type_data()
+        for shopify_sku, helper_sku in sku_type["helper_map"].items():
+            if shopify_sku not in result and helper_sku in result:
+                result[shopify_sku] = result[helper_sku]
+        for sku in sku_type["no_bundle_set"]:
+            if sku not in result:
+                result[sku] = [{"pick_sku": None, "mix_quantity": 1.0, "no_bundle": True, "product_type": None}]
+    except Exception as e:
+        import traceback
+        print(f"[WARN] Period SKU helper indirection failed: {e}")
+        traceback.print_exc()
+
     return result
 
 
@@ -566,46 +586,77 @@ def get_inventory(warehouse: str = None):
     return all_rows
 
 
+def _read_input_sku_type_sheet() -> tuple[dict, set]:
+    """
+    Raw read of the INPUT_SKU_TYPE Google Sheet. Returns (helper_map, no_bundle_set).
+    Header is on row 2 (index 1); data starts on row 3 (index 2).
+
+    Used by `_sheet_helper_map_raw()` (called by the helper-table sync endpoint)
+    and by `_fetch_sku_type_data()` for the no_bundle_set portion.
+    """
+    client = _get_client()
+    ws = client.open_by_key(SPREADSHEET_IDS["inventory"]).worksheet("INPUT_SKU_TYPE")
+    all_values = ws.get_all_values()
+    if not all_values or len(all_values) < 2:
+        return CaseInsensitiveSkuDict(), set()
+
+    header = [str(h).strip().lower() for h in all_values[1]]
+
+    try:
+        sku_col = header.index("sku")
+    except ValueError:
+        print("[WARN] INPUT_SKU_TYPE: 'SKU' column not found in header row")
+        return CaseInsensitiveSkuDict(), set()
+
+    helper_col = next((i for i, h in enumerate(header) if h == "sku helper"),    None)
+    bundle_col = next((i for i, h in enumerate(header) if h == "bundle needed"), None)
+
+    helper_map    = CaseInsensitiveSkuDict()
+    no_bundle_set = set()
+
+    for row in all_values[2:]:
+        sku = str(row[sku_col]).strip() if sku_col < len(row) else ""
+        if not sku:
+            continue
+        if helper_col is not None and helper_col < len(row):
+            helper = str(row[helper_col]).strip()
+            if helper and helper != sku:
+                helper_map[sku] = helper
+        if bundle_col is not None and bundle_col < len(row):
+            if str(row[bundle_col]).strip().upper() == "FALSE":
+                no_bundle_set.add(sku)
+
+    return helper_map, no_bundle_set
+
+
+def _sheet_helper_map_raw() -> dict:
+    """Helper map read directly from the sheet — used by the sync endpoint only."""
+    helper_map, _ = _read_input_sku_type_sheet()
+    return helper_map
+
+
 def _fetch_sku_type_data() -> dict:
     """
-    Read INPUT_SKU_TYPE tab once and return both:
-      - helper_map:    {shopify_sku: helper_sku}  — rows where helper differs from SKU
-      - no_bundle_set: {shopify_sku}               — rows where Bundle Needed = FALSE
-    Uses get_all_values() to avoid gspread duplicate-header errors.
-    Header is on row 2 (index 1); data starts on row 3 (index 2).
+    Returns {helper_map, no_bundle_set}. The helper_map is the canonical DB
+    table (sku_helper_mappings); no_bundle_set still comes from the
+    INPUT_SKU_TYPE sheet's "Bundle Needed" column.
     """
     def fetch():
-        client = _get_client()
-        ws = client.open_by_key(SPREADSHEET_IDS["inventory"]).worksheet("INPUT_SKU_TYPE")
-        all_values = ws.get_all_values()
-        if not all_values or len(all_values) < 2:
-            return {"helper_map": CaseInsensitiveSkuDict(), "no_bundle_set": set()}
+        # Helper map: from DB (canonical source)
+        from database import SessionLocal
+        import models
+        helper_map = CaseInsensitiveSkuDict()
+        with SessionLocal() as db:
+            for row in db.query(models.SkuHelperMapping).all():
+                if row.shopify_sku and row.helper_sku:
+                    helper_map[row.shopify_sku] = row.helper_sku
 
-        header = [str(h).strip().lower() for h in all_values[1]]
-
+        # no_bundle_set: from sheet (kept out of scope for the helper UI)
+        no_bundle_set: set = set()
         try:
-            sku_col = header.index("sku")
-        except ValueError:
-            print("[WARN] INPUT_SKU_TYPE: 'SKU' column not found in header row")
-            return {"helper_map": CaseInsensitiveSkuDict(), "no_bundle_set": set()}
-
-        helper_col    = next((i for i, h in enumerate(header) if h == "sku helper"),    None)
-        bundle_col    = next((i for i, h in enumerate(header) if h == "bundle needed"), None)
-
-        helper_map    = CaseInsensitiveSkuDict()
-        no_bundle_set = set()
-
-        for row in all_values[2:]:
-            sku = str(row[sku_col]).strip() if sku_col < len(row) else ""
-            if not sku:
-                continue
-            if helper_col is not None and helper_col < len(row):
-                helper = str(row[helper_col]).strip()
-                if helper and helper != sku:
-                    helper_map[sku] = helper
-            if bundle_col is not None and bundle_col < len(row):
-                if str(row[bundle_col]).strip().upper() == "FALSE":
-                    no_bundle_set.add(sku)
+            _, no_bundle_set = _read_input_sku_type_sheet()
+        except Exception as e:
+            print(f"[WARN] Failed to read no_bundle_set from sheet: {e}")
 
         return {"helper_map": helper_map, "no_bundle_set": no_bundle_set}
 

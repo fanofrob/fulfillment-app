@@ -37,11 +37,14 @@ def _suggest_default_boundaries(reference_date: datetime = None):
 @router.get("/", response_model=List[schemas.ProjectionPeriodResponse])
 def list_periods(
     status: Optional[str] = Query(None),
+    include_archived: bool = Query(False),
     db: Session = Depends(get_db),
 ):
     q = db.query(models.ProjectionPeriod).order_by(models.ProjectionPeriod.start_datetime.desc())
     if status:
         q = q.filter(models.ProjectionPeriod.status == status)
+    elif not include_archived:
+        q = q.filter(models.ProjectionPeriod.status != "archived")
     return q.all()
 
 
@@ -81,6 +84,8 @@ def update_period(period_id: int, body: schemas.ProjectionPeriodUpdate, db: Sess
     period = db.query(models.ProjectionPeriod).filter(models.ProjectionPeriod.id == period_id).first()
     if not period:
         raise HTTPException(status_code=404, detail="Period not found")
+    if period.status == "archived":
+        raise HTTPException(status_code=409, detail="Cannot edit an archived period. Unarchive first.")
     updates = body.model_dump(exclude_unset=True)
     for k, v in updates.items():
         setattr(period, k, v)
@@ -98,12 +103,44 @@ def delete_period(period_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Period not found")
     if period.status == "active":
         raise HTTPException(status_code=400, detail="Cannot delete an active period. Close it first.")
-    # Delete associated configs
+    if period.status == "archived":
+        raise HTTPException(status_code=400, detail="Cannot delete an archived period. Unarchive first.")
+    # Delete associated configs + confirmed-order join rows
     db.query(models.PeriodShortShipConfig).filter(models.PeriodShortShipConfig.period_id == period_id).delete()
     db.query(models.PeriodInventoryHoldConfig).filter(models.PeriodInventoryHoldConfig.period_id == period_id).delete()
+    db.query(models.ProjectionPeriodConfirmedOrder).filter(models.ProjectionPeriodConfirmedOrder.period_id == period_id).delete()
     db.delete(period)
     db.commit()
     return {"deleted": True, "period_id": period_id}
+
+
+# ── Archive / Unarchive ──────────────────────────────────────────────────────
+
+@router.post("/{period_id}/archive", response_model=schemas.ProjectionPeriodResponse)
+def archive_period(period_id: int, db: Session = Depends(get_db)):
+    period = db.query(models.ProjectionPeriod).filter(models.ProjectionPeriod.id == period_id).first()
+    if not period:
+        raise HTTPException(status_code=404, detail="Period not found")
+    if period.status == "archived":
+        return period
+    period.status = "archived"
+    db.commit()
+    db.refresh(period)
+    return period
+
+
+@router.post("/{period_id}/unarchive", response_model=schemas.ProjectionPeriodResponse)
+def unarchive_period(period_id: int, db: Session = Depends(get_db)):
+    period = db.query(models.ProjectionPeriod).filter(models.ProjectionPeriod.id == period_id).first()
+    if not period:
+        raise HTTPException(status_code=404, detail="Period not found")
+    if period.status != "archived":
+        return period
+    # Restore to draft — user can promote to active again from there
+    period.status = "draft"
+    db.commit()
+    db.refresh(period)
+    return period
 
 
 # ── Short Ship Config ────────────────────────────────────────────────────────
@@ -378,6 +415,84 @@ def import_global_inventory_hold(period_id: int, db: Session = Depends(get_db)):
         added += 1
     db.commit()
     return {"imported": added, "already_existed": len(global_skus & existing)}
+
+
+# ── Projection Overrides (per-product-type) ─────────────────────────────────
+
+def _validate_override_payload(body: schemas.PeriodProjectionOverrideCreate):
+    """Enforce the either/or/manual contract at the API boundary."""
+    has_weeks = body.historical_weeks is not None
+    has_range = body.custom_range_start is not None or body.custom_range_end is not None
+    has_manual = body.manual_daily_lbs is not None
+
+    if has_weeks and has_range:
+        raise HTTPException(status_code=400, detail="Set either historical_weeks OR custom_range_start/end, not both")
+    if has_range and (body.custom_range_start is None or body.custom_range_end is None):
+        raise HTTPException(status_code=400, detail="Both custom_range_start and custom_range_end are required when using a date range")
+    if body.custom_range_start and body.custom_range_end and body.custom_range_end <= body.custom_range_start:
+        raise HTTPException(status_code=400, detail="custom_range_end must be after custom_range_start")
+    if body.historical_weeks is not None and body.historical_weeks <= 0:
+        raise HTTPException(status_code=400, detail="historical_weeks must be positive")
+    if body.manual_daily_lbs is not None and body.manual_daily_lbs < 0:
+        raise HTTPException(status_code=400, detail="manual_daily_lbs must be non-negative")
+
+
+@router.get("/{period_id}/overrides", response_model=List[schemas.PeriodProjectionOverrideResponse])
+def list_overrides(period_id: int, db: Session = Depends(get_db)):
+    _ensure_period(period_id, db)
+    return (
+        db.query(models.PeriodProjectionOverride)
+        .filter(models.PeriodProjectionOverride.period_id == period_id)
+        .order_by(models.PeriodProjectionOverride.product_type)
+        .all()
+    )
+
+
+@router.post("/{period_id}/overrides", response_model=schemas.PeriodProjectionOverrideResponse)
+def upsert_override(
+    period_id: int,
+    body: schemas.PeriodProjectionOverrideCreate,
+    db: Session = Depends(get_db),
+):
+    """Create or update the override for a given (period, product_type)."""
+    _ensure_period(period_id, db)
+    _validate_override_payload(body)
+
+    existing = (
+        db.query(models.PeriodProjectionOverride)
+        .filter(
+            models.PeriodProjectionOverride.period_id == period_id,
+            models.PeriodProjectionOverride.product_type == body.product_type,
+        )
+        .first()
+    )
+    fields = body.model_dump(exclude={"product_type"})
+    if existing:
+        for k, v in fields.items():
+            setattr(existing, k, v)
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    cfg = models.PeriodProjectionOverride(period_id=period_id, product_type=body.product_type, **fields)
+    db.add(cfg)
+    db.commit()
+    db.refresh(cfg)
+    return cfg
+
+
+@router.delete("/{period_id}/overrides/{product_type:path}")
+def delete_override(period_id: int, product_type: str, db: Session = Depends(get_db)):
+    deleted = (
+        db.query(models.PeriodProjectionOverride)
+        .filter(
+            models.PeriodProjectionOverride.period_id == period_id,
+            models.PeriodProjectionOverride.product_type == product_type,
+        )
+        .delete()
+    )
+    db.commit()
+    return {"deleted": deleted > 0}
 
 
 # ── Google Sheets Tab Integration ────────────────────────────────────────────

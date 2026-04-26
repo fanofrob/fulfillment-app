@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 import models
 import schemas
-from services import shopify_service, sheets_service
+from services import shopify_service, sheets_service, mapping_override
 from routers.inventory import _recompute_committed
 from routers.fulfillment import _zone_for_zip
 from routers.products import _sync_products, apply_short_ship_to_orders, _get_active_rule_tags
@@ -56,6 +56,7 @@ def _build_order_response(
     has_plan: bool = False,
     plan_box_unmatched: bool = False,
     has_plan_mismatch: bool = False,
+    mapping_tab_override: Optional[str] = None,
 ) -> schemas.ShopifyOrderOut:
     line_items = (
         db.query(models.ShopifyLineItem)
@@ -75,10 +76,22 @@ def _build_order_response(
         product_type_map = {r.shopify_sku: r.product_type for r in rows}
 
     line_item_outs = []
-    for li in line_items:
-        li_data = {c.name: getattr(li, c.name) for c in li.__table__.columns}
-        li_data["product_type"] = product_type_map.get(li.shopify_sku)
-        line_item_outs.append(schemas.LineItemOut(**li_data))
+    if mapping_tab_override:
+        # Live preview: re-resolve pick_sku / mix_quantity / sku_mapped against
+        # the override tab without touching the DB. May produce more rows than
+        # the underlying ShopifyLineItem table when a SKU explodes into multiple
+        # components in the new mapping.
+        override_rows = mapping_override.override_response_line_items(
+            line_items, mapping_tab_override
+        )
+        for li_data in override_rows:
+            li_data["product_type"] = product_type_map.get(li_data.get("shopify_sku"))
+            line_item_outs.append(schemas.LineItemOut(**li_data))
+    else:
+        for li in line_items:
+            li_data = {c.name: getattr(li, c.name) for c in li.__table__.columns}
+            li_data["product_type"] = product_type_map.get(li.shopify_sku)
+            line_item_outs.append(schemas.LineItemOut(**li_data))
 
     return schemas.ShopifyOrderOut(
         **{c.name: getattr(order, c.name) for c in order.__table__.columns},
@@ -192,6 +205,7 @@ def list_orders(
     search: Optional[str] = Query(None, description="Search order number, customer name/email"),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=2000),
+    mapping_tab: Optional[str] = Query(None, description="Re-resolve line item pick SKUs against this sheet tab (preview, no DB writes)"),
     db: Session = Depends(get_db),
 ):
     q = db.query(models.ShopifyOrder)
@@ -353,6 +367,7 @@ def list_orders(
             has_plan=o.shopify_order_id in plan_order_ids,
             plan_box_unmatched=o.shopify_order_id in unmatched_order_ids,
             has_plan_mismatch=o.shopify_order_id in mismatch_order_ids,
+            mapping_tab_override=mapping_tab,
         )
         for o in orders
     ]
@@ -638,7 +653,11 @@ def get_batch_margins(ids: str = Query(..., description="Comma-separated shopify
 # ── Get single order ──────────────────────────────────────────────────────────
 
 @router.get("/{shopify_order_id}", response_model=schemas.ShopifyOrderOut)
-def get_order(shopify_order_id: str, db: Session = Depends(get_db)):
+def get_order(
+    shopify_order_id: str,
+    mapping_tab: Optional[str] = Query(None, description="Re-resolve line item pick SKUs against this sheet tab (preview, no DB writes)"),
+    db: Session = Depends(get_db),
+):
     order = db.query(models.ShopifyOrder).filter(
         models.ShopifyOrder.shopify_order_id == shopify_order_id
     ).first()
@@ -663,6 +682,7 @@ def get_order(shopify_order_id: str, db: Session = Depends(get_db)):
         has_plan=has_plan,
         plan_box_unmatched=plan_box_unmatched,
         has_plan_mismatch=has_plan_mismatch,
+        mapping_tab_override=mapping_tab,
     )
 
 
@@ -1444,6 +1464,32 @@ def unstage_plan_issues(db: Session = Depends(get_db)):
     orders_unstaged = _unstage_orders_with_plan_issues(db)
     db.commit()
     return {"orders_unstaged": orders_unstaged}
+
+
+@router.post("/recompute")
+def recompute_orders(
+    body: schemas.RecomputeOrdersRequest = schemas.RecomputeOrdersRequest(),
+    db: Session = Depends(get_db),
+):
+    """
+    Refresh open orders against the current SKU mapping and short-ship/inventory-hold
+    config — without pulling from Shopify.
+
+    Re-resolves pick_skus on every line item, re-applies short-ship/hold, replans
+    orders whose pick_skus changed, and unstages anything with new plan issues or
+    rule violations. Orders already in ShipStation are never touched.
+    """
+    # Invalidate sheet caches so the recompute reads the latest mappings/helpers
+    sheets_service.invalidate("sku_walnut")
+    sheets_service.invalidate("sku_northlake")
+    sheets_service.invalidate("sku_type_data")
+
+    from services.order_recompute import recompute_open_orders
+    return recompute_open_orders(
+        db,
+        order_ids=body.order_ids,
+        auto_replan=body.auto_replan,
+    )
 
 
 @router.post("/unstage-batch")

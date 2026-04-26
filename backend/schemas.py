@@ -475,6 +475,11 @@ class StageBatchRequest(BaseModel):
 class BulkCancelSSBoxesRequest(BaseModel):
     order_ids: List[str]
 
+class RecomputeOrdersRequest(BaseModel):
+    """Optional list of order IDs to scope recompute. Empty/None = all open orders."""
+    order_ids: Optional[List[str]] = None
+    auto_replan: bool = True
+
 
 # ---------------------------------------------------------------------------
 # Archived Orders
@@ -528,10 +533,53 @@ class ProjectionPeriodUpdate(BaseModel):
 
 class ProjectionPeriodResponse(ProjectionPeriodBase):
     id: int
+    confirmed_demand_auto_lbs: Optional[dict] = None
+    confirmed_demand_manual_lbs: Optional[dict] = None
+    has_manual_confirmed_demand: bool = False
+    confirmed_demand_saved_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Projection Period Confirmed Orders (review/override layer)
+# ---------------------------------------------------------------------------
+
+class BoxSnapshotItem(BaseModel):
+    pick_sku: str
+    quantity: float
+    weight_lb: Optional[float] = None
+    product_type: Optional[str] = None
+
+class ConfirmOrdersRequest(BaseModel):
+    order_ids: List[str]
+    mapping_tab: str
+
+class UnconfirmOrdersRequest(BaseModel):
+    order_ids: List[str]
+
+class ProjectionPeriodConfirmedOrderResponse(BaseModel):
+    id: int
+    period_id: int
+    shopify_order_id: str
+    boxes_snapshot: List[BoxSnapshotItem]
+    mapping_used: str
+    confirmed_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+class ConfirmOrdersResult(BaseModel):
+    confirmed: int
+    skipped: int
+    results: List[dict]
+
+class SaveConfirmedDemandResponse(BaseModel):
+    period_id: int
+    confirmed_demand_manual_lbs: dict
+    has_manual_confirmed_demand: bool
+    confirmed_demand_saved_at: Optional[datetime] = None
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +612,32 @@ class ConfigDiffResponse(BaseModel):
     only_in_source: List[str]
     only_in_target: List[str]
     in_both: List[str]
+
+
+# Per-product-type projection overrides
+class PeriodProjectionOverrideBase(BaseModel):
+    product_type: str
+    historical_weeks: Optional[int] = None
+    custom_range_start: Optional[datetime] = None
+    custom_range_end: Optional[datetime] = None
+    manual_daily_lbs: Optional[float] = None
+    apply_demand_multiplier: bool = False
+    apply_promotion_multiplier: bool = True
+    apply_padding: bool = True
+    notes: Optional[str] = None
+
+
+class PeriodProjectionOverrideCreate(PeriodProjectionOverrideBase):
+    pass
+
+
+class PeriodProjectionOverrideResponse(PeriodProjectionOverrideBase):
+    id: int
+    period_id: int
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +727,7 @@ class ProjectionGenerateRequest(BaseModel):
     historical_weeks: Optional[int] = 4
     excluded_promo_ids: Optional[List[int]] = None
     promotion_multiplier: Optional[float] = None
+    demand_multiplier: Optional[float] = None
     warehouse: str = "walnut"
 
 class ProjectionLineResponse(BaseModel):
@@ -676,17 +751,62 @@ class ProjectionLineResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
-# Hourly breakdown for a product type within a projection
-class HourlyBucketResponse(BaseModel):
+# Shop-wide projected orders per hour (one curve, summed across PTs)
+class ShopHourlyBucketResponse(BaseModel):
     hour: datetime
     projected_orders: float = 0.0
-    projected_lbs: float = 0.0
 
-class HourlyBreakdownResponse(BaseModel):
-    product_type: str
+class ShopHourlyBreakdownResponse(BaseModel):
     projection_id: int
     period_name: str
-    hours: List[HourlyBucketResponse] = []
+    hours: List[ShopHourlyBucketResponse] = []
+
+
+# Per-PT daily historical lbs, grouped by week — informs manual_daily_lbs overrides
+class PtDailyHistoryDay(BaseModel):
+    date: str
+    dow: int  # 0=Mon … 6=Sun
+    lbs: float = 0.0
+
+class PtDailyHistoryWeek(BaseModel):
+    week_number: int
+    week_start: datetime
+    week_end: datetime
+    days: List[PtDailyHistoryDay] = []
+    total_lbs: float = 0.0
+    avg_lbs_per_day: float = 0.0
+
+class PtDailyHistoryDowAverage(BaseModel):
+    dow: int
+    avg_lbs: float = 0.0
+    sample_count: int = 0
+
+class PtDailyHistoryResponse(BaseModel):
+    product_type: str
+    projection_id: int
+    historical_range_start: Optional[datetime] = None
+    historical_range_end: Optional[datetime] = None
+    weeks: List[PtDailyHistoryWeek] = []
+    dow_averages: List[PtDailyHistoryDowAverage] = []
+    overall_avg_lbs_per_day: float = 0.0
+
+
+# Historical orders/day summary (weekly breakdown) for a projection
+class HistoricalWeekBucket(BaseModel):
+    week_number: int
+    week_start: datetime
+    week_end: datetime
+    days: int
+    total_orders: int
+    avg_orders_per_day: float
+
+class HistoricalOrdersSummaryResponse(BaseModel):
+    historical_range_start: Optional[datetime] = None
+    historical_range_end: Optional[datetime] = None
+    weekly_breakdown: List[HistoricalWeekBucket] = []
+    overall_avg_orders_per_day: float = 0.0
+    overall_total_orders: int = 0
+    overall_days: int = 0
 
 # Projection comparison (two projections side-by-side by product type)
 class ComparisonLineResponse(BaseModel):

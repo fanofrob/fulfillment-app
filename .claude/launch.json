@@ -11,11 +11,12 @@
     },
     {
       "name": "frontend",
-      "runtimeExecutable": "/usr/local/bin/node",
+      "runtimeExecutable": "/opt/homebrew/bin/node",
       "runtimeArgs": ["node_modules/.bin/vite", "--port", "5173"],
       "cwd": "/Users/robertfan/Claude Code/fulfillment-app/frontend",
       "port": 5173,
-      "autoPort": false
+      "autoPort": false,
+      "openUrl": "http://localhost:5173"
     }
   ]
 }

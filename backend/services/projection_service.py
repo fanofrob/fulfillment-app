@@ -3,9 +3,11 @@ Projection engine — generates demand forecasts per projection period.
 
 Primary entrypoint: generate_projection(db, period_id, params)
 """
+from __future__ import annotations
+
 import math
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 import models
@@ -18,6 +20,7 @@ def generate_projection(
     historical_weeks: int = 4,
     excluded_promo_ids: list[int] | None = None,
     promotion_multiplier: float | None = None,
+    demand_multiplier: float | None = None,
     warehouse: str = "walnut",
 ) -> models.Projection:
     """
@@ -59,6 +62,9 @@ def generate_projection(
         pc.product_type: pc.padding_pct for pc in
         db.query(models.ProjectionPaddingConfig).all()
     }
+    # Per-product-type overrides (Phase 2). Affects the padding toggle below
+    # and is reloaded inside _calc_projected_demand for window/manual-rate handling.
+    overrides = _load_overrides(db, period_id)
 
     # ── Step 4: Confirmed demand ─────────────────────────────────────────────
     confirmed_demand, confirmed_orders, unmapped_skus_confirmed = _calc_confirmed_demand(
@@ -71,11 +77,11 @@ def generate_projection(
     projected_demand, projected_orders, unmapped_skus_projected, hist_rows_used = _calc_projected_demand(
         db, period, sku_lookup, weight_map, now,
         hist_range_start, hist_range_end,
-        excluded_promo_ids, promotion_multiplier,
+        excluded_promo_ids, promotion_multiplier, demand_multiplier,
     )
 
     # ── Step 6: On-hand inventory ────────────────────────────────────────────
-    on_hand = _calc_on_hand(db, weight_map, warehouse)
+    on_hand = _calc_on_hand(db, weight_map, sku_lookup, warehouse)
 
     # ── Step 7: Expected on-hand (Period 2+) ─────────────────────────────────
     expected_on_hand = _calc_expected_on_hand(db, period)
@@ -99,7 +105,15 @@ def generate_projection(
         proj_orders = projected_orders.get(pt, 0.0)
         total_lbs = conf_lbs + proj_lbs
         padding_pct = padding_configs.get(pt, 0.0)
-        padded_lbs = total_lbs * (1 + padding_pct / 100.0)
+        # Manual-rate overrides can opt out of padding. All other cases pad as normal.
+        override = overrides.get(pt)
+        skip_padding = (
+            override is not None
+            and override.manual_daily_lbs is not None
+            and not override.apply_padding
+        )
+        effective_padding_pct = 0.0 if skip_padding else padding_pct
+        padded_lbs = total_lbs * (1 + effective_padding_pct / 100.0)
         oh_lbs = on_hand.get(pt, 0.0)
         eoh_lbs = expected_on_hand.get(pt, 0.0)
         on_order = on_order_map.get(pt, 0.0)
@@ -126,7 +140,7 @@ def generate_projection(
             "projected_order_count": round(proj_orders, 2),
             "projected_demand_lbs": round(proj_lbs, 2),
             "total_demand_lbs": round(total_lbs, 2),
-            "padding_pct": padding_pct,
+            "padding_pct": effective_padding_pct,
             "padded_demand_lbs": round(padded_lbs, 2),
             "on_hand_lbs": round(oh_lbs, 2),
             "expected_on_hand_lbs": round(eoh_lbs, 2),
@@ -165,6 +179,7 @@ def generate_projection(
         sku_mapping_source=period.sku_mapping_sheet_tab or f"default ({warehouse})",
         unmapped_skus=all_unmapped,
         period=period,
+        overrides=list(overrides.values()),
     )
 
     # Shopify data freshness: latest pulled_at from orders
@@ -190,6 +205,7 @@ def generate_projection(
             "historical_weeks": historical_weeks,
             "excluded_promo_ids": excluded_promo_ids,
             "promotion_multiplier": promotion_multiplier,
+            "demand_multiplier": demand_multiplier,
             "warehouse": warehouse,
         },
         methodology_report=methodology,
@@ -205,6 +221,13 @@ def generate_projection(
         line = models.ProjectionLine(projection_id=projection.id, **ld)
         db.add(line)
 
+    # Write auto confirmed demand onto the period for the review/override layer.
+    # Manual override (if set via Projections Orders UI) is consulted separately
+    # at dashboard time; writing auto here keeps the two sources cleanly split.
+    period.confirmed_demand_auto_lbs = {
+        pt: round(lbs, 2) for pt, lbs in confirmed_demand.items()
+    }
+
     db.commit()
     db.refresh(projection)
     return projection
@@ -217,27 +240,30 @@ def _build_sku_mapping_lookup(
 ) -> dict:
     """
     Build {shopify_sku: [{"pick_sku", "mix_quantity", "product_type"}, ...]} lookup.
+    product_type is the PICK SKU's type (PicklistSku.type), not the Shopify product
+    type — so a Mix Box explodes into its component product types rather than
+    rolling up under one bundled row.
     Uses period-specific Sheets tab if available, otherwise falls back to warehouse default.
     """
+    # Pick-level product type source of truth: PicklistSku.type keyed by pick_sku.
+    pick_type_map = {}
+    for ps in db.query(models.PicklistSku).all():
+        if ps.pick_sku and ps.type:
+            pick_type_map[ps.pick_sku] = ps.type
+
     if period.sku_mapping_sheet_tab:
         try:
             lookup = sheets_service.get_period_sku_mapping_lookup(period.sku_mapping_sheet_tab)
             if lookup:
+                for entries in lookup.values():
+                    for e in entries:
+                        e["product_type"] = pick_type_map.get(e.get("pick_sku"))
                 return lookup
         except Exception as e:
             print(f"[WARN] Failed to load period SKU mapping tab '{period.sku_mapping_sheet_tab}': {e}")
 
-    # Fallback: use default warehouse mapping + enrich with product_type from DB
+    # Fallback: use default warehouse mapping, tag each entry with its pick-level type.
     base_lookup = sheets_service.get_sku_mapping_lookup(warehouse)
-    # The base lookup doesn't include product_type, so enrich from SkuMapping table
-    pt_map = sheets_service.CaseInsensitiveSkuDict()
-    db_mappings = db.query(models.SkuMapping).filter(
-        models.SkuMapping.warehouse == warehouse
-    ).all()
-    for m in db_mappings:
-        if m.shopify_sku and m.product_type:
-            pt_map[m.shopify_sku] = m.product_type
-
     enriched = sheets_service.CaseInsensitiveSkuDict()
     for sku, entries in base_lookup.items():
         enriched[sku] = []
@@ -245,7 +271,7 @@ def _build_sku_mapping_lookup(
             enriched[sku].append({
                 "pick_sku": e["pick_sku"],
                 "mix_quantity": e.get("mix_quantity") or 1.0,
-                "product_type": pt_map.get(sku),
+                "product_type": pick_type_map.get(e.get("pick_sku")),
             })
     return enriched
 
@@ -364,6 +390,247 @@ def _calc_confirmed_demand(
     return dict(demand), order_count_result, sorted(all_unmapped)
 
 
+def _build_remaining_slots(now: datetime, period: models.ProjectionPeriod) -> list[tuple[int, int]]:
+    """List of (weekday, hour) for each remaining hour in the period."""
+    if now >= period.end_datetime:
+        return []
+    effective_start = max(now, period.start_datetime)
+    remaining_slots = []
+    cursor = effective_start.replace(minute=0, second=0, microsecond=0)
+    if cursor < effective_start:
+        cursor += timedelta(hours=1)
+    while cursor < period.end_datetime:
+        remaining_slots.append((cursor.weekday(), cursor.hour))
+        cursor += timedelta(hours=1)
+    return remaining_slots
+
+
+def _load_overrides(db: Session, period_id: int) -> dict[str, models.PeriodProjectionOverride]:
+    return {
+        o.product_type: o for o in
+        db.query(models.PeriodProjectionOverride).filter(
+            models.PeriodProjectionOverride.period_id == period_id
+        ).all()
+    }
+
+
+def _build_pt_contribs(sku_lookup: dict) -> dict[str, list[tuple[str, float, str]]]:
+    """Invert sku_lookup into product_type → [(shopify_sku, mix_quantity, pick_sku), ...]."""
+    result: dict[str, list[tuple[str, float, str]]] = defaultdict(list)
+    for shopify_sku, entries in sku_lookup.items():
+        for e in entries:
+            pt = e.get("product_type")
+            ps = e.get("pick_sku")
+            if pt and ps:
+                result[pt].append((shopify_sku, float(e.get("mix_quantity") or 1.0), ps))
+    return result
+
+
+def _resolve_override_window(
+    override: models.PeriodProjectionOverride | None,
+    global_start: datetime,
+    global_end: datetime,
+) -> tuple[datetime, datetime]:
+    """Return (hist_start, hist_end) after applying override's range controls."""
+    if override:
+        if override.custom_range_start and override.custom_range_end:
+            return override.custom_range_start, override.custom_range_end
+        if override.historical_weeks:
+            return global_end - timedelta(weeks=override.historical_weeks), global_end
+    return global_start, global_end
+
+
+def _project_pt_from_history(
+    db: Session,
+    pt: str,
+    contribs: list[tuple[str, float, str]],
+    weight_map: dict,
+    slot_counts: dict,
+    pt_hist_start: datetime,
+    pt_hist_end: datetime,
+    promo_ranges: list[dict],
+    promotion_multiplier: float | None,
+    demand_multiplier: float | None,
+    store_curve: dict[tuple[int, int], dict[str, float]],
+) -> tuple[float, float, int]:
+    """
+    Project one product_type using the store-wide hourly curve.
+
+    The PT's own history sets the *volume* (weekly lbs/orders); the store-wide
+    curve sets the *shape* (which (dow, hour) slots get more or less). This
+    avoids the sparse-data problem where individual product types have too
+    few sales to establish their own hourly pattern reliably.
+
+    Returns (lbs, orders, rows_used).
+    """
+    weekly_lbs, weekly_orders, rows_used = _compute_pt_weekly_demand(
+        db, contribs, weight_map, pt_hist_start, pt_hist_end,
+        promo_ranges, promotion_multiplier, demand_multiplier,
+    )
+
+    if weekly_lbs <= 0 and weekly_orders <= 0:
+        return 0.0, 0.0, rows_used
+
+    total_lbs = 0.0
+    total_orders = 0.0
+    for (dow, hour), count in slot_counts.items():
+        share = store_curve.get((dow, hour))
+        if not share:
+            continue
+        total_lbs += weekly_lbs * share["lbs_share"] * count
+        total_orders += weekly_orders * share["orders_share"] * count
+
+    return total_lbs, total_orders, rows_used
+
+
+def _manual_weekly_lbs(
+    override: models.PeriodProjectionOverride,
+    promotion_multiplier: float | None,
+    demand_multiplier: float | None,
+) -> float:
+    """Convert manual_daily_lbs (×7) into a weekly figure that the store curve
+    distributes across the projection window."""
+    lbs = max(override.manual_daily_lbs or 0.0, 0.0) * 7.0
+    if promotion_multiplier is not None and override.apply_promotion_multiplier:
+        lbs *= promotion_multiplier
+    if demand_multiplier is not None and override.apply_demand_multiplier:
+        lbs *= demand_multiplier
+    return lbs
+
+
+def _compute_pt_weekly_demand(
+    db: Session,
+    contribs: list[tuple[str, float, str]],
+    weight_map: dict,
+    pt_hist_start: datetime,
+    pt_hist_end: datetime,
+    promo_ranges: list[dict],
+    promotion_multiplier: float | None,
+    demand_multiplier: float | None,
+) -> tuple[float, float, int]:
+    """
+    Aggregate one product type's history into average weekly demand.
+
+    Returns (weekly_lbs, weekly_orders, rows_used). Promo rows are excluded
+    per the existing per-(hour, SKU) rule. Caller distributes the weekly
+    figure across the projection window via the store-wide hourly curve.
+    """
+    skus_for_pt = list({sku for sku, _mq, _ps in contribs})
+    if not skus_for_pt:
+        return 0.0, 0.0, 0
+
+    rows = db.query(models.HistoricalSales).filter(
+        models.HistoricalSales.shopify_sku.in_(skus_for_pt),
+        models.HistoricalSales.hour_bucket >= pt_hist_start,
+        models.HistoricalSales.hour_bucket <= pt_hist_end,
+    ).all()
+
+    by_sku: dict[str, list[tuple[float, str]]] = defaultdict(list)
+    for sku, mq, ps in contribs:
+        by_sku[sku].append((mq, ps))
+
+    days_in_range = max((pt_hist_end - pt_hist_start).total_seconds() / 86400, 1.0)
+    pt_total_lbs = 0.0
+    pt_total_orders = 0.0
+    rows_used = 0
+    for hs in rows:
+        if _is_promotional_hour(hs.hour_bucket, hs.shopify_sku, promo_ranges):
+            continue
+        for mq, pick_sku in by_sku.get(hs.shopify_sku, []):
+            weight = weight_map.get(pick_sku, 0.0)
+            pt_total_lbs += hs.quantity_sold * mq * weight
+        pt_total_orders += hs.order_count
+        rows_used += 1
+
+    weekly_lbs = (pt_total_lbs / days_in_range) * 7.0
+    weekly_orders = (pt_total_orders / days_in_range) * 7.0
+
+    if promotion_multiplier is not None:
+        weekly_lbs *= promotion_multiplier
+        weekly_orders *= promotion_multiplier
+    if demand_multiplier is not None:
+        weekly_lbs *= demand_multiplier
+        weekly_orders *= demand_multiplier
+
+    return weekly_lbs, weekly_orders, rows_used
+
+
+def _build_store_hourly_curve(
+    db: Session,
+    hist_start: datetime,
+    hist_end: datetime,
+    promo_ranges: list[dict],
+    sku_lookup: dict,
+    weight_map: dict,
+) -> dict[tuple[int, int], dict[str, float]]:
+    """
+    Aggregate store-wide HistoricalSales into a (dow, hour) → share table.
+
+    Policy A: if any tracked-promo SKU was active during a given hour bucket,
+    drop the entire hour from the aggregate (rather than just that SKU's row).
+    This trades some data density for a cleaner non-promo baseline — promos
+    often coincide with naturally-busy hours, and partial exclusion would
+    leak halo-effect demand into the curve.
+
+    Returns {(dow, hour): {"lbs_share": float, "orders_share": float}} where
+    each share table sums to 1.0 across all 168 (dow, hour) slots that had
+    activity. Caller multiplies by weekly demand to project per-slot volume.
+
+    If history has no usable data, returns a uniform 1/168 fallback so the
+    projection still produces non-zero output.
+    """
+    rows = db.query(models.HistoricalSales).filter(
+        models.HistoricalSales.hour_bucket >= hist_start,
+        models.HistoricalSales.hour_bucket <= hist_end,
+    ).all()
+
+    polluted_hours: set[datetime] = set()
+    for hs in rows:
+        if _is_promotional_hour(hs.hour_bucket, hs.shopify_sku, promo_ranges):
+            polluted_hours.add(hs.hour_bucket)
+
+    lbs_by_slot: dict[tuple[int, int], float] = defaultdict(float)
+    orders_by_slot: dict[tuple[int, int], float] = defaultdict(float)
+    total_lbs = 0.0
+    total_orders = 0.0
+
+    for hs in rows:
+        if hs.hour_bucket in polluted_hours:
+            continue
+        slot = (hs.hour_bucket.weekday(), hs.hour_bucket.hour)
+        # Convert qty → lbs across all PTs this SKU maps to (covers duplicate
+        # sheet rows that split a Shopify SKU into multiple pick SKUs).
+        row_lbs = 0.0
+        for entry in sku_lookup.get(hs.shopify_sku, []):
+            pick_sku = entry.get("pick_sku")
+            mix_qty = entry.get("mix_quantity") or 1.0
+            if not pick_sku:
+                continue
+            weight = weight_map.get(pick_sku, 0.0)
+            row_lbs += hs.quantity_sold * mix_qty * weight
+        lbs_by_slot[slot] += row_lbs
+        total_lbs += row_lbs
+        orders_by_slot[slot] += hs.order_count
+        total_orders += hs.order_count
+
+    if total_lbs <= 0 and total_orders <= 0:
+        # Empty history (or fully polluted) — fall back to uniform so callers
+        # still produce a non-zero projection rather than collapsing to 0.
+        uniform = 1.0 / 168.0
+        return {
+            (d, h): {"lbs_share": uniform, "orders_share": uniform}
+            for d in range(7) for h in range(24)
+        }
+
+    curve: dict[tuple[int, int], dict[str, float]] = {}
+    for slot in set(lbs_by_slot.keys()) | set(orders_by_slot.keys()):
+        curve[slot] = {
+            "lbs_share": (lbs_by_slot[slot] / total_lbs) if total_lbs > 0 else 0.0,
+            "orders_share": (orders_by_slot[slot] / total_orders) if total_orders > 0 else 0.0,
+        }
+    return curve
+
+
 def _calc_projected_demand(
     db: Session,
     period: models.ProjectionPeriod,
@@ -374,98 +641,72 @@ def _calc_projected_demand(
     hist_range_end: datetime,
     excluded_promo_ids: list[int],
     promotion_multiplier: float | None,
+    demand_multiplier: float | None = None,
 ) -> tuple[dict[str, float], dict[str, float], list[str], int]:
     """
-    Calculate projected demand from historical hourly sales patterns.
+    Calculate projected demand, per product_type, respecting any per-period overrides.
     Returns (demand_lbs_by_pt, order_count_by_pt, unmapped_skus, hist_rows_used).
     """
-    demand = defaultdict(float)
-    order_counts = defaultdict(float)
-    all_unmapped = set()
+    demand: dict[str, float] = {}
+    order_counts: dict[str, float] = {}
 
-    # Determine remaining hours in the period
-    if now >= period.end_datetime:
-        return dict(demand), dict(order_counts), [], 0
-    effective_start = max(now, period.start_datetime)
-
-    # Build set of remaining (day_of_week, hour) slots
-    remaining_slots = []
-    cursor = effective_start.replace(minute=0, second=0, microsecond=0)
-    if cursor < effective_start:
-        cursor += timedelta(hours=1)
-    while cursor < period.end_datetime:
-        remaining_slots.append((cursor.weekday(), cursor.hour))
-        cursor += timedelta(hours=1)
-
+    remaining_slots = _build_remaining_slots(now, period)
     if not remaining_slots:
-        return dict(demand), dict(order_counts), [], 0
+        return {}, {}, [], 0
 
-    # Count occurrences of each (dow, hour) slot to know how many hours to project
     slot_counts = defaultdict(int)
-    for dow, hour in remaining_slots:
-        slot_counts[(dow, hour)] += 1
+    for s in remaining_slots:
+        slot_counts[s] += 1
 
-    # Load historical sales in the date range
-    hist_sales = db.query(models.HistoricalSales).filter(
-        models.HistoricalSales.hour_bucket >= hist_range_start,
-        models.HistoricalSales.hour_bucket <= hist_range_end,
-    ).all()
+    overrides = _load_overrides(db, period.id)
+    pt_contribs = _build_pt_contribs(sku_lookup)
 
-    # Load promotions to exclude
-    promo_ranges = _load_promo_ranges(db, hist_range_start, hist_range_end, excluded_promo_ids)
+    # Promo ranges span the widest possible window (global + any override custom range).
+    # Overrides rarely extend beyond the global range, but include them to be safe.
+    window_start = hist_range_start
+    window_end = hist_range_end
+    for o in overrides.values():
+        if o.custom_range_start and o.custom_range_start < window_start:
+            window_start = o.custom_range_start
+        if o.custom_range_end and o.custom_range_end > window_end:
+            window_end = o.custom_range_end
+    promo_ranges = _load_promo_ranges(db, window_start, window_end, excluded_promo_ids)
 
-    # Group historical sales by (dow, hour, shopify_sku), excluding promotional hours
-    # hist_agg: {(dow, hour, sku): [qty_sold_values]}
-    hist_agg = defaultdict(list)
-    hist_order_agg = defaultdict(list)
-    rows_used = 0
+    # Build the store-wide hourly distribution once — every PT (and the manual-
+    # override path) shares the same shape.
+    store_curve = _build_store_hourly_curve(
+        db, hist_range_start, hist_range_end, promo_ranges, sku_lookup, weight_map,
+    )
+    slot_share_total = sum(
+        store_curve.get((dow, hour), {}).get("lbs_share", 0.0) * count
+        for (dow, hour), count in slot_counts.items()
+    )
 
-    for hs in hist_sales:
-        bucket = hs.hour_bucket
-        dow = bucket.weekday()
-        hour = bucket.hour
+    total_rows_used = 0
+    for pt, contribs in pt_contribs.items():
+        override = overrides.get(pt)
 
-        # Only include slots we need
-        if (dow, hour) not in slot_counts:
+        if override and override.manual_daily_lbs is not None:
+            weekly_lbs = _manual_weekly_lbs(override, promotion_multiplier, demand_multiplier)
+            demand[pt] = weekly_lbs * slot_share_total
+            order_counts[pt] = 0.0
             continue
 
-        # Check if this hour is in a promotional period
-        if _is_promotional_hour(bucket, hs.shopify_sku, promo_ranges):
-            continue
+        pt_start, pt_end = _resolve_override_window(override, hist_range_start, hist_range_end)
+        lbs, orders, rows = _project_pt_from_history(
+            db, pt, contribs, weight_map, slot_counts,
+            pt_start, pt_end, promo_ranges,
+            promotion_multiplier, demand_multiplier,
+            store_curve,
+        )
+        if lbs > 0 or orders > 0:
+            demand[pt] = lbs
+            order_counts[pt] = orders
+        total_rows_used += rows
 
-        key = (dow, hour, hs.shopify_sku)
-        hist_agg[key].append(hs.quantity_sold)
-        hist_order_agg[key].append(hs.order_count)
-        rows_used += 1
-
-    # For each remaining (dow, hour) slot, project demand using historical averages
-    for (dow, hour), count in slot_counts.items():
-        # Find all SKUs that had sales in this (dow, hour) historically
-        matching_keys = [k for k in hist_agg if k[0] == dow and k[1] == hour]
-
-        for key in matching_keys:
-            sku = key[2]
-            avg_qty = sum(hist_agg[key]) / len(hist_agg[key])
-            avg_orders = sum(hist_order_agg[key]) / len(hist_order_agg[key])
-
-            # Multiply by count (number of times this slot appears in remaining period)
-            projected_qty = avg_qty * count
-            projected_order = avg_orders * count
-
-            # Apply promotion multiplier
-            if promotion_multiplier is not None:
-                projected_qty *= promotion_multiplier
-                projected_order *= promotion_multiplier
-
-            # Resolve SKU → product type
-            li_demand, unmapped = _resolve_line_item(sku, 1, sku_lookup, weight_map)
-            all_unmapped.update(unmapped)
-
-            for pt, lbs_per_unit in li_demand.items():
-                demand[pt] += lbs_per_unit * projected_qty
-                order_counts[pt] += projected_order
-
-    return dict(demand), dict(order_counts), sorted(all_unmapped), rows_used
+    # Unmapped SKUs are tracked by the confirmed-demand pass; projected pass iterates
+    # only mapped SKUs (contribs), so it has no unmapped to report.
+    return demand, order_counts, [], total_rows_used
 
 
 def _load_promo_ranges(
@@ -502,18 +743,22 @@ def _is_promotional_hour(bucket: datetime, shopify_sku: str, promo_ranges: list[
     return False
 
 
-def _calc_on_hand(db: Session, weight_map: dict, warehouse: str) -> dict[str, float]:
+def _calc_on_hand(
+    db: Session, weight_map: dict, sku_lookup: dict, warehouse: str
+) -> dict[str, float]:
     """
     Calculate on-hand inventory in lbs aggregated to product type level.
-    Uses InventoryItem.on_hand_qty × PicklistSku.weight_lb, resolved via SkuMapping.product_type.
+    Uses InventoryItem.on_hand_qty × PicklistSku.weight_lb.
+    pick_sku → product_type is derived from sku_lookup so all demand / supply
+    calculations share one source of truth (PicklistSku.type, pick-level).
     """
     on_hand = defaultdict(float)
 
-    # Build pick_sku → product_type from SkuMapping DB table
     pick_to_pt = {}
-    for m in db.query(models.SkuMapping).filter(models.SkuMapping.warehouse == warehouse).all():
-        if m.pick_sku and m.product_type:
-            pick_to_pt[m.pick_sku] = m.product_type
+    for entries in sku_lookup.values():
+        for e in entries:
+            if e.get("pick_sku") and e.get("product_type"):
+                pick_to_pt[e["pick_sku"]] = e["product_type"]
 
     items = db.query(models.InventoryItem).filter(
         models.InventoryItem.warehouse == warehouse
@@ -609,6 +854,7 @@ def _build_methodology_report(
     sku_mapping_source: str,
     unmapped_skus: list[str],
     period: models.ProjectionPeriod,
+    overrides: list[models.PeriodProjectionOverride] | None = None,
 ) -> str:
     """Auto-generate a human-readable methodology report."""
     lines = [
@@ -637,17 +883,37 @@ def _build_methodology_report(
         if len(unmapped_skus) > 20:
             lines.append(f"  ... and {len(unmapped_skus) - 20} more.")
 
+    if overrides:
+        lines.append("")
+        lines.append("── Per-Product-Type Overrides ──")
+        for o in sorted(overrides, key=lambda x: x.product_type):
+            if o.manual_daily_lbs is not None:
+                toggles = []
+                if o.apply_demand_multiplier: toggles.append("demand")
+                if o.apply_promotion_multiplier: toggles.append("promo")
+                if o.apply_padding: toggles.append("padding")
+                tgl = f" [multipliers: {', '.join(toggles) or 'none'}]" if toggles else " [no multipliers]"
+                lines.append(f"  {o.product_type}: manual {o.manual_daily_lbs} lbs/day{tgl}")
+            elif o.custom_range_start and o.custom_range_end:
+                lines.append(
+                    f"  {o.product_type}: custom range "
+                    f"{o.custom_range_start.strftime('%Y-%m-%d')} → {o.custom_range_end.strftime('%Y-%m-%d')}"
+                )
+            elif o.historical_weeks:
+                lines.append(f"  {o.product_type}: {o.historical_weeks}-week window")
+
     return "\n".join(lines)
 
 
-# ── Hourly breakdown ────────────────────────────────────────────────────────
+# ── Hourly breakdown (shop-wide) ────────────────────────────────────────────
 
-def get_hourly_breakdown(
-    db: Session, projection_id: int, product_type: str
-) -> list[dict]:
+def get_shop_hourly_breakdown(db: Session, projection_id: int) -> dict:
     """
-    Return per-hour projected demand for a single product type,
-    using the same parameters as the original projection.
+    Per-hour projected order count, summed across every product type.
+
+    The store-wide hourly curve is identical for every PT, so a per-PT chart
+    is redundant — this aggregate is the only chart the dashboard needs.
+    Manual-lbs overrides have no order projection and are skipped.
     """
     projection = db.query(models.Projection).filter(
         models.Projection.id == projection_id
@@ -666,18 +932,17 @@ def get_hourly_breakdown(
     historical_weeks = params.get("historical_weeks", 4)
     excluded_promo_ids = params.get("excluded_promo_ids") or []
     promotion_multiplier = params.get("promotion_multiplier")
+    demand_multiplier = params.get("demand_multiplier")
 
     sku_lookup = _build_sku_mapping_lookup(db, period, warehouse)
     weight_map = _build_weight_map(db)
 
-    # Determine the time window (use projection generated_at as "now")
     now = projection.generated_at or datetime.utcnow()
     if now >= period.end_datetime:
-        return []
+        return {"projection_id": projection_id, "period_name": period.name, "hours": []}
     effective_start = max(now, period.start_datetime)
 
-    # Build remaining hour slots as actual datetimes
-    remaining_hours = []
+    remaining_hours: list[datetime] = []
     cursor = effective_start.replace(minute=0, second=0, microsecond=0)
     if cursor < effective_start:
         cursor += timedelta(hours=1)
@@ -686,62 +951,238 @@ def get_hourly_breakdown(
         cursor += timedelta(hours=1)
 
     if not remaining_hours:
-        return []
+        return {"projection_id": projection_id, "period_name": period.name, "hours": []}
 
-    # Historical range
     hist_range_end = period.start_datetime
-    hist_range_start = hist_range_end - timedelta(weeks=historical_weeks)
-
-    hist_sales = db.query(models.HistoricalSales).filter(
-        models.HistoricalSales.hour_bucket >= hist_range_start,
-        models.HistoricalSales.hour_bucket <= hist_range_end,
-    ).all()
-
+    hist_range_start = hist_range_end - timedelta(weeks=max(historical_weeks, 1))
     promo_ranges = _load_promo_ranges(db, hist_range_start, hist_range_end, excluded_promo_ids)
+    store_curve = _build_store_hourly_curve(
+        db, hist_range_start, hist_range_end, promo_ranges, sku_lookup, weight_map,
+    )
 
-    # Aggregate historical by (dow, hour, sku)
-    hist_agg = defaultdict(list)
-    hist_order_agg = defaultdict(list)
+    overrides = _load_overrides(db, period.id)
+    pt_contribs = _build_pt_contribs(sku_lookup)
 
-    for hs in hist_sales:
-        bucket = hs.hour_bucket
-        if _is_promotional_hour(bucket, hs.shopify_sku, promo_ranges):
+    total_weekly_orders = 0.0
+    for pt, contribs in pt_contribs.items():
+        override = overrides.get(pt)
+        if override and override.manual_daily_lbs is not None:
             continue
-        key = (bucket.weekday(), bucket.hour, hs.shopify_sku)
-        hist_agg[key].append(hs.quantity_sold)
-        hist_order_agg[key].append(hs.order_count)
+        pt_start, pt_end = _resolve_override_window(override, hist_range_start, hist_range_end)
+        _lbs, weekly_orders, _ = _compute_pt_weekly_demand(
+            db, contribs, weight_map, pt_start, pt_end,
+            promo_ranges, promotion_multiplier, demand_multiplier,
+        )
+        total_weekly_orders += weekly_orders
 
-    # For each remaining hour, compute projected demand for the target product type
-    result = []
+    hours_out = []
     for hour_dt in remaining_hours:
-        dow = hour_dt.weekday()
-        hr = hour_dt.hour
-        hour_lbs = 0.0
-        hour_orders = 0.0
-
-        matching_keys = [k for k in hist_agg if k[0] == dow and k[1] == hr]
-        for key in matching_keys:
-            sku = key[2]
-            avg_qty = sum(hist_agg[key]) / len(hist_agg[key])
-            avg_orders = sum(hist_order_agg[key]) / len(hist_order_agg[key])
-
-            if promotion_multiplier is not None:
-                avg_qty *= promotion_multiplier
-                avg_orders *= promotion_multiplier
-
-            li_demand, _ = _resolve_line_item(sku, 1, sku_lookup, weight_map)
-            for pt, lbs_per_unit in li_demand.items():
-                if pt == product_type:
-                    hour_lbs += lbs_per_unit * avg_qty
-                    hour_orders += avg_orders
-
-        result.append({
+        share = store_curve.get((hour_dt.weekday(), hour_dt.hour), {})
+        hours_out.append({
             "hour": hour_dt,
-            "projected_orders": round(hour_orders, 2),
-            "projected_lbs": round(hour_lbs, 2),
+            "projected_orders": round(total_weekly_orders * share.get("orders_share", 0.0), 2),
         })
 
-    return result
+    return {
+        "projection_id": projection_id,
+        "period_name": period.name,
+        "hours": hours_out,
+    }
+
+
+def get_pt_daily_history(
+    db: Session, projection_id: int, product_type: str
+) -> dict:
+    """
+    Per-day historical lbs for one product type, grouped into 7-day weeks
+    (week 1 = oldest). Powers the manual-override sizing panel: the user
+    sees raw lbs/day plus a per-week average to pick a manual_daily_lbs.
+    """
+    projection = db.query(models.Projection).filter(
+        models.Projection.id == projection_id
+    ).first()
+    if not projection:
+        raise ValueError(f"Projection {projection_id} not found")
+
+    period = db.query(models.ProjectionPeriod).filter(
+        models.ProjectionPeriod.id == projection.period_id
+    ).first()
+    if not period:
+        raise ValueError("Period not found")
+
+    start = projection.historical_range_start
+    end = projection.historical_range_end
+    if not start or not end or end <= start:
+        return {
+            "product_type": product_type,
+            "projection_id": projection_id,
+            "historical_range_start": start,
+            "historical_range_end": end,
+            "weeks": [],
+            "dow_averages": [],
+            "overall_avg_lbs_per_day": 0.0,
+        }
+
+    params = projection.parameters or {}
+    warehouse = params.get("warehouse", "walnut")
+    sku_lookup = _build_sku_mapping_lookup(db, period, warehouse)
+    weight_map = _build_weight_map(db)
+    pt_contribs = _build_pt_contribs(sku_lookup)
+    contribs = pt_contribs.get(product_type, [])
+
+    daily_lbs: dict[date, float] = defaultdict(float)
+    if contribs:
+        skus_for_pt = list({sku for sku, _mq, _ps in contribs})
+        rows = db.query(models.HistoricalSales).filter(
+            models.HistoricalSales.shopify_sku.in_(skus_for_pt),
+            models.HistoricalSales.hour_bucket >= start,
+            models.HistoricalSales.hour_bucket <= end,
+        ).all()
+
+        by_sku: dict[str, list[tuple[float, str]]] = defaultdict(list)
+        for sku, mq, ps in contribs:
+            by_sku[sku].append((mq, ps))
+
+        for hs in rows:
+            day = hs.hour_bucket.date()
+            for mq, pick_sku in by_sku.get(hs.shopify_sku, []):
+                weight = weight_map.get(pick_sku, 0.0)
+                daily_lbs[day] += hs.quantity_sold * mq * weight
+
+    weeks: list[dict] = []
+    dow_totals: dict[int, float] = defaultdict(float)
+    dow_counts: dict[int, int] = defaultdict(int)
+    overall_total = 0.0
+    overall_days = 0
+
+    cursor = start
+    week_num = 1
+    while cursor < end:
+        w_end = min(cursor + timedelta(days=7), end)
+        days_out: list[dict] = []
+        d = cursor.date()
+        end_d = w_end.date()
+        week_total = 0.0
+        while d < end_d:
+            lbs = daily_lbs.get(d, 0.0)
+            days_out.append({
+                "date": d.isoformat(),
+                "dow": d.weekday(),
+                "lbs": round(lbs, 2),
+            })
+            week_total += lbs
+            dow_totals[d.weekday()] += lbs
+            dow_counts[d.weekday()] += 1
+            d += timedelta(days=1)
+        avg = (week_total / len(days_out)) if days_out else 0.0
+        weeks.append({
+            "week_number": week_num,
+            "week_start": cursor,
+            "week_end": w_end,
+            "days": days_out,
+            "total_lbs": round(week_total, 2),
+            "avg_lbs_per_day": round(avg, 2),
+        })
+        overall_total += week_total
+        overall_days += len(days_out)
+        cursor = w_end
+        week_num += 1
+
+    dow_averages = [
+        {
+            "dow": d,
+            "avg_lbs": round((dow_totals[d] / dow_counts[d]) if dow_counts[d] > 0 else 0.0, 2),
+            "sample_count": dow_counts[d],
+        }
+        for d in range(7)
+    ]
+    overall_avg = (overall_total / overall_days) if overall_days > 0 else 0.0
+
+    return {
+        "product_type": product_type,
+        "projection_id": projection_id,
+        "historical_range_start": start,
+        "historical_range_end": end,
+        "weeks": weeks,
+        "dow_averages": dow_averages,
+        "overall_avg_lbs_per_day": round(overall_avg, 2),
+    }
+
+
+def get_historical_orders_summary(db: Session, projection_id: int) -> dict:
+    """
+    Summarize historical distinct-orders-per-day for a projection's historical window.
+    Breaks the window into 7-day buckets (week 1 = oldest), counts distinct
+    ShopifyOrder.shopify_order_id per day, and returns weekly + overall averages.
+    """
+    projection = db.query(models.Projection).filter(
+        models.Projection.id == projection_id
+    ).first()
+    if not projection:
+        raise ValueError(f"Projection {projection_id} not found")
+
+    start = projection.historical_range_start
+    end = projection.historical_range_end
+    if not start or not end or end <= start:
+        return {
+            "historical_range_start": start,
+            "historical_range_end": end,
+            "weekly_breakdown": [],
+            "overall_avg_orders_per_day": 0.0,
+            "overall_total_orders": 0,
+            "overall_days": 0,
+        }
+
+    # historical_daily_orders stores one row per calendar day with the distinct
+    # order count pulled directly from Shopify at ingestion time (includes
+    # fulfilled orders, unlike shopify_orders which only keeps unshipped).
+    day_rows = db.query(
+        models.HistoricalDailyOrders.day,
+        models.HistoricalDailyOrders.order_count,
+    ).filter(
+        models.HistoricalDailyOrders.day >= start.date(),
+        models.HistoricalDailyOrders.day <= end.date(),
+    ).all()
+    day_orders: dict = {d: count for d, count in day_rows}
+
+    # Slice into 7-day buckets, week 1 = oldest
+    weekly = []
+    cursor = start
+    week_num = 1
+    while cursor < end:
+        w_end = min(cursor + timedelta(days=7), end)
+        total = 0
+        days_in_week = 0
+        d = cursor.date()
+        end_d = w_end.date()
+        while d < end_d:
+            total += day_orders.get(d, 0)
+            days_in_week += 1
+            d += timedelta(days=1)
+        avg = (total / days_in_week) if days_in_week > 0 else 0.0
+        weekly.append({
+            "week_number": week_num,
+            "week_start": cursor,
+            "week_end": w_end,
+            "days": days_in_week,
+            "total_orders": total,
+            "avg_orders_per_day": round(avg, 1),
+        })
+        cursor = w_end
+        week_num += 1
+
+    overall_total = sum(w["total_orders"] for w in weekly)
+    overall_days = sum(w["days"] for w in weekly)
+    overall_avg = (overall_total / overall_days) if overall_days > 0 else 0.0
+
+    return {
+        "historical_range_start": start,
+        "historical_range_end": end,
+        "weekly_breakdown": weekly,
+        "overall_avg_orders_per_day": round(overall_avg, 1),
+        "overall_total_orders": overall_total,
+        "overall_days": overall_days,
+    }
 
 
 def compare_projections(

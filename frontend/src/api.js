@@ -107,12 +107,13 @@ export const shopifyAuthApi = {
 export const ordersApi = {
   list: (params) => api.get('/orders/', { params }).then(r => r.data),
   pull: (data) => api.post('/orders/pull', data).then(r => r.data),
-  get: (id) => api.get(`/orders/${id}`).then(r => r.data),
+  get: (id, params) => api.get(`/orders/${id}`, { params }).then(r => r.data),
   updateStatus: (id, data) => api.put(`/orders/${id}/status`, data).then(r => r.data),
   stage: (id) => api.post(`/orders/${id}/stage`).then(r => r.data),
   stageBatch: (data) => api.post('/orders/stage-batch', data).then(r => r.data),
   unstageBatch: (order_ids) => api.post('/orders/unstage-batch', { order_ids }).then(r => r.data),
   unstagePlanIssues: () => api.post('/orders/unstage-plan-issues').then(r => r.data),
+  recompute: (body = {}) => api.post('/orders/recompute', body, { timeout: 180000 }).then(r => r.data),
   getMargin: (id) => api.get(`/orders/${id}/margin`).then(r => r.data),
   getBatchMargins: (ids) => api.get('/orders/margins', { params: { ids: ids.join(',') } }).then(r => r.data),
   listArchived: () => api.get('/orders/archived').then(r => r.data),
@@ -136,6 +137,14 @@ export const picklistSkusApi = {
   sync: () => api.post('/picklist-skus/sync').then(r => r.data),
   update: (id, data) => api.put(`/picklist-skus/${id}`, data).then(r => r.data),
   missingCogs: () => api.get('/picklist-skus/missing-cogs').then(r => r.data),
+}
+
+export const skuHelperApi = {
+  list: (params) => api.get('/sku-helper/', { params }).then(r => r.data),
+  create: (data) => api.post('/sku-helper/', data).then(r => r.data),
+  update: (id, data) => api.put(`/sku-helper/${id}`, data).then(r => r.data),
+  delete: (id) => api.delete(`/sku-helper/${id}`).then(r => r.data),
+  sync: () => api.post('/sku-helper/sync').then(r => r.data),
 }
 
 export const gmSettingsApi = {
@@ -192,7 +201,20 @@ export const projectionPeriodsApi = {
   importGlobalInventoryHold: (periodId) => api.post(`/projection-periods/${periodId}/inventory-hold/import-global`).then(r => r.data),
   // SKU mappings
   getSkuMappings: (periodId, params) => api.get(`/projection-periods/${periodId}/sku-mappings`, { params }).then(r => r.data),
-  listSheetsTabs: () => api.get('/projection-periods/sheets/tabs').then(r => r.data),
+  listSheetsTabs: () => api.get('/projection-periods/sheets/tabs').then(r => r.data.tabs || []),
+  // Archive
+  archive: (periodId) => api.post(`/projection-periods/${periodId}/archive`).then(r => r.data),
+  unarchive: (periodId) => api.post(`/projection-periods/${periodId}/unarchive`).then(r => r.data),
+}
+
+export const projectionConfirmedOrdersApi = {
+  list: (periodId) => api.get(`/projection-periods/${periodId}/confirmed-orders`).then(r => r.data),
+  confirmOrders: (periodId, data) => api.post(`/projection-periods/${periodId}/confirm-orders`, data).then(r => r.data),
+  unconfirmOrders: (periodId, data) => api.post(`/projection-periods/${periodId}/unconfirm-orders`, data).then(r => r.data),
+  getRollup: (periodId) => api.get(`/projection-periods/${periodId}/confirmed-demand-rollup`).then(r => r.data),
+  saveConfirmedDemand: (periodId) => api.post(`/projection-periods/${periodId}/save-confirmed-demand`).then(r => r.data),
+  revertConfirmedDemand: (periodId) => api.post(`/projection-periods/${periodId}/revert-confirmed-demand`).then(r => r.data),
+  getStagedBlocking: (periodId) => api.get(`/projection-periods/${periodId}/staged-orders-blocking`).then(r => r.data),
 }
 
 export const historicalDataApi = {
@@ -305,9 +327,23 @@ export const projectionsApi = {
   get: (id) => api.get(`/projections/${id}`).then(r => r.data),
   delete: (id) => api.delete(`/projections/${id}`).then(r => r.data),
 
-  // Hourly breakdown & comparison
-  getHourlyBreakdown: (projectionId, productType) =>
-    api.get(`/projections/${projectionId}/hourly-breakdown`, { params: { product_type: productType } }).then(r => r.data),
+  // Shop-wide hourly orders chart + per-PT daily history grid
+  getShopHourlyBreakdown: (projectionId) =>
+    api.get(`/projections/${projectionId}/shop-hourly-breakdown`).then(r => r.data),
+  getPtDailyHistory: (projectionId, productType) =>
+    api.get(`/projections/${projectionId}/pt-daily-history`, { params: { product_type: productType } }).then(r => r.data),
+  getHistoricalSummary: (projectionId) =>
+    api.get(`/projections/${projectionId}/historical-summary`).then(r => r.data),
+  getSkuDiagnostics: (projectionId, productType) =>
+    api.get(`/projections/${projectionId}/sku-diagnostics`, { params: { product_type: productType } }).then(r => r.data),
+  getCoverageSummary: (projectionId) =>
+    api.get(`/projections/${projectionId}/coverage-summary`).then(r => r.data),
+
+  // Per-product-type overrides (Phase 2)
+  listOverrides: (periodId) => api.get(`/projection-periods/${periodId}/overrides`).then(r => r.data),
+  upsertOverride: (periodId, data) => api.post(`/projection-periods/${periodId}/overrides`, data).then(r => r.data),
+  deleteOverride: (periodId, productType) =>
+    api.delete(`/projection-periods/${periodId}/overrides/${encodeURIComponent(productType)}`).then(r => r.data),
   compare: (id, otherId) =>
     api.get(`/projections/${id}/compare/${otherId}`).then(r => r.data),
 

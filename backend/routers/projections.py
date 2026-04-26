@@ -8,7 +8,7 @@ from typing import Optional
 import models
 import schemas
 from database import get_db
-from services import projection_service
+from services import projection_service, projection_diagnostics
 
 router = APIRouter()
 
@@ -82,6 +82,7 @@ def generate_projection(
             historical_weeks=body.historical_weeks or 4,
             excluded_promo_ids=body.excluded_promo_ids,
             promotion_multiplier=body.promotion_multiplier,
+            demand_multiplier=body.demand_multiplier,
             warehouse=body.warehouse,
         )
     except ValueError as e:
@@ -179,34 +180,60 @@ def get_projection(projection_id: int, db: Session = Depends(get_db)):
     )
 
 
-@router.get("/{projection_id}/hourly-breakdown", response_model=schemas.HourlyBreakdownResponse)
-def get_hourly_breakdown(
+@router.get("/{projection_id}/shop-hourly-breakdown", response_model=schemas.ShopHourlyBreakdownResponse)
+def get_shop_hourly_breakdown(
+    projection_id: int,
+    db: Session = Depends(get_db),
+):
+    """Shop-wide projected orders per hour, summed across all product types."""
+    try:
+        return projection_service.get_shop_hourly_breakdown(db, projection_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/{projection_id}/pt-daily-history", response_model=schemas.PtDailyHistoryResponse)
+def get_pt_daily_history(
     projection_id: int,
     product_type: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """Get hourly demand breakdown for a product type within a projection."""
-    projection = db.query(models.Projection).filter(
-        models.Projection.id == projection_id
-    ).first()
-    if not projection:
-        raise HTTPException(status_code=404, detail="Projection not found")
-
-    period = db.query(models.ProjectionPeriod).filter(
-        models.ProjectionPeriod.id == projection.period_id
-    ).first()
-
+    """Per-day historical lbs for a product type, grouped by week."""
     try:
-        hours = projection_service.get_hourly_breakdown(db, projection_id, product_type)
+        return projection_service.get_pt_daily_history(db, projection_id, product_type)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e))
 
-    return schemas.HourlyBreakdownResponse(
-        product_type=product_type,
-        projection_id=projection_id,
-        period_name=period.name if period else "",
-        hours=[schemas.HourlyBucketResponse(**h) for h in hours],
-    )
+
+@router.get("/{projection_id}/historical-summary", response_model=schemas.HistoricalOrdersSummaryResponse)
+def get_historical_summary(projection_id: int, db: Session = Depends(get_db)):
+    """Weekly + overall distinct-orders-per-day for this projection's historical window."""
+    try:
+        return projection_service.get_historical_orders_summary(db, projection_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/{projection_id}/sku-diagnostics")
+def get_sku_diagnostics(
+    projection_id: int,
+    product_type: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Per-SKU data-quality diagnostics for every Shopify SKU that rolls up to this product type."""
+    try:
+        return projection_diagnostics.get_sku_diagnostics(db, projection_id, product_type)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/{projection_id}/coverage-summary")
+def get_coverage_summary(projection_id: int, db: Session = Depends(get_db)):
+    """One coverage flag per product_type (worst color among material contributors)."""
+    try:
+        return projection_diagnostics.get_coverage_summary(db, projection_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/{projection_id}/compare/{other_id}", response_model=schemas.ProjectionComparisonResponse)

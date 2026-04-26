@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 import { picklistSkusApi } from '../api'
@@ -19,13 +19,19 @@ const EDITABLE_FIELDS = [
   { key: 'notes',                label: 'Notes',             type: 'text',   width: 160 },
 ]
 
-function EditableRow({ item, onSave }) {
+// Focused column set for the missing-COGS filter view — only shows the fields
+// that actually need to be edited to clear a missing-COGS row.
+const MISSING_COGS_FIELDS = EDITABLE_FIELDS.filter(f =>
+  ['type', 'weight_lb', 'cost_per_lb', 'cost_per_case', 'case_weight_lb'].includes(f.key)
+)
+
+function EditableRow({ item, onSave, prefixCells = null, fields = EDITABLE_FIELDS }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState({})
 
   function startEdit() {
     const initial = {}
-    for (const f of EDITABLE_FIELDS) initial[f.key] = item[f.key] ?? ''
+    for (const f of fields) initial[f.key] = item[f.key] ?? ''
     setDraft(initial)
     setEditing(true)
   }
@@ -34,7 +40,7 @@ function EditableRow({ item, onSave }) {
 
   function save() {
     const payload = {}
-    for (const f of EDITABLE_FIELDS) {
+    for (const f of fields) {
       const raw = draft[f.key]
       if (f.type === 'number') {
         payload[f.key] = raw === '' || raw === null ? null : Number(raw)
@@ -54,7 +60,8 @@ function EditableRow({ item, onSave }) {
     return (
       <tr style={{ background: '#fefce8' }}>
         <td className="mono" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>{item.pick_sku}</td>
-        {EDITABLE_FIELDS.map(f => (
+        {prefixCells}
+        {fields.map(f => (
           <td key={f.key}>
             <input
               type={f.type === 'number' ? 'number' : 'text'}
@@ -76,7 +83,8 @@ function EditableRow({ item, onSave }) {
   return (
     <tr style={{ cursor: 'pointer' }} onDoubleClick={startEdit}>
       <td className="mono" style={{ fontSize: 12, whiteSpace: 'nowrap', color: '#16a34a' }}>{item.pick_sku}</td>
-      {EDITABLE_FIELDS.map(f => (
+      {prefixCells}
+      {fields.map(f => (
         <td key={f.key} style={{ fontSize: 13 }} title={f.hint || undefined}>
           {f.key === 'pactor' && item[f.key] != null
             ? <span className="pactor-chip pactor-line">{item[f.key]}</span>
@@ -103,7 +111,9 @@ function EditableRow({ item, onSave }) {
 
 export default function PicklistSkus() {
   const qc = useQueryClient()
-  const [urlParams] = useSearchParams()
+  const [urlParams, setUrlParams] = useSearchParams()
+  const filter = urlParams.get('filter') || ''
+  const isMissingCogs = filter === 'missing-cogs'
   const [search, setSearch] = useState(urlParams.get('search') || '')
   const [page, setPage] = useState(0)
   const limit = 200
@@ -112,6 +122,13 @@ export default function PicklistSkus() {
   const { data = { total: 0, items: [] }, isLoading } = useQuery({
     queryKey: ['picklist-skus', search, page],
     queryFn: () => picklistSkusApi.list({ search: search || undefined, skip: page * limit, limit }),
+    enabled: !isMissingCogs,
+  })
+
+  const { data: missingCogsData = [], isLoading: missingLoading } = useQuery({
+    queryKey: ['picklist-skus-missing-cogs'],
+    queryFn: picklistSkusApi.missingCogs,
+    enabled: isMissingCogs,
   })
 
   const syncMut = useMutation({
@@ -119,21 +136,38 @@ export default function PicklistSkus() {
     onSuccess: (res) => {
       setSyncResult(res)
       qc.invalidateQueries(['picklist-skus'])
+      qc.invalidateQueries(['picklist-skus-missing-cogs'])
       qc.invalidateQueries(['pactor-map'])
     },
   })
 
   const updateMut = useMutation({
     mutationFn: ({ id, payload }) => picklistSkusApi.update(id, payload),
-    onSuccess: () => qc.invalidateQueries(['picklist-skus']),
+    onSuccess: () => {
+      qc.invalidateQueries(['picklist-skus'])
+      qc.invalidateQueries(['picklist-skus-missing-cogs'])
+    },
   })
 
   function handleSave(id, payload, done) {
     updateMut.mutate({ id, payload }, { onSuccess: done })
   }
 
-  const { total, items } = data
-  const totalPages = Math.ceil(total / limit)
+  function clearFilter() {
+    const next = new URLSearchParams(urlParams)
+    next.delete('filter')
+    setUrlParams(next, { replace: true })
+  }
+
+  const missingTotals = useMemo(() => {
+    if (!isMissingCogs) return null
+    return { skus: missingCogsData.length }
+  }, [isMissingCogs, missingCogsData])
+
+  const { total, items } = isMissingCogs
+    ? { total: missingCogsData.length, items: missingCogsData }
+    : data
+  const totalPages = isMissingCogs ? 1 : Math.ceil(total / limit)
 
   return (
     <div>
@@ -142,13 +176,25 @@ export default function PicklistSkus() {
         <p>App is source of truth. Sync pulls from Google Sheets; edits here override sheet values.</p>
       </div>
 
+      {isMissingCogs && (
+        <div className="warning-banner" style={{ justifyContent: 'space-between' }}>
+          <span>
+            <strong>Filter: SKUs missing COGS</strong> — {missingTotals?.skus ?? 0} SKU{missingTotals?.skus === 1 ? '' : 's'} need cost data, sorted by orders blocked.
+            Set <code>cost_per_lb</code> or <code>cost_per_case</code> + <code>case_weight_lb</code> to clear each row.
+          </span>
+          <button className="btn btn-secondary" style={{ fontSize: 12 }} onClick={clearFilter}>Clear filter</button>
+        </div>
+      )}
+
       <div className="toolbar">
-        <input
-          placeholder="Search SKU or description..."
-          value={search}
-          onChange={e => { setSearch(e.target.value); setPage(0) }}
-          style={{ minWidth: 240 }}
-        />
+        {!isMissingCogs && (
+          <input
+            placeholder="Search SKU or description..."
+            value={search}
+            onChange={e => { setSearch(e.target.value); setPage(0) }}
+            style={{ minWidth: 240 }}
+          />
+        )}
         <button
           className="btn btn-primary"
           onClick={() => { setSyncResult(null); syncMut.mutate() }}
@@ -167,23 +213,31 @@ export default function PicklistSkus() {
           </span>
         )}
         <span style={{ marginLeft: 'auto', fontSize: 12, color: '#9ca3af' }}>
-          {total} SKUs
+          {total} SKU{total === 1 ? '' : 's'}
         </span>
       </div>
 
-      {total === 0 && !isLoading && (
+      {total === 0 && !isLoading && !missingLoading && (
         <div style={{ padding: '40px 0', textAlign: 'center', color: '#9ca3af' }}>
-          No picklist SKUs in database. Click <strong>Sync from Sheets</strong> to pull data.
+          {isMissingCogs
+            ? 'No SKUs missing COGS. All set!'
+            : <>No picklist SKUs in database. Click <strong>Sync from Sheets</strong> to pull data.</>}
         </div>
       )}
 
       {items.length > 0 && (
         <div style={{ overflowX: 'auto' }}>
-          <table className="data-table" style={{ minWidth: 1100 }}>
+          <table className="data-table" style={{ minWidth: isMissingCogs ? 900 : 1100 }}>
             <thead>
               <tr>
                 <th style={{ minWidth: 160 }}>Pick SKU</th>
-                {EDITABLE_FIELDS.map(f => (
+                {isMissingCogs && (
+                  <>
+                    <th style={{ minWidth: 90 }} title="Active orders blocked by this missing COGS">Orders blocked</th>
+                    <th style={{ minWidth: 110 }} title="Total revenue of orders blocked by this SKU">Revenue at risk</th>
+                  </>
+                )}
+                {(isMissingCogs ? MISSING_COGS_FIELDS : EDITABLE_FIELDS).map(f => (
                   <th key={f.key} style={{ minWidth: f.width }} title={f.hint || undefined}>{f.label}</th>
                 ))}
                 <th style={{ width: 80 }}></th>
@@ -191,7 +245,18 @@ export default function PicklistSkus() {
             </thead>
             <tbody>
               {items.map(item => (
-                <EditableRow key={item.id} item={item} onSave={handleSave} />
+                <EditableRow
+                  key={item.id}
+                  item={item}
+                  onSave={handleSave}
+                  fields={isMissingCogs ? MISSING_COGS_FIELDS : EDITABLE_FIELDS}
+                  prefixCells={isMissingCogs ? (
+                    <>
+                      <td style={{ fontSize: 13, fontWeight: 600, color: '#dc2626' }}>{item.affected_order_count ?? 0}</td>
+                      <td style={{ fontSize: 13 }}>${(item.revenue_at_risk ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>
+                    </>
+                  ) : null}
+                />
               ))}
             </tbody>
           </table>

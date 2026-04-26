@@ -1,6 +1,7 @@
 import { Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom'
 import SkuMapping from './pages/SkuMapping'
 import PicklistSkus from './pages/PicklistSkus'
+import SkuHelper from './pages/SkuHelper'
 import Cogs from './pages/Cogs'
 import RateCards from './pages/RateCards'
 import Rules from './pages/Rules'
@@ -8,6 +9,8 @@ import PackageRules from './pages/PackageRules'
 import CarrierServiceRules from './pages/CarrierServiceRules'
 import Inventory from './pages/Inventory'
 import Orders from './pages/Orders'
+import ProjectionOrders from './pages/ProjectionOrders'
+import ProjectionConfirmed from './pages/ProjectionConfirmed'
 import DemandDashboard from './pages/DemandDashboard'
 import ProjectionPeriods from './pages/ProjectionPeriods'
 import HistoricalPromotions from './pages/HistoricalPromotions'
@@ -19,7 +22,7 @@ import InventoryCount from './pages/InventoryCount'
 import './App.css'
 
 // Routes that use the full-bleed no-padding layout
-const FULL_BLEED_ROUTES = ['/orders']
+const FULL_BLEED_ROUTES = ['/orders', '/projection-orders']
 
 export default function App() {
   const location = useLocation()
@@ -43,6 +46,8 @@ export default function App() {
         <ul>
           <li><NavLink to="/projection-dashboard">Projection Dashboard</NavLink></li>
           <li><NavLink to="/projection-periods">Projection Periods</NavLink></li>
+          <li><NavLink to="/projection-orders">Projection Orders</NavLink></li>
+          <li><NavLink to="/projection-confirmed">Confirmed Demand</NavLink></li>
           <li><NavLink to="/historical-data">Historical Data</NavLink></li>
         </ul>
         <div className="nav-section-label">Procurement</div>
@@ -54,6 +59,7 @@ export default function App() {
         <ul>
           <li><NavLink to="/picklist-skus">Picklist SKUs</NavLink></li>
           <li><NavLink to="/sku-mapping">SKU Mapping</NavLink></li>
+          <li><NavLink to="/sku-helper">SKU Helper</NavLink></li>
           <li><NavLink to="/cogs">COGS</NavLink></li>
           <li><NavLink to="/rate-cards">Rate Cards</NavLink></li>
           <li><NavLink to="/rules">Order Rules</NavLink></li>
@@ -71,11 +77,14 @@ export default function App() {
           <Route path="/demand-dashboard" element={<DemandDashboard />} />
           <Route path="/projection-dashboard" element={<ProjectionDashboard />} />
           <Route path="/projection-periods" element={<ProjectionPeriods />} />
+          <Route path="/projection-orders" element={<ProjectionOrders />} />
+          <Route path="/projection-confirmed" element={<ProjectionConfirmed />} />
           <Route path="/historical-data" element={<HistoricalPromotions />} />
           <Route path="/vendors" element={<Vendors />} />
           <Route path="/purchase-orders" element={<PurchaseOrders />} />
           <Route path="/picklist-skus" element={<PicklistSkus />} />
           <Route path="/sku-mapping" element={<SkuMapping />} />
+          <Route path="/sku-helper" element={<SkuHelper />} />
           <Route path="/cogs" element={<Cogs />} />
           <Route path="/rate-cards" element={<RateCards />} />
           <Route path="/rules" element={<Rules />} />

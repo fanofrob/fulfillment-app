@@ -44,6 +44,24 @@ class SkuMapping(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
+class SkuHelperMapping(Base):
+    """
+    Variant-to-canonical Shopify SKU normalization. A single product often gets
+    re-published in Shopify with auto-suffixed SKUs (`-2lb_2`, `-1lb_pos`, etc.);
+    this table maps every variant back to one helper SKU so we don't have to
+    add every variant row to the SkuMapping table. Sourced originally from the
+    INPUT_SKU_TYPE Google Sheet; the DB is the canonical source going forward.
+    """
+    __tablename__ = "sku_helper_mappings"
+    id = Column(Integer, primary_key=True, index=True)
+    shopify_sku = Column(String, nullable=False, unique=True, index=True)
+    helper_sku = Column(String, nullable=False, index=True)
+    notes = Column(Text, nullable=True)
+    synced_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
 class CogsCost(Base):
     __tablename__ = "cogs_costs"
     id = Column(Integer, primary_key=True, index=True)
@@ -440,7 +458,7 @@ class ProjectionPeriod(Base):
     """
     A named time window for demand projection with configurable date boundaries.
     Default cycle: Wed 12:00am → Tue 11:59pm.
-    Status: draft → active → closed.
+    Status: draft | active | closed | archived.
     """
     __tablename__ = "projection_periods"
     id                    = Column(Integer, primary_key=True, index=True)
@@ -449,13 +467,37 @@ class ProjectionPeriod(Base):
     end_datetime          = Column(DateTime(timezone=True), nullable=False)
     fulfillment_start     = Column(DateTime(timezone=True), nullable=True)
     fulfillment_end       = Column(DateTime(timezone=True), nullable=True)
-    status                = Column(String, nullable=False, default="draft")  # draft | active | closed
+    status                = Column(String, nullable=False, default="draft")  # draft | active | closed | archived
     sku_mapping_sheet_tab = Column(String, nullable=True)
     previous_period_id    = Column(Integer, ForeignKey("projection_periods.id"), nullable=True)
     spoilage_adjustments  = Column(JSON, nullable=True)   # per-SKU spoilage % overrides
     notes                 = Column(Text, nullable=True)
+    # Confirmed-demand review/override layer (see ProjectionPeriodConfirmedOrder)
+    confirmed_demand_auto_lbs     = Column(JSON, nullable=True)   # {product_type: lbs} computed by projection engine
+    confirmed_demand_manual_lbs   = Column(JSON, nullable=True)   # {product_type: lbs} saved from the Projections Orders UI
+    has_manual_confirmed_demand   = Column(Boolean, nullable=False, default=False)
+    confirmed_demand_saved_at     = Column(DateTime(timezone=True), nullable=True)
     created_at            = Column(DateTime(timezone=True), server_default=func.now())
     updated_at            = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class ProjectionPeriodConfirmedOrder(Base):
+    """
+    Join table tracking which orders a human has "confirmed" as demand for a projection period,
+    along with the frozen box contents and SKU mapping used at confirm time so the rollup
+    stays reproducible even if the underlying plan or mapping changes later.
+    """
+    __tablename__ = "projection_period_confirmed_orders"
+    id               = Column(Integer, primary_key=True, index=True)
+    period_id        = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
+    shopify_order_id = Column(String, ForeignKey("shopify_orders.shopify_order_id"), nullable=False, index=True)
+    boxes_snapshot   = Column(JSON, nullable=False)   # [{pick_sku, quantity, weight_lb, product_type}, ...]
+    mapping_used     = Column(String, nullable=False) # Google Sheets tab name
+    confirmed_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('period_id', 'shopify_order_id', name='uq_period_confirmed_order'),
+    )
 
 
 class PeriodShortShipConfig(Base):
@@ -484,6 +526,34 @@ class PeriodInventoryHoldConfig(Base):
     )
 
 
+class PeriodProjectionOverride(Base):
+    """
+    Per-product-type override of projection inputs, scoped to a period.
+    Either use a narrower historical window (weeks OR custom date range — mutually
+    exclusive) OR skip history entirely with a manual lbs/day rate.
+    """
+    __tablename__ = "period_projection_overrides"
+    id                         = Column(Integer, primary_key=True, index=True)
+    period_id                  = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
+    product_type               = Column(String, nullable=False)
+    # Range control — either_or: historical_weeks XOR (custom_range_start + custom_range_end)
+    historical_weeks           = Column(Integer, nullable=True)
+    custom_range_start         = Column(DateTime(timezone=True), nullable=True)
+    custom_range_end           = Column(DateTime(timezone=True), nullable=True)
+    # Manual rate — when set, replaces historical calc. Range fields are ignored.
+    manual_daily_lbs           = Column(Float, nullable=True)
+    apply_demand_multiplier    = Column(Boolean, nullable=False, default=False)
+    apply_promotion_multiplier = Column(Boolean, nullable=False, default=True)
+    apply_padding              = Column(Boolean, nullable=False, default=True)
+    notes                      = Column(Text, nullable=True)
+    created_at                 = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at                 = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('period_id', 'product_type', name='uq_period_projection_override'),
+    )
+
+
 class HistoricalSales(Base):
     """
     Hourly-bucketed historical sales data aggregated from Shopify orders.
@@ -500,6 +570,44 @@ class HistoricalSales(Base):
     __table_args__ = (
         UniqueConstraint('hour_bucket', 'shopify_sku', name='uq_historical_hour_sku'),
     )
+
+
+class HistoricalOrderLineItem(Base):
+    """
+    Flat per-line-item snapshot of historical Shopify orders used for CSV
+    export and ad-hoc comparison with Shopify reports. Denormalizes order-level
+    fields (order number, tags, created_at) onto each line item for simple
+    spreadsheet workflows.
+    """
+    __tablename__ = "historical_order_line_items"
+    id                   = Column(Integer, primary_key=True, index=True)
+    shopify_order_id     = Column(String, nullable=False, index=True)
+    shopify_order_number = Column(String, nullable=True)
+    created_at_shopify   = Column(DateTime(timezone=True), nullable=False, index=True)
+    tags                 = Column(Text, nullable=True)
+    financial_status     = Column(String, nullable=True)
+    fulfillment_status   = Column(String, nullable=True)
+    shopify_sku          = Column(String, nullable=True, index=True)
+    product_title        = Column(String, nullable=True)
+    variant_title        = Column(String, nullable=True)
+    quantity             = Column(Integer, nullable=False, default=0)
+    price                = Column(Float, nullable=False, default=0.0)
+    discount             = Column(Float, nullable=False, default=0.0)
+
+
+class HistoricalDailyOrders(Base):
+    """
+    Per-day distinct order count for historical demand analysis.
+    Populated by the same Shopify ingestion job that builds historical_sales,
+    but tracks order-level counts (not SKU-level) so orders/day is accurate
+    regardless of how many SKUs an order contains.
+    """
+    __tablename__ = "historical_daily_orders"
+    id           = Column(Integer, primary_key=True, index=True)
+    day          = Column(Date, nullable=False, unique=True, index=True)
+    order_count  = Column(Integer, nullable=False, default=0)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at   = Column(DateTime(timezone=True), onupdate=func.now())
 
 
 class HistoricalPromotion(Base):

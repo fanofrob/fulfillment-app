@@ -228,7 +228,7 @@ function StatusSidebar({ orders, statusFilter, setStatusFilter, holdTags, dnssTa
 
 // ── Orders Table Row ───────────────────────────────────────────────────────────
 
-function OrderRow({ order, isSelected, isChecked, onClick, onCheck, holdTags, grossMarginPct, missingCostSkus = [], fulfillableRevenue }) {
+function OrderRow({ order, isSelected, isChecked, onClick, onCheck, holdTags, grossMarginPct, missingCostSkus = [], fulfillableRevenue, mappingUsed = null, currentMappingTab = null }) {
   const tags = (order.tags || '').split(',').map(t => t.trim()).filter(Boolean)
   const isHeld = order.shopify_hold || tags.some(t => holdTags.has(t.toLowerCase()))
   const isPendingPayment = order.financial_status === 'pending' || order.financial_status === 'partially_paid'
@@ -308,6 +308,23 @@ function OrderRow({ order, isSelected, isChecked, onClick, onCheck, holdTags, gr
         )}
         {isPendingPayment && (
           <span className="badge" style={{ fontSize: 10, marginLeft: 4, background: '#fef3c7', color: '#92400e' }} title={`Payment status: ${order.financial_status}`}>Pending Payment</span>
+        )}
+        {mappingUsed && (
+          <span
+            className="badge"
+            style={{
+              fontSize: 10, marginLeft: 4,
+              background: currentMappingTab && mappingUsed !== currentMappingTab ? '#fef3c7' : '#dbeafe',
+              color: currentMappingTab && mappingUsed !== currentMappingTab ? '#92400e' : '#1e40af',
+            }}
+            title={
+              currentMappingTab && mappingUsed !== currentMappingTab
+                ? `Confirmed under "${mappingUsed}" — current selection is "${currentMappingTab}". Re-confirming will overwrite the snapshot.`
+                : `Confirmed under "${mappingUsed}"`
+            }
+          >
+            ✓ {mappingUsed}
+          </span>
         )}
       </td>
     </tr>
@@ -442,18 +459,29 @@ export default function OrdersPage({
   const [ssBoxColFilters, setSsBoxColFilters] = useState({ boxType: null, pickSku: null })
   function setSsBoxCF(key, val) { setSsBoxColFilters(f => ({ ...f, [key]: val })) }
 
+  // Re-confirm safety guard: when the user clicks Confirm Selected and any of
+  // the selected orders are already confirmed under a *different* mapping tab,
+  // we surface this modal so an accidental overwrite is a deliberate choice.
+  const [reconfirmModal, setReconfirmModal] = useState(null)
+  // shape: { conflicts: [{shopify_order_id, order_number, original_tab}], allIds: [...] }
+
   const qc = useQueryClient()
   const navigate = useNavigate()
 
   const CLIENT_SIDE_FILTERS = new Set(['all', 'not_processed', 'needs_plan', 'on_hold', 'no_box_rule', 'plan_mismatch', 'ss_duplicate', 'cogs_error', 'pending_payment', 'ship_all', 'ship_partial', 'ship_none', 'inv_hold', 'confirmed'])
+  // In projections mode, mappingTab drives a live preview re-resolution of pick
+  // SKUs and box configs server-side. Empty string = no override (show stored).
+  const previewTab = isProjections && mappingTab ? mappingTab : null
   const ordersParams = {
     ...(statusFilter !== 'all' && !CLIENT_SIDE_FILTERS.has(statusFilter) ? { app_status: statusFilter } : {}),
     ...(search ? { search } : {}),
     ...(tagSearch ? { tag: tagSearch } : {}),
+    ...(previewTab ? { mapping_tab: previewTab } : {}),
     limit: 2000,
   }
 
-  // Always fetch all orders (no status filter) for sidebar counts
+  // Always fetch all orders (no status filter) for sidebar counts. Counts don't
+  // depend on the mapping tab, so we don't pass it here — keeps the cache hot.
   const allOrdersParams = {
     ...(search ? { search } : {}),
     ...(tagSearch ? { tag: tagSearch } : {}),
@@ -1187,7 +1215,30 @@ export default function OrdersPage({
                 {(statusFilter === 'ship_all' || statusFilter === 'ship_partial' || statusFilter === 'ship_none') && (
                   <button
                     className="btn btn-primary"
-                    onClick={() => confirmMutation.mutate([...selectedForBatch])}
+                    onClick={() => {
+                      const ids = [...selectedForBatch]
+                      // Find any already-confirmed order whose mapping_used
+                      // differs from the currently-selected tab. Show the
+                      // safety modal before overwriting.
+                      const confirmedById = new Map(confirmedOrders.map(c => [c.shopify_order_id, c]))
+                      const conflicts = ids
+                        .map(oid => {
+                          const c = confirmedById.get(oid)
+                          if (!c || c.mapping_used === mappingTab) return null
+                          const ord = orders.find(o => o.shopify_order_id === oid)
+                          return {
+                            shopify_order_id: oid,
+                            order_number: ord?.shopify_order_number || oid,
+                            original_tab: c.mapping_used,
+                          }
+                        })
+                        .filter(Boolean)
+                      if (conflicts.length > 0) {
+                        setReconfirmModal({ conflicts, allIds: ids })
+                      } else {
+                        confirmMutation.mutate(ids)
+                      }
+                    }}
                     disabled={
                       confirmMutation.isPending ||
                       selectedForBatch.size === 0 ||
@@ -1497,22 +1548,29 @@ export default function OrdersPage({
                 </tr>
               </thead>
               <tbody>
-                {processedOrders.map(order => (
-                  <OrderRow
-                    key={order.shopify_order_id}
-                    order={order}
-                    isSelected={selectedOrderId === order.shopify_order_id || selectedForBatch.has(order.shopify_order_id)}
-                    isChecked={selectedForBatch.has(order.shopify_order_id)}
-                    onClick={() => setSelectedOrderId(
-                      selectedOrderId === order.shopify_order_id ? null : order.shopify_order_id
-                    )}
-                    onCheck={() => toggleBatch(order.shopify_order_id)}
-                    holdTags={holdTags}
-                    grossMarginPct={marginsMap[order.shopify_order_id]?.gm_pct ?? null}
-                    missingCostSkus={marginsMap[order.shopify_order_id]?.missing_cost_skus ?? []}
-                    fulfillableRevenue={marginsMap[order.shopify_order_id]?.fulfillable_revenue ?? null}
-                  />
-                ))}
+                {processedOrders.map(order => {
+                  const confirmed = isProjections
+                    ? confirmedOrders.find(c => c.shopify_order_id === order.shopify_order_id)
+                    : null
+                  return (
+                    <OrderRow
+                      key={order.shopify_order_id}
+                      order={order}
+                      isSelected={selectedOrderId === order.shopify_order_id || selectedForBatch.has(order.shopify_order_id)}
+                      isChecked={selectedForBatch.has(order.shopify_order_id)}
+                      onClick={() => setSelectedOrderId(
+                        selectedOrderId === order.shopify_order_id ? null : order.shopify_order_id
+                      )}
+                      onCheck={() => toggleBatch(order.shopify_order_id)}
+                      holdTags={holdTags}
+                      grossMarginPct={marginsMap[order.shopify_order_id]?.gm_pct ?? null}
+                      missingCostSkus={marginsMap[order.shopify_order_id]?.missing_cost_skus ?? []}
+                      fulfillableRevenue={marginsMap[order.shopify_order_id]?.fulfillable_revenue ?? null}
+                      mappingUsed={confirmed?.mapping_used || null}
+                      currentMappingTab={isProjections ? mappingTab : null}
+                    />
+                  )
+                })}
               </tbody>
             </table>
           )}
@@ -1530,7 +1588,66 @@ export default function OrdersPage({
           hasNext={selectedOrderIdx < processedOrders.length - 1}
           holdTags={holdTags}
           ssConfigured={ssStatus?.configured}
+          previewMappingTab={previewTab}
         />
+      )}
+
+      {/* Re-confirm safety guard modal: shown when user is about to overwrite
+          one or more confirmed-order snapshots with a different mapping tab. */}
+      {reconfirmModal && (
+        <div
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          onClick={() => setReconfirmModal(null)}
+        >
+          <div
+            style={{ background: '#fff', borderRadius: 12, padding: 24, maxWidth: 560, width: '92%', boxShadow: '0 8px 32px rgba(0,0,0,0.2)' }}
+            onClick={e => e.stopPropagation()}
+          >
+            <h3 style={{ margin: '0 0 8px', color: '#92400e' }}>Mapping mismatch on confirmed orders</h3>
+            <p style={{ margin: '0 0 12px', fontSize: 13, color: '#374151' }}>
+              {reconfirmModal.conflicts.length} of the {reconfirmModal.allIds.length} selected order{reconfirmModal.allIds.length !== 1 ? 's' : ''} {reconfirmModal.conflicts.length === 1 ? 'is' : 'are'} already confirmed under a different mapping. Re-confirming will overwrite their stored snapshot{reconfirmModal.conflicts.length !== 1 ? 's' : ''}.
+            </p>
+            <div style={{ maxHeight: 220, overflowY: 'auto', margin: '8px 0 12px', fontSize: 12, color: '#374151', border: '1px solid #e5e7eb', borderRadius: 6, padding: 8, background: '#f9fafb' }}>
+              {reconfirmModal.conflicts.map(c => (
+                <div key={c.shopify_order_id} style={{ display: 'flex', justifyContent: 'space-between', padding: '2px 0' }}>
+                  <span>#{(c.order_number || '').toString().replace(/^#/, '')}</span>
+                  <span style={{ color: '#6b7280' }}>
+                    confirmed under <strong style={{ color: '#92400e' }}>{c.original_tab || '(none)'}</strong>
+                  </span>
+                </div>
+              ))}
+            </div>
+            <p style={{ margin: '4px 0 16px', fontSize: 12, color: '#6b7280' }}>
+              Currently selected: <strong>{mappingTab}</strong>
+            </p>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button className="btn btn-secondary" onClick={() => setReconfirmModal(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={() => {
+                  const conflictIds = new Set(reconfirmModal.conflicts.map(c => c.shopify_order_id))
+                  const safeIds = reconfirmModal.allIds.filter(id => !conflictIds.has(id))
+                  setReconfirmModal(null)
+                  if (safeIds.length > 0) confirmMutation.mutate(safeIds)
+                }}
+              >
+                Skip already-confirmed ({reconfirmModal.allIds.length - reconfirmModal.conflicts.length})
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  const ids = reconfirmModal.allIds
+                  setReconfirmModal(null)
+                  confirmMutation.mutate(ids)
+                }}
+              >
+                Overwrite with {mappingTab}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Triple-confirm modal for bulk cancel ShipStation boxes */}

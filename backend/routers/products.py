@@ -529,21 +529,31 @@ def set_inventory_hold_by_type(
 @router.post("/apply")
 def apply_short_ship(db: Session = Depends(get_db)):
     """
-    Re-apply current short-ship rules to all open orders.
-    Useful if rules were changed without triggering an order pull.
+    Recompute open orders against the current SKU mapping and short-ship/inventory-hold
+    config, then run the margin check (which Pull Shopify and the generic /recompute
+    endpoint skip — it's specific to /apply).
     """
-    result = apply_short_ship_to_orders(db)
-    db.commit()
-
-    # Also check order rules (hold, DNSS, margin) and unstage affected staged orders
+    from services.order_recompute import recompute_open_orders
     from routers.orders import _unstage_by_order_rules
+
+    result = recompute_open_orders(db)
+
+    # Layer the margin check on top — Recompute and Pull Shopify both skip it
     rule_unstage = _unstage_by_order_rules(db, check_margin=True)
     db.commit()
 
+    # Preserve the field names the frontend already consumes for backwards compat
     return {
         **result,
+        # Legacy field names kept for the existing UI
+        "lines_marked":          result.get("lines_marked_short_ship", 0),
+        "lines_cleared":         result.get("lines_cleared_short_ship", 0),
+        "hold_lines_marked":     result.get("lines_marked_inv_hold", 0),
+        "hold_lines_cleared":    result.get("lines_cleared_inv_hold", 0),
+        "boxes_deleted":         result.get("boxes_deleted_short_ship", 0),
+        "orders_unstaged":       result.get("orders_unstaged_short_ship", 0),
         "orders_unstaged_rules_hold": rule_unstage["orders_unstaged_hold"],
-        "orders_unstaged_dnss": rule_unstage["orders_unstaged_dnss"],
+        "orders_unstaged_dnss":  rule_unstage["orders_unstaged_dnss"],
         "orders_unstaged_margin": rule_unstage["orders_unstaged_margin"],
     }
 

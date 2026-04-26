@@ -129,6 +129,19 @@ def _migrate_db():
                 if col_name not in cols:
                     conn.execute(text(f"ALTER TABLE picklist_skus ADD COLUMN {col_name} {col_type}"))
             conn.commit()
+    # Add confirmed-demand review/override fields to projection_periods if missing
+    if "projection_periods" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("projection_periods")}
+        with engine.connect() as conn:
+            for col_name, col_type in [
+                ("confirmed_demand_auto_lbs",   "TEXT"),
+                ("confirmed_demand_manual_lbs", "TEXT"),
+                ("has_manual_confirmed_demand", "BOOLEAN NOT NULL DEFAULT 0"),
+                ("confirmed_demand_saved_at",   "DATETIME"),
+            ]:
+                if col_name not in cols:
+                    conn.execute(text(f"ALTER TABLE projection_periods ADD COLUMN {col_name} {col_type}"))
+            conn.commit()
 
 
 def _seed_ups_rates():
@@ -231,7 +244,7 @@ models.Base.metadata.create_all(bind=engine)
 _seed_ups_rates()
 _seed_gm_settings()
 
-from routers import sku_mapping, cogs, rate_cards, rules, inventory, orders, shopify_auth, shipstation, fulfillment, picklist_skus, products, gm_settings, projection_periods, historical_data, projections, vendors, purchase_orders, inventory_count, receiving
+from routers import sku_mapping, sku_helper, cogs, rate_cards, rules, inventory, orders, shopify_auth, shipstation, fulfillment, picklist_skus, products, gm_settings, projection_periods, projection_confirmed_orders, historical_data, projections, vendors, purchase_orders, inventory_count, receiving
 from services import sheets_service, shopify_service, shipstation_service
 
 app = FastAPI(title="Fulfillment App API")
@@ -254,9 +267,11 @@ app.include_router(shopify_auth.router, prefix="/api/shopify", tags=["Shopify Au
 app.include_router(shipstation.router, prefix="/api/shipstation", tags=["ShipStation"])
 app.include_router(fulfillment.router, prefix="/api/fulfillment", tags=["Fulfillment"])
 app.include_router(picklist_skus.router, prefix="/api/picklist-skus", tags=["Picklist SKUs"])
+app.include_router(sku_helper.router, prefix="/api/sku-helper", tags=["SKU Helper"])
 app.include_router(products.router, prefix="/api/products", tags=["Products"])
 app.include_router(gm_settings.router, prefix="/api/gm-settings", tags=["GM Settings"])
 app.include_router(projection_periods.router, prefix="/api/projection-periods", tags=["Projection Periods"])
+app.include_router(projection_confirmed_orders.router, prefix="/api/projection-periods", tags=["Projection Confirmed Orders"])
 app.include_router(historical_data.router, prefix="/api/historical", tags=["Historical Data"])
 app.include_router(projections.router, prefix="/api/projections", tags=["Projections"])
 app.include_router(vendors.router, prefix="/api/vendors", tags=["Vendors"])
