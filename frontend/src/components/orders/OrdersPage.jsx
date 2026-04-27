@@ -102,13 +102,17 @@ function StatusSidebar({ orders, statusFilter, setStatusFilter, holdTags, dnssTa
     for (const o of orders) {
       c[o.app_status] = (c[o.app_status] || 0) + 1
       if (o.app_status !== 'fulfilled') c.all++
-      if (o.app_status === 'not_processed' && !o.has_plan) c.needs_plan++
       const tags = (o.tags || '').split(',').map(t => t.trim().toLowerCase()).filter(Boolean)
       const isHeld = o.shopify_hold || tags.some(t => holdTags.has(t))
       const isDNSS = tags.some(t => dnssTags && dnssTags.has(t))
       const hasShortShip = (o.line_items || []).some(li => li.app_line_status === 'short_ship')
       const hasInvHold = (o.line_items || []).some(li => li.app_line_status === 'inventory_hold')
-      const hasPlanIssue = (o.app_status === 'not_processed' && !o.has_plan) || (o.has_plan && o.plan_box_unmatched) || o.has_plan_mismatch || o.ss_duplicate
+      const shipCat = getShipCategory(o)
+      // "Nothing to ship" — all unfulfilled lines are short-shipped (or none exist).
+      // These orders don't need a plan, and belong in Ship None, not Needs Plan.
+      const hasNothingToShip = shipCat === 'ship_none' || shipCat === null
+      if (o.app_status === 'not_processed' && !o.has_plan && !isHeld && !hasNothingToShip) c.needs_plan++
+      const hasPlanIssue = (o.app_status === 'not_processed' && !o.has_plan && !hasNothingToShip) || (o.has_plan && o.plan_box_unmatched) || o.has_plan_mismatch || o.ss_duplicate
       if (o.has_plan && o.plan_box_unmatched && !isHeld) c.no_box_rule++
       if (o.has_plan_mismatch) c.plan_mismatch++
       if (o.ss_duplicate) c.ss_duplicate++
@@ -122,7 +126,6 @@ function StatusSidebar({ orders, statusFilter, setStatusFilter, holdTags, dnssTa
       const isExcludedFromShipViews = isHeld || isPaymentPending || hasInvHold || hasPlanIssue || hasCOGSError ||
         o.app_status === 'staged' || o.app_status === 'in_shipstation_not_shipped' || o.app_status === 'in_shipstation_shipped' || o.app_status === 'fulfilled'
       if (!isExcludedFromShipViews) {
-        const shipCat = getShipCategory(o)
         // Check if order should be forced to ship_none due to margin rules.
         // Threshold differs by category: ship_partial requires GM% >= 40%
         // (partial fulfillment overhead needs more margin to pencil out);
@@ -876,8 +879,13 @@ export default function OrdersPage({
   const isPaymentPending = (order) =>
     order.financial_status === 'pending' || order.financial_status === 'partially_paid'
 
-  const hasPlanBoxIssue = (order) =>
-    (order.app_status === 'not_processed' && !order.has_plan) || (order.has_plan && order.plan_box_unmatched) || order.has_plan_mismatch || order.ss_duplicate
+  const hasPlanBoxIssue = (order) => {
+    // "No plan" is only a plan issue if there's something to plan. Orders with
+    // nothing to ship (all lines short-shipped) belong in Ship None, not Needs Plan.
+    const cat = getShipCategory(order)
+    const hasNothingToShip = cat === 'ship_none' || cat === null
+    return (order.app_status === 'not_processed' && !order.has_plan && !hasNothingToShip) || (order.has_plan && order.plan_box_unmatched) || order.has_plan_mismatch || order.ss_duplicate
+  }
 
   // Filter + sort
   const processedOrders = useMemo(() => {
@@ -900,7 +908,13 @@ export default function OrdersPage({
     } else if (statusFilter === 'not_processed') {
       result = result.filter(o => o.app_status === 'not_processed')
     } else if (statusFilter === 'needs_plan') {
-      result = result.filter(o => o.app_status === 'not_processed' && !o.has_plan)
+      result = result.filter(o => {
+        if (o.app_status !== 'not_processed' || o.has_plan) return false
+        if (isOrderHeld(o)) return false
+        const cat = getShipCategory(o)
+        if (cat === 'ship_none' || cat === null) return false
+        return true
+      })
     } else if (statusFilter === 'on_hold') {
       result = result.filter(o => isOrderHeld(o))
     } else if (statusFilter === 'no_box_rule') {
