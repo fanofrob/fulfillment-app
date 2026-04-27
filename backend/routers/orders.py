@@ -373,6 +373,14 @@ def list_orders(
                         mismatch_order_ids.add(oid)
                         break
 
+        # Don't surface plan/box issues for orders already in ShipStation —
+        # the plan is locked once pushed, so any mismatch with refreshed
+        # Shopify line items isn't actionable from the Orders page.
+        ss_order_ids = {o.shopify_order_id for o in orders if o.app_status in SHIPSTATION_STATUSES}
+        if ss_order_ids:
+            mismatch_order_ids -= ss_order_ids
+            unmatched_order_ids -= ss_order_ids
+
     return [
         _build_order_response(
             o, db,
