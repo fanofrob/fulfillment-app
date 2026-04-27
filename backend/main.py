@@ -57,14 +57,14 @@ def _migrate_db():
         cols = {c["name"] for c in insp.get_columns("fulfillment_boxes")}
         if "estimated_delivery_date" not in cols:
             with engine.connect() as conn:
-                conn.execute(text("ALTER TABLE fulfillment_boxes ADD COLUMN estimated_delivery_date DATETIME"))
+                conn.execute(text("ALTER TABLE fulfillment_boxes ADD COLUMN estimated_delivery_date TIMESTAMP"))
                 conn.commit()
     # Add estimated_delivery_date to shopify_orders if missing
     if "shopify_orders" in insp.get_table_names():
         cols = {c["name"] for c in insp.get_columns("shopify_orders")}
         if "estimated_delivery_date" not in cols:
             with engine.connect() as conn:
-                conn.execute(text("ALTER TABLE shopify_orders ADD COLUMN estimated_delivery_date DATETIME"))
+                conn.execute(text("ALTER TABLE shopify_orders ADD COLUMN estimated_delivery_date TIMESTAMP"))
                 conn.commit()
     # Add days_til_expiration to picklist_skus if missing
     if "picklist_skus" in insp.get_table_names():
@@ -116,14 +116,14 @@ def _migrate_db():
         cols = {c["name"] for c in insp.get_columns("shopify_products")}
         if "inventory_hold" not in cols:
             with engine.connect() as conn:
-                conn.execute(text("ALTER TABLE shopify_products ADD COLUMN inventory_hold BOOLEAN NOT NULL DEFAULT 0"))
+                conn.execute(text("ALTER TABLE shopify_products ADD COLUMN inventory_hold BOOLEAN NOT NULL DEFAULT FALSE"))
                 conn.commit()
     # Add ss_duplicate to shopify_orders if missing
     if "shopify_orders" in insp.get_table_names():
         cols = {c["name"] for c in insp.get_columns("shopify_orders")}
         if "ss_duplicate" not in cols:
             with engine.connect() as conn:
-                conn.execute(text("ALTER TABLE shopify_orders ADD COLUMN ss_duplicate BOOLEAN NOT NULL DEFAULT 0"))
+                conn.execute(text("ALTER TABLE shopify_orders ADD COLUMN ss_duplicate BOOLEAN NOT NULL DEFAULT FALSE"))
                 conn.commit()
     # Add SKU cost columns to picklist_skus if missing
     if "picklist_skus" in insp.get_table_names():
@@ -140,8 +140,8 @@ def _migrate_db():
             for col_name, col_type in [
                 ("confirmed_demand_auto_lbs",   "TEXT"),
                 ("confirmed_demand_manual_lbs", "TEXT"),
-                ("has_manual_confirmed_demand", "BOOLEAN NOT NULL DEFAULT 0"),
-                ("confirmed_demand_saved_at",   "DATETIME"),
+                ("has_manual_confirmed_demand", "BOOLEAN NOT NULL DEFAULT FALSE"),
+                ("confirmed_demand_saved_at",   "TIMESTAMP"),
             ]:
                 if col_name not in cols:
                     conn.execute(text(f"ALTER TABLE projection_periods ADD COLUMN {col_name} {col_type}"))
