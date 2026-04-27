@@ -727,25 +727,30 @@ function PlanSection({ plan, lineItems, boxTypes, pactorMap, ssConfigured, shipp
 
 // ── Order Detail Panel ─────────────────────────────────────────────────────────
 
-export default function OrderDetailPanel({ order, onClose, onPrev, onNext, hasPrev, hasNext, holdTags, ssConfigured, previewMappingTab = null }) {
+export default function OrderDetailPanel({ order, onClose, onPrev, onNext, hasPrev, hasNext, holdTags, ssConfigured, previewMappingTab = null, previewPeriodId = null }) {
   const qc = useQueryClient()
 
   // When previewMappingTab is set, the backend re-resolves pick SKUs and box
-  // configs against that sheet tab (no DB writes). Cache key includes the tab
-  // so React Query refetches when it changes.
+  // configs against that sheet tab (no DB writes). previewPeriodId layers the
+  // period's short-ship/inventory-hold configs as in-memory app_line_status
+  // overrides. Both flow into the cache key so React Query refetches on change.
   const { data: orderDetail } = useQuery({
-    queryKey: ['order-detail', order.shopify_order_id, previewMappingTab],
+    queryKey: ['order-detail', order.shopify_order_id, previewMappingTab, previewPeriodId],
     queryFn: () => ordersApi.get(
       order.shopify_order_id,
-      previewMappingTab ? { mapping_tab: previewMappingTab } : undefined,
+      {
+        ...(previewMappingTab ? { mapping_tab: previewMappingTab } : {}),
+        ...(previewPeriodId ? { period_id: previewPeriodId } : {}),
+      },
     ),
   })
 
   const { data: plans, isLoading: plansLoading } = useQuery({
-    queryKey: ['plans', order.shopify_order_id, previewMappingTab],
+    queryKey: ['plans', order.shopify_order_id, previewMappingTab, previewPeriodId],
     queryFn: () => fulfillmentApi.listPlans({
       shopify_order_id: order.shopify_order_id,
       ...(previewMappingTab ? { mapping_tab: previewMappingTab } : {}),
+      ...(previewPeriodId ? { period_id: previewPeriodId } : {}),
     }),
   })
 
@@ -775,8 +780,14 @@ export default function OrderDetailPanel({ order, onClose, onPrev, onNext, hasPr
   })
 
   const { data: margin } = useQuery({
-    queryKey: ['order-margin', order.shopify_order_id],
-    queryFn: () => ordersApi.getMargin(order.shopify_order_id),
+    queryKey: ['order-margin', order.shopify_order_id, previewPeriodId, previewMappingTab],
+    queryFn: () => ordersApi.getMargin(
+      order.shopify_order_id,
+      {
+        ...(previewPeriodId ? { period_id: previewPeriodId } : {}),
+        ...(previewMappingTab ? { mapping_tab: previewMappingTab } : {}),
+      },
+    ),
     staleTime: 2 * 60 * 1000,
     retry: false,
   })

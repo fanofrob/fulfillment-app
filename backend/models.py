@@ -501,7 +501,13 @@ class ProjectionPeriodConfirmedOrder(Base):
 
 
 class PeriodShortShipConfig(Base):
-    """Short-ship SKU configuration scoped to a specific projection period."""
+    """
+    Short-ship SKU configuration scoped to a specific projection period.
+
+    Drives the *projection forecast engine only* (services/projection_service.py).
+    Does NOT affect the Confirmed Orders view or Confirmed Demand rollup —
+    those read from `ConfirmedDemandShortShipConfig` instead.
+    """
     __tablename__ = "period_short_ship_configs"
     id          = Column(Integer, primary_key=True, index=True)
     period_id   = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
@@ -514,7 +520,9 @@ class PeriodShortShipConfig(Base):
 
 
 class PeriodInventoryHoldConfig(Base):
-    """Inventory-hold SKU configuration scoped to a specific projection period."""
+    """
+    Inventory-hold counterpart to PeriodShortShipConfig — projection-forecast only.
+    """
     __tablename__ = "period_inventory_hold_configs"
     id          = Column(Integer, primary_key=True, index=True)
     period_id   = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
@@ -523,6 +531,42 @@ class PeriodInventoryHoldConfig(Base):
 
     __table_args__ = (
         UniqueConstraint('period_id', 'shopify_sku', name='uq_period_inv_hold'),
+    )
+
+
+class ConfirmedDemandShortShipConfig(Base):
+    """
+    Short-ship SKU configuration for the Confirmed Demand Dashboard, scoped per
+    projection period. Drives:
+      - the confirmed-demand rollup
+      - the Confirmed Demand Dashboard's confirmed-orders / inventory views
+      - the Confirmed Orders page (orders awaiting confirmation for the period)
+
+    Independent of `period_short_ship_configs` (which drives projection
+    forecasts only) and `shopify_products.allow_short_ship` (which drives
+    Operations / Staging).
+    """
+    __tablename__ = "confirmed_demand_short_ship_configs"
+    id          = Column(Integer, primary_key=True, index=True)
+    period_id   = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
+    shopify_sku = Column(String, nullable=False)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('period_id', 'shopify_sku', name='uq_cd_short_ship'),
+    )
+
+
+class ConfirmedDemandInventoryHoldConfig(Base):
+    """Inventory-hold counterpart to ConfirmedDemandShortShipConfig."""
+    __tablename__ = "confirmed_demand_inventory_hold_configs"
+    id          = Column(Integer, primary_key=True, index=True)
+    period_id   = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
+    shopify_sku = Column(String, nullable=False)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('period_id', 'shopify_sku', name='uq_cd_inv_hold'),
     )
 
 

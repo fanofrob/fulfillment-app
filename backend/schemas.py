@@ -613,6 +613,26 @@ class ConfigDiffResponse(BaseModel):
     only_in_target: List[str]
     in_both: List[str]
 
+# ---------------------------------------------------------------------------
+# Confirmed Demand short-ship / inventory-hold configs (independent layer)
+# ---------------------------------------------------------------------------
+
+class ConfirmedDemandShortShipResponse(BaseModel):
+    id: int
+    period_id: int
+    shopify_sku: str
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+class ConfirmedDemandInventoryHoldResponse(BaseModel):
+    id: int
+    period_id: int
+    shopify_sku: str
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
 
 # Per-product-type projection overrides
 class PeriodProjectionOverrideBase(BaseModel):

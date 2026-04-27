@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { inventoryApi } from '../api'
+import { inventoryApi, projectionConfirmedOrdersApi } from '../api'
 
 const WAREHOUSES = ['walnut', 'northlake']
 
@@ -178,15 +178,22 @@ function InventoryTransactions({ analysis }) {
 
 // ── Main page ──────────────────────────────────────────────────────────────────
 
-const HEALTH_FILTERS = [
+const OPS_HEALTH_FILTERS = [
   { key: 'all', label: 'All Staged Orders' },
   { key: 'ok', label: 'No Errors', color: '#16a34a' },
   { key: 'errors', label: 'With Errors', color: '#dc2626' },
 ]
+const CD_HEALTH_FILTERS = [
+  { key: 'all', label: 'All Confirmed Demand' },
+  { key: 'ok', label: 'No Errors', color: '#16a34a' },
+  { key: 'errors', label: 'With Errors', color: '#dc2626' },
+]
 
-export default function InventoryDashboard() {
+export default function InventoryDashboard({ mode = 'operations', periodId = null }) {
+  const isCD = mode === 'confirmed-demand'
   const [warehouse, setWarehouse] = useState('walnut')
   const [healthFilter, setHealthFilter] = useState('all') // 'all' | 'ok' | 'errors'
+  const HEALTH_FILTERS = isCD ? CD_HEALTH_FILTERS : OPS_HEALTH_FILTERS
 
   const { data: items = [], isLoading: loadingItems } = useQuery({
     queryKey: ['inventory-items', warehouse],
@@ -195,22 +202,29 @@ export default function InventoryDashboard() {
   })
 
   const { data: analysis = [], isLoading: loadingAnalysis, refetch, isFetching, dataUpdatedAt } = useQuery({
-    queryKey: ['demand-analysis', warehouse, 'staged', healthFilter],
-    queryFn: () => inventoryApi.demandAnalysis(warehouse, 'staged', healthFilter),
+    queryKey: isCD
+      ? ['confirmed-demand-inventory', periodId]
+      : ['demand-analysis', warehouse, 'staged', healthFilter],
+    queryFn: () => isCD
+      ? projectionConfirmedOrdersApi.getInventory(periodId)
+      : inventoryApi.demandAnalysis(warehouse, 'staged', healthFilter),
     staleTime: 60000,
+    enabled: !isCD || !!periodId,
   })
 
   const { data: shortages = [] } = useQuery({
     queryKey: ['staged-shortages', warehouse],
     queryFn: () => inventoryApi.stagedShortages(warehouse),
     staleTime: 30000,
+    enabled: !isCD,
   })
 
   const filteredShortages = useMemo(() => {
+    if (isCD) return []
     if (healthFilter === 'errors') return shortages.filter(s => s.has_shortage)
     if (healthFilter === 'ok') return shortages.filter(s => !s.has_shortage)
     return shortages
-  }, [shortages, healthFilter])
+  }, [shortages, healthFilter, isCD])
 
   const isLoading = loadingItems || loadingAnalysis
   const issueCount = analysis.filter(a => a.on_hand_qty - a.total_demand < 0).length
@@ -222,8 +236,9 @@ export default function InventoryDashboard() {
         <div className="page-header">
           <h1>Inventory Dashboard</h1>
           <p>
-            Pivot of current available quantities, issue SKUs where staged orders would go negative,
-            and ending balances if the staged batch is committed.
+            {isCD
+              ? 'Pivot of current available quantities, issue SKUs where confirmed demand would go negative, and ending balances against this dashboard\'s short-ship/hold config.'
+              : 'Pivot of current available quantities, issue SKUs where staged orders would go negative, and ending balances if the staged batch is committed.'}
           </p>
         </div>
         <div className="page-header-actions">
@@ -240,20 +255,21 @@ export default function InventoryDashboard() {
 
       {/* Health filter tabs */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-        {HEALTH_FILTERS.map(f => (
-          <button
-            key={f.key}
-            onClick={() => setHealthFilter(f.key)}
-            className={`wh-tab${healthFilter === f.key ? ' active' : ''}`}
-            style={healthFilter === f.key && f.color ? { color: f.color } : {}}
-          >
-            {f.key === 'all'
-              ? `${f.label} (${shortages.length})`
-              : f.key === 'ok'
-              ? `${f.label} (${shortages.filter(s => !s.has_shortage).length})`
-              : `${f.label} (${shortages.filter(s => s.has_shortage).length})`}
-          </button>
-        ))}
+        {HEALTH_FILTERS.map(f => {
+          const counts = isCD
+            ? { all: analysis.length, ok: analysis.filter(a => !a.has_shortage).length, errors: analysis.filter(a => a.has_shortage).length }
+            : { all: shortages.length, ok: shortages.filter(s => !s.has_shortage).length, errors: shortages.filter(s => s.has_shortage).length }
+          return (
+            <button
+              key={f.key}
+              onClick={() => setHealthFilter(f.key)}
+              className={`wh-tab${healthFilter === f.key ? ' active' : ''}`}
+              style={healthFilter === f.key && f.color ? { color: f.color } : {}}
+            >
+              {f.label} ({counts[f.key]})
+            </button>
+          )
+        })}
       </div>
 
       {/* Warehouse tabs */}
@@ -285,7 +301,7 @@ export default function InventoryDashboard() {
           <div className="stat-num">
             {analysis.filter(a => a.total_demand > 0).length}
           </div>
-          <div className="stat-label">SKUs with Staged Demand</div>
+          <div className="stat-label">{isCD ? 'SKUs with Confirmed Demand' : 'SKUs with Staged Demand'}</div>
         </div>
       </div>
 
@@ -299,8 +315,8 @@ export default function InventoryDashboard() {
           <InventoryTransactions analysis={analysis} />
         </div>
 
-        {/* Per-order shortage view */}
-        {filteredShortages.length > 0 && (
+        {/* Per-order shortage view (operations only — no per-order view for CD) */}
+        {!isCD && filteredShortages.length > 0 && (
           <div style={{ marginTop: 24 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
               <div style={{ fontWeight: 700, fontSize: 14, color: '#374151' }}>Staged Orders — Inventory Status</div>

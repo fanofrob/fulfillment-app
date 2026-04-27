@@ -1,6 +1,9 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ordersApi, inventoryApi, productsApi, fulfillmentApi, rulesApi, shipstationApi } from '../../api'
+import {
+  ordersApi, inventoryApi, productsApi, fulfillmentApi, rulesApi, shipstationApi,
+  projectionConfirmedOrdersApi, confirmedDemandConfigsApi,
+} from '../../api'
 import InventoryDashboard from '../../pages/InventoryDashboard'
 import OrderDetailPanel from '../../pages/OrderDetailPanel'
 
@@ -139,15 +142,20 @@ function hasPlanIssue(order) {
   return !order.has_plan || order.plan_box_unmatched || order.has_plan_mismatch || order.ss_duplicate
 }
 
-function StagedOrdersTab() {
+function StagedOrdersTab({ mode = 'operations', periodId = null }) {
+  const isCD = mode === 'confirmed-demand'
   const qc = useQueryClient()
   const [warehouse, setWarehouse] = useState('all')
   const [unstageResult, setUnstageResult] = useState(null)
   const [selectedOrderId, setSelectedOrderId] = useState(null)
 
   const { data: orders = [], isLoading, refetch, isFetching } = useQuery({
-    queryKey: ['orders-staged'],
+    queryKey: isCD ? ['confirmed-orders-enriched', periodId] : ['orders-staged'],
     queryFn: async () => {
+      if (isCD) {
+        if (!periodId) return []
+        return projectionConfirmedOrdersApi.listEnriched(periodId)
+      }
       const pageSize = 2000
       let skip = 0
       let all = []
@@ -160,6 +168,7 @@ function StagedOrdersTab() {
       return all
     },
     staleTime: 30000,
+    enabled: !isCD || !!periodId,
   })
 
   const { data: marginsMap = {} } = useQuery({
@@ -169,28 +178,43 @@ function StagedOrdersTab() {
     staleTime: 60000,
   })
 
+  const invalidateOrders = () => {
+    if (isCD) {
+      qc.invalidateQueries(['confirmed-orders-enriched', periodId])
+      qc.invalidateQueries({ queryKey: ['projection-confirmed-rollup', periodId] })
+      qc.invalidateQueries({ queryKey: ['confirmed-demand-inventory', periodId] })
+    } else {
+      qc.invalidateQueries(['orders-staged'])
+    }
+  }
+
   const unstagePlanIssuesMut = useMutation({
     mutationFn: () => ordersApi.unstagePlanIssues(),
     onSuccess: (data) => {
       setUnstageResult(`${data.orders_unstaged} order${data.orders_unstaged !== 1 ? 's' : ''} moved back to awaiting staging`)
-      qc.invalidateQueries(['orders-staged'])
+      invalidateOrders()
       setTimeout(() => setUnstageResult(null), 5000)
     },
   })
 
   const unstageSingleMut = useMutation({
-    mutationFn: (orderId) => ordersApi.unstageBatch([orderId]),
-    onSuccess: () => {
-      qc.invalidateQueries(['orders-staged'])
-    },
+    mutationFn: (orderId) =>
+      isCD
+        ? projectionConfirmedOrdersApi.unconfirmOrders(periodId, { order_ids: [orderId] })
+        : ordersApi.unstageBatch([orderId]),
+    onSuccess: invalidateOrders,
   })
 
   const unstageBulkMut = useMutation({
-    mutationFn: (orderIds) => ordersApi.unstageBatch(orderIds),
+    mutationFn: (orderIds) =>
+      isCD
+        ? projectionConfirmedOrdersApi.unconfirmOrders(periodId, { order_ids: orderIds })
+        : ordersApi.unstageBatch(orderIds),
     onSuccess: (data, variables) => {
       setSelectedOrders(new Set())
-      setUnstageResult(`${variables.length} order${variables.length !== 1 ? 's' : ''} removed from staging`)
-      qc.invalidateQueries(['orders-staged'])
+      const verb = isCD ? 'unconfirmed' : 'removed from staging'
+      setUnstageResult(`${variables.length} order${variables.length !== 1 ? 's' : ''} ${verb}`)
+      invalidateOrders()
       setTimeout(() => setUnstageResult(null), 5000)
     },
   })
@@ -203,6 +227,7 @@ function StagedOrdersTab() {
       if (data.lines_updated > 0) parts.push(`${data.lines_updated} line${data.lines_updated !== 1 ? 's' : ''} updated`)
       const replanned = (data.orders_replanned_created || 0) + (data.orders_replanned_repaired || 0)
       if (replanned > 0) parts.push(`${replanned} replanned`)
+      if (data.empty_boxes_removed > 0) parts.push(`${data.empty_boxes_removed} empty box${data.empty_boxes_removed !== 1 ? 'es' : ''} cleared`)
       const unstaged = (data.orders_unstaged_plan_issues || 0) + (data.orders_unstaged_short_ship || 0) + (data.orders_unstaged_inv_hold || 0) + (data.orders_unstaged_hold || 0) + (data.orders_unstaged_dnss || 0)
       if (unstaged > 0) parts.push(`${unstaged} unstaged`)
       setRecomputeResult(parts.length === 0 ? 'No changes needed' : parts.join(', '))
@@ -452,7 +477,7 @@ function StagedOrdersTab() {
       <div className="stats-row">
         <div className="stat-card">
           <div className="stat-num">{wlCounts.all}</div>
-          <div className="stat-label">Total Staged</div>
+          <div className="stat-label">{isCD ? 'Total Confirmed' : 'Total Staged'}</div>
         </div>
         <div className="stat-card">
           <div className="stat-num">{wlCounts.walnut}</div>
@@ -476,75 +501,87 @@ function StagedOrdersTab() {
         </div>
       </div>
 
-      {/* Recompute + Bulk Unstage Issues */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
-        <button
-          className="btn btn-secondary btn-sm"
-          onClick={() => recomputeMut.mutate()}
-          disabled={recomputeMut.isPending}
-          title="Re-resolve SKU mappings, re-apply short-ship/inventory-hold, replan affected orders, and unstage anything that no longer fits — without pulling from Shopify."
-        >
-          {recomputeMut.isPending ? 'Recomputing…' : '↻ Recompute Orders'}
-        </button>
-        {recomputeResult && (
-          <span style={{ fontSize: 12, color: recomputeResult.startsWith('Error') ? '#dc2626' : '#16a34a', fontWeight: 500 }}>
-            {recomputeResult.startsWith('Error') ? '' : '✓ '}{recomputeResult}
-          </span>
-        )}
-        {issueOrders.length > 0 && (
+      {/* Recompute + Bulk Unstage Issues — operations only */}
+      {!isCD && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
           <button
-            className="btn btn-sm"
-            style={{ background: '#fef2f2', color: '#dc2626', border: '1px solid #fca5a5', fontWeight: 600 }}
-            onClick={() => unstagePlanIssuesMut.mutate()}
-            disabled={unstagePlanIssuesMut.isPending}
+            className="btn btn-secondary btn-sm"
+            onClick={() => recomputeMut.mutate()}
+            disabled={recomputeMut.isPending}
+            title="Re-resolve SKU mappings, re-apply short-ship/inventory-hold, replan affected orders, and unstage anything that no longer fits — without pulling from Shopify."
           >
-            {unstagePlanIssuesMut.isPending ? 'Unstaging…' : `Unstage ${issueOrders.length} Issue Order${issueOrders.length !== 1 ? 's' : ''}`}
+            {recomputeMut.isPending ? 'Recomputing…' : '↻ Recompute Orders'}
+          </button>
+          {recomputeResult && (
+            <span style={{ fontSize: 12, color: recomputeResult.startsWith('Error') ? '#dc2626' : '#16a34a', fontWeight: 500 }}>
+              {recomputeResult.startsWith('Error') ? '' : '✓ '}{recomputeResult}
+            </span>
+          )}
+          {issueOrders.length > 0 && (
+            <button
+              className="btn btn-sm"
+              style={{ background: '#fef2f2', color: '#dc2626', border: '1px solid #fca5a5', fontWeight: 600 }}
+              onClick={() => unstagePlanIssuesMut.mutate()}
+              disabled={unstagePlanIssuesMut.isPending}
+            >
+              {unstagePlanIssuesMut.isPending ? 'Unstaging…' : `Unstage ${issueOrders.length} Issue Order${issueOrders.length !== 1 ? 's' : ''}`}
+            </button>
+          )}
+          {unstageResult && (
+            <span style={{ fontSize: 12, color: '#16a34a', fontWeight: 500 }}>✓ {unstageResult}</span>
+          )}
+        </div>
+      )}
+
+      {/* Push to ShipStation (operations) / Bulk unconfirm (CD) */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+        {!isCD && (
+          <button
+            className="btn btn-primary btn-sm"
+            onClick={handlePushSelected}
+            disabled={pushMut.isPending || selectedOrders.size === 0}
+          >
+            {pushState.active
+              ? `Pushing… ${pushState.pushed + pushState.failed} / ${pushState.total}`
+              : `→ Push to ShipStation${selectedOrders.size > 0 ? ` (${selectedOrders.size})` : ''}`}
           </button>
         )}
-        {unstageResult && (
-          <span style={{ fontSize: 12, color: '#16a34a', fontWeight: 500 }}>✓ {unstageResult}</span>
-        )}
-      </div>
-
-      {/* Push to ShipStation */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-        <button
-          className="btn btn-primary btn-sm"
-          onClick={handlePushSelected}
-          disabled={pushMut.isPending || selectedOrders.size === 0}
-        >
-          {pushState.active
-            ? `Pushing… ${pushState.pushed + pushState.failed} / ${pushState.total}`
-            : `→ Push to ShipStation${selectedOrders.size > 0 ? ` (${selectedOrders.size})` : ''}`}
-        </button>
         {selectedOrders.size > 0 && (
           <>
             <button
               className="btn btn-danger btn-sm"
               onClick={() => {
                 const ids = sortedFiltered.filter(o => selectedOrders.has(o.shopify_order_id)).map(o => o.shopify_order_id)
-                if (ids.length > 0 && window.confirm(`Remove ${ids.length} order${ids.length !== 1 ? 's' : ''} from staging?`)) {
+                const verb = isCD ? 'Unconfirm' : 'Remove'
+                if (ids.length > 0 && window.confirm(`${verb} ${ids.length} order${ids.length !== 1 ? 's' : ''}?`)) {
                   unstageBulkMut.mutate(ids)
                 }
               }}
               disabled={unstageBulkMut.isPending}
             >
-              {unstageBulkMut.isPending ? 'Removing…' : `✕ Remove from Staging (${selectedOrders.size})`}
+              {unstageBulkMut.isPending
+                ? (isCD ? 'Unconfirming…' : 'Removing…')
+                : isCD
+                  ? `✕ Unconfirm Selected (${selectedOrders.size})`
+                  : `✕ Remove from Staging (${selectedOrders.size})`}
             </button>
             <button className="btn btn-secondary btn-sm" onClick={() => setSelectedOrders(new Set())}>
               Clear Selection
             </button>
           </>
         )}
-        {pushMut.isSuccess && (
+        {!isCD && pushMut.isSuccess && (
           <span style={{ fontSize: 12, color: '#16a34a', fontWeight: 500 }}>
             ✓ {pushMut.data?.pushed ?? 0} pushed
           </span>
         )}
-        {pushMut.isError && (
+        {!isCD && pushMut.isError && (
           <span style={{ fontSize: 12, color: '#dc2626' }}>
             Push failed: {pushMut.error?.response?.data?.detail || pushMut.error?.message || 'Unknown error'}
           </span>
+        )}
+        {isCD && unstageResult && (
+          <span style={{ fontSize: 12, color: '#16a34a', fontWeight: 500 }}>✓ {unstageResult}</span>
         )}
       </div>
 
@@ -577,7 +614,11 @@ function StagedOrdersTab() {
       {isLoading ? (
         <div className="loading">Loading staged orders…</div>
       ) : sortedFiltered.length === 0 ? (
-        <div className="empty">No staged orders{warehouse !== 'all' ? ` for ${warehouse}` : ''}</div>
+        <div className="empty">
+          {isCD
+            ? `No confirmed orders${warehouse !== 'all' ? ` for ${warehouse}` : ''}`
+            : `No staged orders${warehouse !== 'all' ? ` for ${warehouse}` : ''}`}
+        </div>
       ) : (
         <div>
           {PRIORITY_TIERS.map(tier => {
@@ -734,7 +775,7 @@ function StagedOrdersTab() {
                                   onClick={() => unstageSingleMut.mutate(order.shopify_order_id)}
                                   disabled={unstageSingleMut.isPending}
                                 >
-                                  Unstage
+                                  {isCD ? 'Unconfirm' : 'Unstage'}
                                 </button>
                               </td>
                             </tr>
@@ -804,7 +845,8 @@ function StatusBadge({ status, counts }) {
   )
 }
 
-function ShortShipConfigTab() {
+function ShortShipConfigTab({ mode = 'operations', periodId = null }) {
+  const isCD = mode === 'confirmed-demand'
   const qc = useQueryClient()
   const [warehouse, setWarehouse] = useState('walnut')
   const [orderScope, setOrderScope] = useState('staged')
@@ -812,6 +854,7 @@ function ShortShipConfigTab() {
   const [syncMsg, setSyncMsg] = useState(null)
   const [pendingChanges, setPendingChanges] = useState(0)
   const [applyResult, setApplyResult] = useState(null)
+  const [importMsg, setImportMsg] = useState(null)
 
   const { data: productTypes = [], isLoading: loadingTypes } = useQuery({
     queryKey: ['product-types'],
@@ -831,27 +874,90 @@ function ShortShipConfigTab() {
     staleTime: 60000,
   })
 
+  // Confirmed-demand mode: load the period's CD short-ship and inventory-hold sets
+  // and use them as the source of truth instead of `p.allow_short_ship` / `p.inventory_hold`.
+  const { data: cdShortShipRows = [] } = useQuery({
+    queryKey: ['cd-short-ship', periodId],
+    queryFn: () => confirmedDemandConfigsApi.listShortShip(periodId),
+    enabled: isCD && !!periodId,
+  })
+  const { data: cdHoldRows = [] } = useQuery({
+    queryKey: ['cd-inventory-hold', periodId],
+    queryFn: () => confirmedDemandConfigsApi.listInventoryHold(periodId),
+    enabled: isCD && !!periodId,
+  })
+  const cdShortShipSet = useMemo(() => new Set(cdShortShipRows.map(r => r.shopify_sku)), [cdShortShipRows])
+  const cdHoldSet = useMemo(() => new Set(cdHoldRows.map(r => r.shopify_sku)), [cdHoldRows])
+
   const invalidateAll = () => {
-    qc.invalidateQueries(['product-types'])
-    qc.invalidateQueries(['products'])
-    setPendingChanges(c => c + 1)
+    if (isCD) {
+      qc.invalidateQueries({ queryKey: ['cd-short-ship', periodId] })
+      qc.invalidateQueries({ queryKey: ['cd-inventory-hold', periodId] })
+      qc.invalidateQueries({ queryKey: ['projection-confirmed-rollup', periodId] })
+      qc.invalidateQueries({ queryKey: ['confirmed-demand-inventory', periodId] })
+      qc.invalidateQueries(['confirmed-orders-enriched', periodId])
+    } else {
+      qc.invalidateQueries(['product-types'])
+      qc.invalidateQueries(['products'])
+      setPendingChanges(c => c + 1)
+    }
+  }
+
+  // Surface auto-unconfirm cascade from CD config writes. The backend returns
+  // {cascade: {unconfirmed: N, ...}} on every CD short-ship/hold write — when
+  // N>0, the user needs to know to head over to Confirmed Orders and click
+  // "Re-confirm All".
+  const flashCascade = (data) => {
+    const items = Array.isArray(data) ? data : [data]
+    const totalUnconfirmed = items.reduce((sum, x) => sum + (x?.cascade?.unconfirmed || 0), 0)
+    if (totalUnconfirmed > 0) {
+      setImportMsg(`${totalUnconfirmed} confirmed order${totalUnconfirmed !== 1 ? 's' : ''} kicked back — re-confirm them on the Confirmed Orders page`)
+      setTimeout(() => setImportMsg(null), 6000)
+    }
   }
 
   const setShortShipByTypeMut = useMutation({
     mutationFn: ({ product_type, allow_short_ship }) =>
-      productsApi.setShortShipByType({ product_type, allow_short_ship }),
-    onSuccess: invalidateAll,
+      isCD
+        ? confirmedDemandConfigsApi.setShortShipByType(periodId, { product_type, allow_short_ship })
+        : productsApi.setShortShipByType({ product_type, allow_short_ship }),
+    onSuccess: (data) => { invalidateAll(); if (isCD) flashCascade(data) },
   })
 
   const setHoldByTypeMut = useMutation({
     mutationFn: ({ product_type, inventory_hold }) =>
-      productsApi.setInventoryHoldByType({ product_type, inventory_hold }),
-    onSuccess: invalidateAll,
+      isCD
+        ? confirmedDemandConfigsApi.setInventoryHoldByType(periodId, { product_type, inventory_hold })
+        : productsApi.setInventoryHoldByType({ product_type, inventory_hold }),
+    onSuccess: (data) => { invalidateAll(); if (isCD) flashCascade(data) },
   })
 
   const updateProductMut = useMutation({
-    mutationFn: ({ id, ...data }) => productsApi.update(id, data),
-    onSuccess: invalidateAll,
+    mutationFn: ({ id, shopify_sku, ...data }) => {
+      if (!isCD) return productsApi.update(id, data)
+      // CD mode: rewrite the SKU's membership in CD short-ship / hold sets.
+      // Each call swaps in the new state; only one of {short, hold, none} is "on".
+      const want = data.allow_short_ship === true ? 'short_ship'
+        : data.inventory_hold === true ? 'inv_hold'
+        : 'none'
+      const tasks = []
+      // Toggle short-ship membership
+      if (want === 'short_ship') {
+        if (!cdShortShipSet.has(shopify_sku))
+          tasks.push(confirmedDemandConfigsApi.addShortShip(periodId, { shopify_sku }))
+      } else if (cdShortShipSet.has(shopify_sku)) {
+        tasks.push(confirmedDemandConfigsApi.removeShortShip(periodId, shopify_sku))
+      }
+      // Toggle hold membership
+      if (want === 'inv_hold') {
+        if (!cdHoldSet.has(shopify_sku))
+          tasks.push(confirmedDemandConfigsApi.addInventoryHold(periodId, { shopify_sku }))
+      } else if (cdHoldSet.has(shopify_sku)) {
+        tasks.push(confirmedDemandConfigsApi.removeInventoryHold(periodId, shopify_sku))
+      }
+      return Promise.all(tasks)
+    },
+    onSuccess: (data) => { invalidateAll(); if (isCD) flashCascade(data) },
   })
 
   const applyMut = useMutation({
@@ -873,6 +979,29 @@ function ShortShipConfigTab() {
       qc.invalidateQueries(['product-types'])
       qc.invalidateQueries(['products'])
       setTimeout(() => setSyncMsg(null), 4000)
+    },
+  })
+
+  const importShortShipMut = useMutation({
+    mutationFn: () => confirmedDemandConfigsApi.importGlobalShortShip(periodId),
+    onSuccess: (data) => {
+      const cascadeNote = data?.cascade?.unconfirmed > 0
+        ? ` · ${data.cascade.unconfirmed} confirmed orders kicked back`
+        : ''
+      setImportMsg(`Imported ${data.imported} short-ship from Staging (${data.already_existed} already existed)${cascadeNote}`)
+      invalidateAll()
+      setTimeout(() => setImportMsg(null), 6000)
+    },
+  })
+  const importHoldMut = useMutation({
+    mutationFn: () => confirmedDemandConfigsApi.importGlobalInventoryHold(periodId),
+    onSuccess: (data) => {
+      const cascadeNote = data?.cascade?.unconfirmed > 0
+        ? ` · ${data.cascade.unconfirmed} confirmed orders kicked back`
+        : ''
+      setImportMsg(`Imported ${data.imported} hold from Staging (${data.already_existed} already existed)${cascadeNote}`)
+      invalidateAll()
+      setTimeout(() => setImportMsg(null), 6000)
     },
   })
 
@@ -920,10 +1049,37 @@ function ShortShipConfigTab() {
       const hasNegativeEnding = analysisItems.some(a => a.on_hand_qty - a.total_demand < 0)
       const hasPositiveEnding = analysisItems.length > 0 && analysisItems.every(a => a.on_hand_qty - a.total_demand >= 0)
 
+      // In CD mode, override short_ship/inventory_hold counts so they reflect
+      // the period's CD configs, not `shopify_products.*` flags.
+      const overrides = isCD
+        ? (() => {
+            const ssCount = ptProducts.filter(p => cdShortShipSet.has(p.shopify_sku)).length
+            const holdCount = ptProducts.filter(p => cdHoldSet.has(p.shopify_sku)).length
+            return {
+              short_ship_count:    ssCount,
+              all_short_ship:      ptProducts.length > 0 && ssCount === ptProducts.length,
+              inventory_hold_count: holdCount,
+              all_inventory_hold:  ptProducts.length > 0 && holdCount === ptProducts.length,
+            }
+          })()
+        : {}
+
+      // CD mode: per-SKU view of products needs a synthetic
+      // allow_short_ship/inventory_hold derived from CD sets so SkuStatusControl
+      // renders the correct radio.
+      const renderProducts = isCD
+        ? ptProducts.map(p => ({
+            ...p,
+            allow_short_ship: cdShortShipSet.has(p.shopify_sku),
+            inventory_hold:   cdHoldSet.has(p.shopify_sku),
+          }))
+        : ptProducts
+
       return {
         ...pt,
+        ...overrides,
         label,
-        ptProducts,
+        ptProducts: renderProducts,
         pickSkus,
         analysisItems,
         hasStagedDemand,
@@ -962,7 +1118,7 @@ function ShortShipConfigTab() {
     }
 
     return [...fromProductTypes, ...unlinked]
-  }, [analysis, allProducts, productTypes])
+  }, [analysis, allProducts, productTypes, isCD, cdShortShipSet, cdHoldSet])
 
   // Check for mutual exclusivity conflicts
   const conflicts = ptData.filter(pt => pt.short_ship_count > 0 && pt.inventory_hold_count > 0)
@@ -1030,8 +1186,8 @@ function ShortShipConfigTab() {
         </span>
       </div>
 
-      {/* Unsaved changes banner */}
-      {pendingChanges > 0 && (
+      {/* Unsaved changes banner — operations only (CD writes are immediate) */}
+      {!isCD && pendingChanges > 0 && (
         <div className="staging-apply-banner">
           <span>
             ⚠ {pendingChanges} unsaved change{pendingChanges !== 1 ? 's' : ''} — config saved but not yet applied to orders
@@ -1039,24 +1195,48 @@ function ShortShipConfigTab() {
         </div>
       )}
 
-      {/* Apply to Orders button — always visible */}
-      <div style={{ marginBottom: 16 }}>
-        <button
-          className="btn btn-primary btn-sm"
-          onClick={() => applyMut.mutate()}
-          disabled={applyMut.isPending}
-        >
-          {applyMut.isPending ? 'Applying…' : '▶ Apply to Orders'}
-        </button>
-        {pendingChanges > 0 && (
-          <span style={{ marginLeft: 8, fontSize: 12, color: '#f59e0b' }}>
-            {pendingChanges} pending change{pendingChanges !== 1 ? 's' : ''}
-          </span>
+      {/* Apply to Orders (operations) / Import from Staging (CD) */}
+      <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        {!isCD ? (
+          <>
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={() => applyMut.mutate()}
+              disabled={applyMut.isPending}
+            >
+              {applyMut.isPending ? 'Applying…' : '▶ Apply to Orders'}
+            </button>
+            {pendingChanges > 0 && (
+              <span style={{ fontSize: 12, color: '#f59e0b' }}>
+                {pendingChanges} pending change{pendingChanges !== 1 ? 's' : ''}
+              </span>
+            )}
+          </>
+        ) : (
+          <>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => importShortShipMut.mutate()}
+              disabled={importShortShipMut.isPending || !periodId}
+              title="Copy current Staging short-ship flags into this period (one-way snapshot)"
+            >
+              {importShortShipMut.isPending ? 'Importing…' : '⇣ Import Short-Ship from Staging'}
+            </button>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => importHoldMut.mutate()}
+              disabled={importHoldMut.isPending || !periodId}
+              title="Copy current Staging inventory-hold flags into this period (one-way snapshot)"
+            >
+              {importHoldMut.isPending ? 'Importing…' : '⇣ Import Hold from Staging'}
+            </button>
+            {importMsg && <span style={{ fontSize: 12, color: '#16a34a' }}>{importMsg}</span>}
+          </>
         )}
       </div>
 
       {/* Apply result */}
-      {applyResult && pendingChanges === 0 && (
+      {!isCD && applyResult && pendingChanges === 0 && (
         <div className="success-banner" style={{ marginBottom: 16 }}>
           ✓ Applied
           {(applyResult.orders_unstaged ?? 0) > 0 && ` — ${applyResult.orders_unstaged} order${applyResult.orders_unstaged !== 1 ? 's' : ''} unstaged (short ship)`}
@@ -1134,18 +1314,22 @@ function ShortShipConfigTab() {
             <div className="inv-dash-panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               <span>All Product Types</span>
               <span style={{ fontSize: 11, color: '#9ca3af', fontWeight: 400 }}>
-                Configure short ship / inventory hold · demand from {orderScope === 'staged' ? 'staged' : 'all open'} orders
+                {isCD
+                  ? 'Configure short ship / inventory hold for this period · demand from staged orders'
+                  : `Configure short ship / inventory hold · demand from ${orderScope === 'staged' ? 'staged' : 'all open'} orders`}
               </span>
               <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
                 {syncMsg && <span style={{ fontSize: 12, color: '#16a34a' }}>{syncMsg}</span>}
-                <button
-                  className="btn btn-secondary"
-                  style={{ fontSize: 12, padding: '3px 10px' }}
-                  onClick={() => syncMut.mutate()}
-                  disabled={syncMut.isPending}
-                >
-                  {syncMut.isPending ? 'Syncing…' : '↺ Sync Products'}
-                </button>
+                {!isCD && (
+                  <button
+                    className="btn btn-secondary"
+                    style={{ fontSize: 12, padding: '3px 10px' }}
+                    onClick={() => syncMut.mutate()}
+                    disabled={syncMut.isPending}
+                  >
+                    {syncMut.isPending ? 'Syncing…' : '↺ Sync Products'}
+                  </button>
+                )}
               </div>
             </div>
 
@@ -1220,11 +1404,12 @@ function ShortShipConfigTab() {
                               <SkuStatusControl
                                 skuStatus={skuSt}
                                 onSet={(status) => {
-                                  if (status === 'short_ship') updateProductMut.mutate({ id: p.id, allow_short_ship: true })
-                                  else if (status === 'inv_hold') updateProductMut.mutate({ id: p.id, inventory_hold: true })
+                                  const base = { id: p.id, shopify_sku: p.shopify_sku }
+                                  if (status === 'short_ship') updateProductMut.mutate({ ...base, allow_short_ship: true })
+                                  else if (status === 'inv_hold') updateProductMut.mutate({ ...base, inventory_hold: true })
                                   else {
                                     // Clear both
-                                    updateProductMut.mutate({ id: p.id, allow_short_ship: false, inventory_hold: false })
+                                    updateProductMut.mutate({ ...base, allow_short_ship: false, inventory_hold: false })
                                   }
                                 }}
                                 disabled={updateProductMut.isPending}
@@ -1596,13 +1781,19 @@ function FilterCSection({ filterCA, filterCB, onShortShip, onHold, onClear, isPe
 
 // ── Tab: Inventory Hold Orders ───────────────────────────────────────────────
 
-function InventoryHoldTab() {
+function InventoryHoldTab({ mode = 'operations', periodId = null }) {
+  const isCD = mode === 'confirmed-demand'
   const [warehouse, setWarehouse] = useState('walnut')
 
   const { data: allOrders = [], isLoading } = useQuery({
-    queryKey: ['orders', { app_status: 'not_processed' }],
-    queryFn: () => ordersApi.list({ app_status: 'not_processed' }),
+    queryKey: isCD
+      ? ['confirmed-orders-enriched', periodId]
+      : ['orders', { app_status: 'not_processed' }],
+    queryFn: () => isCD
+      ? projectionConfirmedOrdersApi.listEnriched(periodId)
+      : ordersApi.list({ app_status: 'not_processed' }),
     staleTime: 30000,
+    enabled: !isCD || !!periodId,
   })
 
   // Filter to orders that have at least one inventory_hold line item
@@ -1711,7 +1902,7 @@ function InventoryHoldTab() {
 
 // ── Tab 4: Catalog Errors Dashboard ──────────────────────────────────────────
 
-function CatalogErrorsTab() {
+function CatalogErrorsTab({ mode = 'operations' }) {
   const { data, isLoading, refetch, isFetching } = useQuery({
     queryKey: ['catalog-errors'],
     queryFn: () => productsApi.catalogErrors(),
@@ -1895,7 +2086,7 @@ function CatalogErrorsTab() {
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
-const TABS = [
+const OPS_TABS = [
   { key: 'staged-orders', label: 'Staged Orders' },
   { key: 'inventory-hold', label: 'Inventory Hold' },
   { key: 'inventory', label: 'Inventory' },
@@ -1903,19 +2094,41 @@ const TABS = [
   { key: 'catalog-errors', label: '⚠ Catalog Errors' },
 ]
 
-export default function StagingPage({ mode = 'operations' }) {
-  const [activeTab, setActiveTab] = useState('staged-orders')
+const CD_TABS = [
+  { key: 'staged-orders', label: 'Confirmed Orders' },
+  { key: 'inventory-hold', label: 'Inventory Hold' },
+  { key: 'inventory', label: 'Inventory' },
+  { key: 'short-ship', label: 'Short Ship / Hold Config' },
+  { key: 'catalog-errors', label: '⚠ Catalog Errors' },
+]
+
+export default function StagingPage({
+  mode = 'operations',
+  periodId = null,
+  header = null,         // Custom header element to render in place of the default
+  defaultTab = 'staged-orders',
+}) {
+  const isCD = mode === 'confirmed-demand'
+  const [activeTab, setActiveTab] = useState(defaultTab)
+  const tabs = isCD ? CD_TABS : OPS_TABS
+  const needsPeriod = isCD && !periodId
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Staging Dashboard</h1>
-        <p>View staged orders, inventory status, short ship and inventory hold configuration.</p>
-      </div>
+      {header || (
+        <div className="page-header">
+          <h1>{isCD ? 'Confirmed Demand Dashboard' : 'Staging Dashboard'}</h1>
+          <p>
+            {isCD
+              ? "View confirmed orders, inventory status, and short-ship / inventory-hold configuration. This dashboard's short-ship/hold config drives the confirmed-demand rollup and the Confirmed Orders view for the same period — independent of Staging."
+              : 'View staged orders, inventory status, short ship and inventory hold configuration.'}
+          </p>
+        </div>
+      )}
 
       {/* Top-level tabs */}
       <div className="staging-tabs">
-        {TABS.map(tab => (
+        {tabs.map(tab => (
           <button
             key={tab.key}
             className={`staging-tab${activeTab === tab.key ? ' active' : ''}`}
@@ -1928,11 +2141,19 @@ export default function StagingPage({ mode = 'operations' }) {
 
       {/* Tab content */}
       <div style={{ marginTop: 24 }}>
-        {activeTab === 'staged-orders' && <StagedOrdersTab />}
-        {activeTab === 'inventory-hold' && <InventoryHoldTab />}
-        {activeTab === 'inventory' && <InventoryDashboard />}
-        {activeTab === 'short-ship' && <ShortShipConfigTab />}
-        {activeTab === 'catalog-errors' && <CatalogErrorsTab />}
+        {needsPeriod && activeTab !== 'catalog-errors' ? (
+          <div className="empty" style={{ padding: 24, color: '#6b7280' }}>
+            Select a projection period to view this tab.
+          </div>
+        ) : (
+          <>
+            {activeTab === 'staged-orders' && <StagedOrdersTab mode={mode} periodId={periodId} />}
+            {activeTab === 'inventory-hold' && <InventoryHoldTab mode={mode} periodId={periodId} />}
+            {activeTab === 'inventory' && <InventoryDashboard mode={mode} periodId={periodId} />}
+            {activeTab === 'short-ship' && <ShortShipConfigTab mode={mode} periodId={periodId} />}
+            {activeTab === 'catalog-errors' && <CatalogErrorsTab mode={mode} />}
+          </>
+        )}
       </div>
     </div>
   )

@@ -108,6 +108,8 @@ def delete_period(period_id: int, db: Session = Depends(get_db)):
     # Delete associated configs + confirmed-order join rows
     db.query(models.PeriodShortShipConfig).filter(models.PeriodShortShipConfig.period_id == period_id).delete()
     db.query(models.PeriodInventoryHoldConfig).filter(models.PeriodInventoryHoldConfig.period_id == period_id).delete()
+    db.query(models.ConfirmedDemandShortShipConfig).filter(models.ConfirmedDemandShortShipConfig.period_id == period_id).delete()
+    db.query(models.ConfirmedDemandInventoryHoldConfig).filter(models.ConfirmedDemandInventoryHoldConfig.period_id == period_id).delete()
     db.query(models.ProjectionPeriodConfirmedOrder).filter(models.ProjectionPeriodConfirmedOrder.period_id == period_id).delete()
     db.delete(period)
     db.commit()

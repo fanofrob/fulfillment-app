@@ -1,7 +1,7 @@
 """
 Live-preview mapping override service.
 
-Used by the Projection Orders page to show what an order's pick SKUs and
+Used by the Confirmed Orders page to show what an order's pick SKUs and
 fulfillment plan would look like under a different SKU mapping sheet tab,
 without writing anything to the database.
 
@@ -9,6 +9,12 @@ The override is a *view* — every function here returns synthetic structures
 derived from the selected mapping tab combined with the order's persisted
 Shopify-side data. Stored ShopifyLineItem.pick_sku and FulfillmentPlan rows
 are never modified.
+
+Period status overrides (short-ship / inventory-hold) read from the
+*Confirmed Demand Dashboard* configs, so toggles made on that dashboard
+flow through to the Confirmed Orders view of the same period. The
+projection-forecast-only `PeriodShortShipConfig` / `PeriodInventoryHoldConfig`
+tables are NOT consulted here.
 """
 from __future__ import annotations
 from typing import Optional
@@ -31,44 +37,81 @@ def _load_mapping_lookup(mapping_tab: str) -> dict:
         return {}
 
 
-def build_override_line_items(
-    shopify_order_id: str,
-    mapping_tab: str,
+def _load_period_status_skus(
+    period_id: int, db: Session
+) -> tuple[set[str], set[str]]:
+    """Return (short_ship_skus, inventory_hold_skus) from the period's
+    Confirmed Demand Dashboard configs."""
+    short = {
+        r.shopify_sku for r in
+        db.query(models.ConfirmedDemandShortShipConfig.shopify_sku)
+        .filter(models.ConfirmedDemandShortShipConfig.period_id == period_id)
+        .all()
+    }
+    hold = {
+        r.shopify_sku for r in
+        db.query(models.ConfirmedDemandInventoryHoldConfig.shopify_sku)
+        .filter(models.ConfirmedDemandInventoryHoldConfig.period_id == period_id)
+        .all()
+    }
+    return short, hold
+
+
+def apply_period_status_overrides(
+    line_items: list[models.ShopifyLineItem],
+    period_id: Optional[int],
     db: Session,
+) -> None:
+    """
+    Mutate `app_line_status` in-place on each line item based on the period's
+    short-ship / inventory-hold configs. No-op when period_id is falsy.
+
+    Override semantics (replaces, not merges, the stamped global value):
+      - shopify_sku in period short-ship list → 'short_ship'
+      - shopify_sku in period inventory-hold list → 'inventory_hold'
+      - otherwise → None  (clears anything stamped from the global config)
+      - 'removed' is preserved — never overwritten
+
+    Safety: relies on SessionLocal(autocommit=False, autoflush=False) — these
+    ORM-level attribute mutations stay in-memory and never persist unless the
+    request handler explicitly calls db.commit(). All GET handlers that call
+    this helper are read-only and never commit.
+    """
+    if not period_id:
+        return
+    short_skus, hold_skus = _load_period_status_skus(period_id, db)
+    for li in line_items:
+        if li.app_line_status == "removed":
+            continue
+        sku = li.shopify_sku
+        if sku and sku in short_skus:
+            li.app_line_status = "short_ship"
+        elif sku and sku in hold_skus:
+            li.app_line_status = "inventory_hold"
+        else:
+            li.app_line_status = None
+
+
+def _resolve_rows(
+    line_items: list[models.ShopifyLineItem],
+    sku_lookup: dict,
 ) -> list[dict]:
     """
-    Return synthetic line-item rows for one order, re-resolved against `mapping_tab`.
+    Core re-resolution: turn ShopifyLineItem rows into synthetic dicts under
+    the supplied mapping `sku_lookup`. Caller is responsible for any period
+    status mutation prior to calling.
 
-    Output shape mirrors the fields _compute_multi_box_split needs to read off
-    each ShopifyLineItem so the result can be passed in as `line_items_override`.
+    ShopifyLineItem rows are *already exploded* in the DB — a single Shopify
+    line item mapped to N pick SKUs under the warehouse default is stored as
+    N rows. Dedupe by line_item_id first so we re-resolve each unique Shopify
+    line item once; otherwise the override would multiply N (stored) × M
+    (override) components.
 
-    Important: ShopifyLineItem rows are *already exploded* in the DB — a single
-    Shopify line item that maps to N pick SKUs under the warehouse default is
-    stored as N rows (one per component). We deduplicate by line_item_id first,
-    then re-resolve each unique Shopify line item against the override mapping.
-    Otherwise the override would multiply N (stored components) × M (override
-    components), inflating quantities Nx.
-
-    Each Shopify line item explodes into 1+ override rows — one per (pick_sku)
-    component in the tab's mapping. A "no_bundle" entry yields zero rows
-    (treated as unmapped).
+    Each Shopify line item explodes into 1+ override rows — one per pick_sku
+    component in the tab's mapping. A "no_bundle" entry yields zero rows.
     """
-    sku_lookup = _load_mapping_lookup(mapping_tab)
-    if not sku_lookup:
-        return []
-
-    raw_lis = (
-        db.query(models.ShopifyLineItem)
-        .filter(models.ShopifyLineItem.shopify_order_id == shopify_order_id)
-        .all()
-    )
-
-    # Dedupe by line_item_id — keep the first row seen. All exploded rows for
-    # one line item share shopify_sku / quantity / fulfillable_quantity / etc.,
-    # so the choice of representative doesn't matter as long as we don't iterate
-    # all of them.
     by_line_id: dict[str, models.ShopifyLineItem] = {}
-    for li in raw_lis:
+    for li in line_items:
         if li.line_item_id and li.line_item_id not in by_line_id:
             by_line_id[li.line_item_id] = li
 
@@ -82,7 +125,7 @@ def build_override_line_items(
             if not pick_sku or entry.get("no_bundle"):
                 continue
             out.append({
-                "shopify_order_id": shopify_order_id,
+                "shopify_order_id": li.shopify_order_id,
                 "line_item_id": li_id,
                 "shopify_sku": li.shopify_sku,
                 "product_title": li.product_title,
@@ -94,6 +137,76 @@ def build_override_line_items(
                 "app_line_status": li.app_line_status,
             })
     return out
+
+
+def build_override_line_items(
+    shopify_order_id: str,
+    mapping_tab: str,
+    db: Session,
+    period_id: Optional[int] = None,
+) -> list[dict]:
+    """
+    Return synthetic line-item rows for one order, re-resolved against `mapping_tab`.
+
+    Output shape mirrors the fields _compute_multi_box_split needs to read off
+    each ShopifyLineItem so the result can be passed in as `line_items_override`.
+
+    When `period_id` is provided, each underlying ShopifyLineItem's
+    `app_line_status` is rewritten in-memory via apply_period_status_overrides
+    *before* the synthetic dicts are emitted, so callers see period-specific
+    short-ship / inventory-hold semantics on the resulting `app_line_status`
+    field.
+    """
+    sku_lookup = _load_mapping_lookup(mapping_tab)
+    if not sku_lookup:
+        return []
+
+    raw_lis = (
+        db.query(models.ShopifyLineItem)
+        .filter(models.ShopifyLineItem.shopify_order_id == shopify_order_id)
+        .all()
+    )
+    apply_period_status_overrides(raw_lis, period_id, db)
+    return _resolve_rows(raw_lis, sku_lookup)
+
+
+def build_override_cogs_rows(
+    line_items: list[models.ShopifyLineItem],
+    mapping_tab: str,
+) -> Optional[list[dict]]:
+    """
+    Re-resolve already-loaded `line_items` against `mapping_tab` for the COGS
+    side of GM% calculation. Returns None when the tab fails to load (caller
+    should fall back to stored pick_sku/mix_quantity), or a list otherwise.
+
+    Caller is responsible for having already mutated `line_items` via
+    apply_period_status_overrides if a period override is in effect — the
+    returned dicts carry the post-override `app_line_status` through.
+
+    The output shape matches build_override_line_items but consumes pre-loaded
+    rows so the caller's existing DB query can be reused.
+    """
+    sku_lookup = _load_mapping_lookup(mapping_tab)
+    if not sku_lookup:
+        return None
+    return _resolve_rows(line_items, sku_lookup)
+
+
+def build_override_cogs_rows_for_orders(
+    line_items_by_order: dict[str, list[models.ShopifyLineItem]],
+    mapping_tab: str,
+) -> Optional[dict[str, list[dict]]]:
+    """
+    Batch variant of build_override_cogs_rows. Loads the mapping lookup once
+    (cached) and re-resolves each order's line items independently.
+
+    Returns None when the tab fails to load. Each order key maps to a (possibly
+    empty) list of synthetic rows.
+    """
+    sku_lookup = _load_mapping_lookup(mapping_tab)
+    if not sku_lookup:
+        return None
+    return {oid: _resolve_rows(lis, sku_lookup) for oid, lis in line_items_by_order.items()}
 
 
 def override_response_line_items(

@@ -57,12 +57,16 @@ def _build_order_response(
     plan_box_unmatched: bool = False,
     has_plan_mismatch: bool = False,
     mapping_tab_override: Optional[str] = None,
+    period_id_override: Optional[int] = None,
 ) -> schemas.ShopifyOrderOut:
     line_items = (
         db.query(models.ShopifyLineItem)
         .filter(models.ShopifyLineItem.shopify_order_id == order.shopify_order_id)
         .all()
     )
+    # Period override mutates app_line_status in-memory only — see
+    # mapping_override.apply_period_status_overrides for safety notes.
+    mapping_override.apply_period_status_overrides(line_items, period_id_override, db)
 
     # Build shopify_sku → product_type lookup from the product catalog
     skus = {li.shopify_sku for li in line_items if li.shopify_sku}
@@ -206,6 +210,7 @@ def list_orders(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=2000),
     mapping_tab: Optional[str] = Query(None, description="Re-resolve line item pick SKUs against this sheet tab (preview, no DB writes)"),
+    period_id: Optional[int] = Query(None, description="Apply this projection period's short-ship/inventory-hold configs as in-memory overrides on app_line_status (no DB writes)"),
     db: Session = Depends(get_db),
 ):
     q = db.query(models.ShopifyOrder)
@@ -247,7 +252,8 @@ def list_orders(
             .distinct()
             .all()
         }
-        # Orders where a plan exists but at least one pending box has no box_type assigned
+        # Orders where a plan exists but at least one pending box has no box_type assigned.
+        # Excludes orders with nothing to ship (filtered below using `needed`).
         unmatched_order_ids = {
             row[0] for row in db.query(models.FulfillmentPlan.shopify_order_id)
             .join(models.FulfillmentBox, models.FulfillmentBox.plan_id == models.FulfillmentPlan.id)
@@ -345,6 +351,12 @@ def list_orders(
                 boxed[bi.shopify_order_id][bi.pick_sku] = (
                     boxed[bi.shopify_order_id].get(bi.pick_sku, 0.0) + bi.quantity
                 )
+            # Orders with nothing to ship (everything short-shipped, fulfilled, or unmapped):
+            # they're absent from `needed` after both the direct-pick and mix-item passes.
+            # Don't flag them with "No Box Rule" — they have no real plan issue.
+            shippable_order_ids = set(needed.keys())
+            unmatched_order_ids = {oid for oid in unmatched_order_ids if oid in shippable_order_ids}
+
             # Flag orders with any under-coverage or over-coverage
             for oid, skus in needed.items():
                 order_boxed = boxed.get(oid, {})
@@ -368,6 +380,7 @@ def list_orders(
             plan_box_unmatched=o.shopify_order_id in unmatched_order_ids,
             has_plan_mismatch=o.shopify_order_id in mismatch_order_ids,
             mapping_tab_override=mapping_tab,
+            period_id_override=period_id,
         )
         for o in orders
     ]
@@ -392,7 +405,12 @@ def list_archived_orders(
 
 
 @router.get("/margins")
-def get_batch_margins(ids: str = Query(..., description="Comma-separated shopify_order_ids"), db: Session = Depends(get_db)):
+def get_batch_margins(
+    ids: str = Query(..., description="Comma-separated shopify_order_ids"),
+    period_id: Optional[int] = Query(None, description="Apply this projection period's short-ship/inventory-hold configs as in-memory overrides on app_line_status (no DB writes)"),
+    mapping_tab: Optional[str] = Query(None, description="Re-resolve line item pick SKUs / mix_quantity against this sheet tab for COGS calculation (preview, no DB writes). Revenue is unaffected."),
+    db: Session = Depends(get_db),
+):
     """
     Batch compute gross_margin_pct for multiple orders.
     Returns {shopify_order_id: float | null}.
@@ -423,9 +441,20 @@ def get_batch_margins(ids: str = Query(..., description="Comma-separated shopify
     all_line_items = db.query(models.ShopifyLineItem).filter(
         models.ShopifyLineItem.shopify_order_id.in_(order_ids)
     ).all()
+    # Period override mutates app_line_status in-memory only — see
+    # mapping_override.apply_period_status_overrides for safety notes.
+    mapping_override.apply_period_status_overrides(all_line_items, period_id, db)
     li_by_order: dict = {}
     for li in all_line_items:
         li_by_order.setdefault(li.shopify_order_id, []).append(li)
+
+    # Mapping-tab override: re-resolve pick_sku/mix_quantity for COGS only.
+    # Returns None when the tab fails to load → fall back to stored values.
+    cogs_by_order: Optional[dict] = None
+    if mapping_tab:
+        cogs_by_order = mapping_override.build_override_cogs_rows_for_orders(
+            li_by_order, mapping_tab
+        )
 
     all_plans = db.query(models.FulfillmentPlan).filter(
         models.FulfillmentPlan.shopify_order_id.in_(order_ids),
@@ -550,26 +579,36 @@ def get_batch_margins(ids: str = Query(..., description="Comma-separated shopify
             ship_unfulfilled = paid_shipping if revenue_gross > 0 else 0.0
         rev_total_unfulfilled = rev_net_unfulfilled + ship_unfulfilled
 
-        # Fruit / SKU cost (unfulfilled items only)
+        # Fruit / SKU cost (unfulfilled items only) — uses override rows when
+        # mapping_tab is set so the COGS reflects the override pick_sku/mix.
+        if cogs_by_order is not None:
+            cogs_items = cogs_by_order.get(order_id, [])
+            def _cg(li, k): return li.get(k)
+        else:
+            cogs_items = line_items
+            def _cg(li, k): return getattr(li, k)
+
         fruit_cost = 0.0
         missing_cost_skus: set = set()
-        for li in line_items:
-            if li.app_line_status in ("short_ship", "removed") or not li.pick_sku:
+        for li in cogs_items:
+            pick_sku = _cg(li, "pick_sku")
+            if _cg(li, "app_line_status") in ("short_ship", "removed") or not pick_sku:
                 continue
-            orig_qty_b = li.quantity or 1
-            fq_b = li.fulfillable_quantity if li.fulfillable_quantity is not None else orig_qty_b
+            orig_qty_b = _cg(li, "quantity") or 1
+            fq_attr = _cg(li, "fulfillable_quantity")
+            fq_b = fq_attr if fq_attr is not None else orig_qty_b
             if fq_b <= 0:
                 continue
-            sku_rec = picklist_map.get(li.pick_sku)
+            sku_rec = picklist_map.get(pick_sku)
             if not sku_rec or sku_rec.weight_lb is None:
                 continue
             cost_per_lb = sku_rec.cost_per_lb
             if cost_per_lb is None and sku_rec.cost_per_case is not None and sku_rec.case_weight_lb:
                 cost_per_lb = sku_rec.cost_per_case / sku_rec.case_weight_lb
             if cost_per_lb is None:
-                missing_cost_skus.add(li.pick_sku)
+                missing_cost_skus.add(pick_sku)
                 continue
-            mix = li.mix_quantity or 1.0
+            mix = _cg(li, "mix_quantity") or 1.0
             fruit_cost += sku_rec.weight_lb * mix * fq_b * cost_per_lb
 
         # Shipping estimate (unshipped boxes only)
@@ -656,6 +695,7 @@ def get_batch_margins(ids: str = Query(..., description="Comma-separated shopify
 def get_order(
     shopify_order_id: str,
     mapping_tab: Optional[str] = Query(None, description="Re-resolve line item pick SKUs against this sheet tab (preview, no DB writes)"),
+    period_id: Optional[int] = Query(None, description="Apply this projection period's short-ship/inventory-hold configs as in-memory overrides on app_line_status (no DB writes)"),
     db: Session = Depends(get_db),
 ):
     order = db.query(models.ShopifyOrder).filter(
@@ -683,6 +723,7 @@ def get_order(
         plan_box_unmatched=plan_box_unmatched,
         has_plan_mismatch=has_plan_mismatch,
         mapping_tab_override=mapping_tab,
+        period_id_override=period_id,
     )
 
 
@@ -1990,7 +2031,12 @@ def _estimate_box_shipping(box, box_type, order, carrier_match, zone, db) -> dic
 
 
 @router.get("/{shopify_order_id}/margin")
-def get_order_margin(shopify_order_id: str, db: Session = Depends(get_db)):
+def get_order_margin(
+    shopify_order_id: str,
+    period_id: Optional[int] = Query(None, description="Apply this projection period's short-ship/inventory-hold configs as in-memory overrides on app_line_status (no DB writes)"),
+    mapping_tab: Optional[str] = Query(None, description="Re-resolve line item pick SKUs / mix_quantity against this sheet tab for COGS calculation (preview, no DB writes). Revenue is unaffected."),
+    db: Session = Depends(get_db),
+):
     """
     Split gross margin breakdown for an order — separate calculations for:
       - to_fulfill:          items with fulfillable_quantity > 0 (live costs)
@@ -2011,6 +2057,23 @@ def get_order_margin(shopify_order_id: str, db: Session = Depends(get_db)):
     line_items = db.query(models.ShopifyLineItem).filter(
         models.ShopifyLineItem.shopify_order_id == shopify_order_id
     ).all()
+    # Period override mutates app_line_status in-memory only — see
+    # mapping_override.apply_period_status_overrides for safety notes.
+    mapping_override.apply_period_status_overrides(line_items, period_id, db)
+
+    # Mapping tab override: re-resolve pick_sku/mix_quantity for COGS only.
+    # Revenue is per-Shopify-line-item and doesn't depend on the warehouse
+    # mapping, so it always reads from the original line_items.
+    cogs_rows: Optional[list] = None
+    if mapping_tab:
+        cogs_rows = mapping_override.build_override_cogs_rows(line_items, mapping_tab)
+    if cogs_rows is not None:
+        def _cg(li, k):
+            return li.get(k)
+    else:
+        cogs_rows = line_items
+        def _cg(li, k):
+            return getattr(li, k)
 
     # ── Determine which fulfilled line items were fulfilled via the app ───────
     # A line item is "fulfilled via app" if there are BoxLineItem records that
@@ -2156,40 +2219,46 @@ def get_order_margin(shopify_order_id: str, db: Session = Depends(get_db)):
     revenue_total = rev_net_unfulfilled + rev_net_app + rev_net_ext + paid_shipping
 
     # ── COGS: Fruit / SKU cost (unfulfilled — live data) ─────────────────────
+    # Reads from `cogs_rows` so the mapping_tab override (when present) picks
+    # the override's pick_sku + mix_quantity. Revenue calculations above stay
+    # on `line_items` since revenue is mapping-independent.
     picklist_map = {r.pick_sku: r for r in db.query(models.PicklistSku).all()}
 
     sku_weights: dict = {}
-    for li in line_items:
-        if li.pick_sku and li.app_line_status not in ("short_ship", "removed"):
-            sku_rec = picklist_map.get(li.pick_sku)
+    for li in cogs_rows:
+        pick_sku = _cg(li, "pick_sku")
+        if pick_sku and _cg(li, "app_line_status") not in ("short_ship", "removed"):
+            sku_rec = picklist_map.get(pick_sku)
             if sku_rec and sku_rec.weight_lb:
-                sku_weights[li.pick_sku] = sku_rec.weight_lb
+                sku_weights[pick_sku] = sku_rec.weight_lb
 
     fruit_cost_unfulfilled = 0.0
     fruit_lines = []
     missing_cost_skus: list = []
-    for li in line_items:
-        if li.app_line_status in ("short_ship", "removed") or not li.pick_sku:
+    for li in cogs_rows:
+        pick_sku = _cg(li, "pick_sku")
+        if _cg(li, "app_line_status") in ("short_ship", "removed") or not pick_sku:
             continue
-        orig_qty_fc = li.quantity or 1
-        unfulfilled_qty = li.fulfillable_quantity if li.fulfillable_quantity is not None else orig_qty_fc
+        orig_qty_fc = _cg(li, "quantity") or 1
+        fq_attr = _cg(li, "fulfillable_quantity")
+        unfulfilled_qty = fq_attr if fq_attr is not None else orig_qty_fc
         if unfulfilled_qty <= 0:
             continue
-        sku_rec = picklist_map.get(li.pick_sku)
+        sku_rec = picklist_map.get(pick_sku)
         if not sku_rec or sku_rec.weight_lb is None:
             continue
         cost_per_lb = sku_rec.cost_per_lb
         if cost_per_lb is None and sku_rec.cost_per_case is not None and sku_rec.case_weight_lb:
             cost_per_lb = sku_rec.cost_per_case / sku_rec.case_weight_lb
         if cost_per_lb is None:
-            if li.pick_sku not in missing_cost_skus:
-                missing_cost_skus.append(li.pick_sku)
+            if pick_sku not in missing_cost_skus:
+                missing_cost_skus.append(pick_sku)
             continue
-        mix = li.mix_quantity or 1.0
+        mix = _cg(li, "mix_quantity") or 1.0
         line_cost = sku_rec.weight_lb * mix * unfulfilled_qty * cost_per_lb
         fruit_cost_unfulfilled += line_cost
         fruit_lines.append({
-            "pick_sku": li.pick_sku, "qty": unfulfilled_qty, "mix": mix,
+            "pick_sku": pick_sku, "qty": unfulfilled_qty, "mix": mix,
             "weight_lb": sku_rec.weight_lb, "cost_per_lb": round(cost_per_lb, 4),
             "line_cost": round(line_cost, 2),
         })

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import OrdersPage from '../components/orders/OrdersPage'
 
-export default function ProjectionOrders() {
+export default function ConfirmedOrders() {
   const [periodId, setPeriodId] = useState(null)
   const [mappingTab, setMappingTab] = useState('')
 

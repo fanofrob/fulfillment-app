@@ -125,8 +125,14 @@ export const ordersApi = {
   unstageBatch: (order_ids) => api.post('/orders/unstage-batch', { order_ids }).then(r => r.data),
   unstagePlanIssues: () => api.post('/orders/unstage-plan-issues').then(r => r.data),
   recompute: (body = {}) => api.post('/orders/recompute', body, { timeout: 180000 }).then(r => r.data),
-  getMargin: (id) => api.get(`/orders/${id}/margin`).then(r => r.data),
-  getBatchMargins: (ids) => api.get('/orders/margins', { params: { ids: ids.join(',') } }).then(r => r.data),
+  getMargin: (id, params) => api.get(`/orders/${id}/margin`, { params }).then(r => r.data),
+  getBatchMargins: (ids, periodId, mappingTab) => api.get('/orders/margins', {
+    params: {
+      ids: ids.join(','),
+      ...(periodId ? { period_id: periodId } : {}),
+      ...(mappingTab ? { mapping_tab: mappingTab } : {}),
+    },
+  }).then(r => r.data),
   listArchived: () => api.get('/orders/archived').then(r => r.data),
   cancelOrder: (id) => api.post(`/orders/${id}/cancel`).then(r => r.data),
   bulkCancelSSBoxesPreview: (order_ids) => api.post('/orders/bulk-cancel-shipstation-boxes/preview', { order_ids }).then(r => r.data),
@@ -222,10 +228,50 @@ export const projectionConfirmedOrdersApi = {
   list: (periodId) => api.get(`/projection-periods/${periodId}/confirmed-orders`).then(r => r.data),
   confirmOrders: (periodId, data) => api.post(`/projection-periods/${periodId}/confirm-orders`, data).then(r => r.data),
   unconfirmOrders: (periodId, data) => api.post(`/projection-periods/${periodId}/unconfirm-orders`, data).then(r => r.data),
+  reConfirmAll: (periodId, data) => api.post(`/projection-periods/${periodId}/re-confirm-all`, data).then(r => r.data),
   getRollup: (periodId) => api.get(`/projection-periods/${periodId}/confirmed-demand-rollup`).then(r => r.data),
   saveConfirmedDemand: (periodId) => api.post(`/projection-periods/${periodId}/save-confirmed-demand`).then(r => r.data),
   revertConfirmedDemand: (periodId) => api.post(`/projection-periods/${periodId}/revert-confirmed-demand`).then(r => r.data),
   getStagedBlocking: (periodId) => api.get(`/projection-periods/${periodId}/staged-orders-blocking`).then(r => r.data),
+  // Inventory pivot scoped to confirmed demand for the period (respects this dashboard's short-ship/hold)
+  getInventory: (periodId) => api.get(`/projection-periods/${periodId}/confirmed-demand-inventory`).then(r => r.data),
+  // Confirmed orders enriched with ShopifyOrder fields + line items, matching the staged-orders shape
+  listEnriched: (periodId) => api.get(`/projection-periods/${periodId}/confirmed-orders/enriched`).then(r => r.data),
+}
+
+// Confirmed Demand Dashboard's per-period short-ship / inventory-hold configs.
+// Drives the confirmed-demand rollup, the dashboard's own views, AND the
+// Confirmed Orders page (orders awaiting confirmation for the same period).
+// Independent of Operations (shopify_products) and the projection forecast
+// engine (period_*_configs).
+export const confirmedDemandConfigsApi = {
+  listShortShip: (periodId) =>
+    api.get(`/projection-periods/${periodId}/confirmed-demand/short-ship`).then(r => r.data),
+  addShortShip: (periodId, data) =>
+    api.post(`/projection-periods/${periodId}/confirmed-demand/short-ship`, data).then(r => r.data),
+  removeShortShip: (periodId, sku) =>
+    api.delete(`/projection-periods/${periodId}/confirmed-demand/short-ship/${encodeURIComponent(sku)}`).then(r => r.data),
+  bulkSetShortShip: (periodId, data) =>
+    api.post(`/projection-periods/${periodId}/confirmed-demand/short-ship/bulk`, data).then(r => r.data),
+  importGlobalShortShip: (periodId) =>
+    api.post(`/projection-periods/${periodId}/confirmed-demand/short-ship/import-global`).then(r => r.data),
+
+  listInventoryHold: (periodId) =>
+    api.get(`/projection-periods/${periodId}/confirmed-demand/inventory-hold`).then(r => r.data),
+  addInventoryHold: (periodId, data) =>
+    api.post(`/projection-periods/${periodId}/confirmed-demand/inventory-hold`, data).then(r => r.data),
+  removeInventoryHold: (periodId, sku) =>
+    api.delete(`/projection-periods/${periodId}/confirmed-demand/inventory-hold/${encodeURIComponent(sku)}`).then(r => r.data),
+  bulkSetInventoryHold: (periodId, data) =>
+    api.post(`/projection-periods/${periodId}/confirmed-demand/inventory-hold/bulk`, data).then(r => r.data),
+  importGlobalInventoryHold: (periodId) =>
+    api.post(`/projection-periods/${periodId}/confirmed-demand/inventory-hold/import-global`).then(r => r.data),
+
+  // Bulk-by-product-type — mirrors productsApi.setShortShipByType / setInventoryHoldByType
+  setShortShipByType: (periodId, data) =>
+    api.post(`/projection-periods/${periodId}/confirmed-demand/short-ship/by-product-type`, data).then(r => r.data),
+  setInventoryHoldByType: (periodId, data) =>
+    api.post(`/projection-periods/${periodId}/confirmed-demand/inventory-hold/by-product-type`, data).then(r => r.data),
 }
 
 export const historicalDataApi = {

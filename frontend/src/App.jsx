@@ -9,7 +9,7 @@ import PackageRules from './pages/PackageRules'
 import CarrierServiceRules from './pages/CarrierServiceRules'
 import Inventory from './pages/Inventory'
 import Orders from './pages/Orders'
-import ProjectionOrders from './pages/ProjectionOrders'
+import ConfirmedOrders from './pages/ConfirmedOrders'
 import ProjectionConfirmed from './pages/ProjectionConfirmed'
 import DemandDashboard from './pages/DemandDashboard'
 import ProjectionPeriods from './pages/ProjectionPeriods'
@@ -23,7 +23,7 @@ import InventoryCount from './pages/InventoryCount'
 import './App.css'
 
 // Routes that use the full-bleed no-padding layout
-const FULL_BLEED_ROUTES = ['/orders', '/projection-orders']
+const FULL_BLEED_ROUTES = ['/orders', '/confirmed-orders']
 
 export default function App() {
   const location = useLocation()
@@ -47,7 +47,7 @@ export default function App() {
         <ul>
           <li><NavLink to="/projection-dashboard">Projection Dashboard</NavLink></li>
           <li><NavLink to="/projection-periods">Projection Periods</NavLink></li>
-          <li><NavLink to="/projection-orders">Projection Orders</NavLink></li>
+          <li><NavLink to="/confirmed-orders">Confirmed Orders</NavLink></li>
           <li><NavLink to="/projection-confirmed">Confirmed Demand</NavLink></li>
           <li><NavLink to="/historical-data">Historical Data</NavLink></li>
         </ul>
@@ -79,7 +79,8 @@ export default function App() {
           <Route path="/demand-dashboard" element={<DemandDashboard />} />
           <Route path="/projection-dashboard" element={<ProjectionDashboard />} />
           <Route path="/projection-periods" element={<ProjectionPeriods />} />
-          <Route path="/projection-orders" element={<ProjectionOrders />} />
+          <Route path="/confirmed-orders" element={<ConfirmedOrders />} />
+          <Route path="/projection-orders" element={<Navigate to="/confirmed-orders" replace />} />
           <Route path="/projection-confirmed" element={<ProjectionConfirmed />} />
           <Route path="/historical-data" element={<HistoricalPromotions />} />
           <Route path="/vendors" element={<Vendors />} />

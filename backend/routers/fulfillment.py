@@ -244,7 +244,7 @@ def _order_pactor(
             li for li in line_items_override
             if li.get("sku_mapped")
             and li.get("pick_sku")
-            and li.get("app_line_status") != "short_ship"
+            and li.get("app_line_status") not in ("short_ship", "inventory_hold")
         ]
         get = lambda li, k: li.get(k)
     else:
@@ -556,7 +556,7 @@ def _compute_multi_box_split(
             li for li in line_items_override
             if li.get("sku_mapped")
             and li.get("pick_sku")
-            and li.get("app_line_status") != "short_ship"
+            and li.get("app_line_status") not in ("short_ship", "inventory_hold")
         ]
         get = lambda li, k: li.get(k)
     else:
@@ -699,6 +699,74 @@ def _try_multi_box_split(
     return _compute_multi_box_split(order, db, line_items_override=line_items_override)
 
 
+def compute_boxes_for_order(
+    order: models.ShopifyOrder,
+    line_items_override: list,
+    db: Session,
+) -> tuple[list[dict], list[str]]:
+    """
+    Public, pure planner used by both `_build_preview_plan` and the period-aware
+    confirmed-demand snapshot path. Mirrors `create_plan`'s orchestration:
+    direct-rule single box → multi-box split → fallback single box (no type).
+
+    `line_items_override` is REQUIRED here (unlike the helpers below which
+    accept None). Callers wanting period/mapping awareness must pre-build this
+    list via `services.mapping_override.build_override_line_items`.
+
+    Returns (boxes, errors) where each box is:
+        {"box_type_id": int|None,
+         "items": {(pick_sku, line_item_id): pick_qty, ...}}
+
+    No DB writes. Empty `boxes` list → no shippable items.
+    """
+    if not line_items_override:
+        return [], ["No line items to plan"]
+
+    order_pactor_val = _order_pactor(order, db, line_items_override=line_items_override)
+    auto_box_type_id = (
+        _apply_package_rules_for_pactor(order, order_pactor_val, db)
+        if order_pactor_val is not None else None
+    )
+    max_cap = _get_max_box_pactor(order, db)
+    single_box_ok = (
+        auto_box_type_id is not None
+        and order_pactor_val is not None
+        and (max_cap is None or order_pactor_val <= max_cap + 1e-9)
+    )
+
+    def _aggregate_single_box_items() -> dict:
+        items: dict = {}
+        for li in line_items_override:
+            if li.get("app_line_status") in ("short_ship", "inventory_hold"):
+                continue
+            if not li.get("sku_mapped") or not li.get("pick_sku"):
+                continue
+            qty = li.get("fulfillable_quantity")
+            if qty is None:
+                qty = li.get("quantity") or 0
+            pick_qty = (qty or 0) * (li.get("mix_quantity") or 1.0)
+            if pick_qty <= 0:
+                continue
+            key = (li["pick_sku"], li.get("line_item_id") or "")
+            items[key] = items.get(key, 0.0) + pick_qty
+        return items
+
+    if single_box_ok:
+        items = _aggregate_single_box_items()
+        if not items:
+            return [], []
+        return [{"box_type_id": auto_box_type_id, "items": items}], []
+
+    split_boxes, split_errors = _try_multi_box_split(order, db, line_items_override=line_items_override)
+    if split_boxes:
+        return split_boxes, split_errors
+
+    items = _aggregate_single_box_items()
+    if not items:
+        return [], split_errors
+    return [{"box_type_id": auto_box_type_id, "items": items}], split_errors
+
+
 # ── Pactor map ────────────────────────────────────────────────────────────────
 
 @router.get("/carrier-service-for-order/{shopify_order_id}")
@@ -722,10 +790,21 @@ def get_pactor_map(db: Session = Depends(get_db)):
 
 # ── Plans ─────────────────────────────────────────────────────────────────────
 
-def _build_preview_plan(shopify_order_id: str, mapping_tab: str, db: Session) -> dict:
+def _build_preview_plan(
+    shopify_order_id: str,
+    mapping_tab: str,
+    db: Session,
+    period_id: Optional[int] = None,
+) -> dict:
     """
     Synthesize a what-if FulfillmentPlan response by re-resolving the order's
     line items against `mapping_tab` and re-running the box-split logic.
+
+    When `period_id` is provided, the period's short-ship / inventory-hold
+    configs are applied as in-memory overrides on each underlying line item's
+    app_line_status before the box split — items marked 'short_ship' or
+    'inventory_hold' under the period override are excluded from the preview
+    boxes (won't-ship semantics).
 
     Returns a plan-shaped dict matching _plan_to_dict so the existing UI
     consumes it unchanged. Marked with {"is_preview": True, "mapping_tab": ...}
@@ -740,7 +819,7 @@ def _build_preview_plan(shopify_order_id: str, mapping_tab: str, db: Session) ->
         return None
 
     override_lis = mapping_override.build_override_line_items(
-        shopify_order_id, mapping_tab, db
+        shopify_order_id, mapping_tab, db, period_id=period_id
     )
 
     boxes_out: list[dict] = []
@@ -749,41 +828,18 @@ def _build_preview_plan(shopify_order_id: str, mapping_tab: str, db: Session) ->
     if not override_lis:
         preview_errors.append(f"No line items resolved under mapping tab '{mapping_tab}'")
     else:
-        # Mirror create_plan's resolution: try direct package rule by overall pactor,
-        # else multi-box split, else single fallback box.
-        order_pactor_val = _order_pactor(order, db, line_items_override=override_lis)
-        auto_box_type_id = (
-            _apply_package_rules_for_pactor(order, order_pactor_val, db)
-            if order_pactor_val is not None else None
-        )
+        boxes, errs = compute_boxes_for_order(order, override_lis, db)
+        preview_errors.extend(errs)
 
-        # Single-box check: only take this path when total fits in a matched box.
-        max_cap = _get_max_box_pactor(order, db)
-        single_box_ok = (
-            auto_box_type_id is not None
-            and order_pactor_val is not None
-            and (max_cap is None or order_pactor_val <= max_cap + 1e-9)
-        )
-
-        if single_box_ok:
-            items: dict = {}
-            for li in override_lis:
-                if li.get("app_line_status") == "short_ship":
-                    continue
-                qty = li.get("fulfillable_quantity")
-                if qty is None:
-                    qty = li.get("quantity") or 0
-                pick_qty = (qty or 0) * (li.get("mix_quantity") or 1.0)
-                if pick_qty <= 0:
-                    continue
-                key = (li["pick_sku"], li.get("line_item_id") or "")
-                items[key] = items.get(key, 0.0) + pick_qty
+        # Index meta once for the box-item shaping below
+        meta_by_key = {
+            (l["pick_sku"], l.get("line_item_id") or ""): l
+            for l in override_lis if l.get("pick_sku")
+        }
+        for i, box_def in enumerate(boxes, start=1):
             box_items_out = []
-            for (pick_sku, li_id), qty in items.items():
-                meta = next(
-                    (l for l in override_lis if l["pick_sku"] == pick_sku and l.get("line_item_id") == li_id),
-                    None,
-                )
+            for (pick_sku, li_id), qty in box_def["items"].items():
+                meta = meta_by_key.get((pick_sku, li_id))
                 box_items_out.append({
                     "id": None, "box_id": None,
                     "pick_sku": pick_sku, "quantity": qty,
@@ -792,77 +848,13 @@ def _build_preview_plan(shopify_order_id: str, mapping_tab: str, db: Session) ->
                     "shopify_line_item_id": li_id or None,
                 })
             boxes_out.append({
-                "id": None, "plan_id": None, "box_number": 1,
-                "status": "pending", "box_type_id": auto_box_type_id,
+                "id": None, "plan_id": None, "box_number": i,
+                "status": "pending", "box_type_id": box_def["box_type_id"],
                 "carrier": None, "notes": None,
                 "shipstation_order_id": None, "shipstation_order_key": None,
                 "tracking_number": None, "shipped_at": None,
                 "items": box_items_out,
             })
-        else:
-            split_boxes, split_errors = _try_multi_box_split(order, db, line_items_override=override_lis)
-            if split_boxes:
-                for i, box_def in enumerate(split_boxes, start=1):
-                    box_items_out = []
-                    for (pick_sku, li_id), qty in box_def["items"].items():
-                        meta = next(
-                            (l for l in override_lis if l["pick_sku"] == pick_sku and l.get("line_item_id") == li_id),
-                            None,
-                        )
-                        box_items_out.append({
-                            "id": None, "box_id": None,
-                            "pick_sku": pick_sku, "quantity": qty,
-                            "shopify_sku": meta.get("shopify_sku") if meta else None,
-                            "product_title": meta.get("product_title") if meta else None,
-                            "shopify_line_item_id": li_id or None,
-                        })
-                    boxes_out.append({
-                        "id": None, "plan_id": None, "box_number": i,
-                        "status": "pending", "box_type_id": box_def["box_type_id"],
-                        "carrier": None, "notes": None,
-                        "shipstation_order_id": None, "shipstation_order_key": None,
-                        "tracking_number": None, "shipped_at": None,
-                        "items": box_items_out,
-                    })
-                if split_errors:
-                    preview_errors.extend(split_errors)
-            else:
-                if split_errors:
-                    preview_errors.extend(split_errors)
-                # Fallback: single box, no type
-                items: dict = {}
-                for li in override_lis:
-                    if li.get("app_line_status") == "short_ship":
-                        continue
-                    qty = li.get("fulfillable_quantity")
-                    if qty is None:
-                        qty = li.get("quantity") or 0
-                    pick_qty = (qty or 0) * (li.get("mix_quantity") or 1.0)
-                    if pick_qty <= 0:
-                        continue
-                    key = (li["pick_sku"], li.get("line_item_id") or "")
-                    items[key] = items.get(key, 0.0) + pick_qty
-                box_items_out = []
-                for (pick_sku, li_id), qty in items.items():
-                    meta = next(
-                        (l for l in override_lis if l["pick_sku"] == pick_sku and l.get("line_item_id") == li_id),
-                        None,
-                    )
-                    box_items_out.append({
-                        "id": None, "box_id": None,
-                        "pick_sku": pick_sku, "quantity": qty,
-                        "shopify_sku": meta.get("shopify_sku") if meta else None,
-                        "product_title": meta.get("product_title") if meta else None,
-                        "shopify_line_item_id": li_id or None,
-                    })
-                boxes_out.append({
-                    "id": None, "plan_id": None, "box_number": 1,
-                    "status": "pending", "box_type_id": auto_box_type_id,
-                    "carrier": None, "notes": None,
-                    "shipstation_order_id": None, "shipstation_order_key": None,
-                    "tracking_number": None, "shipped_at": None,
-                    "items": box_items_out,
-                })
 
     notes = None
     if preview_errors:
@@ -888,12 +880,13 @@ def list_plans(
     shopify_order_id: Optional[str] = None,
     status: Optional[str] = None,
     mapping_tab: Optional[str] = None,
+    period_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     # Live mapping preview path: synthesize a plan from the override mapping
     # without touching stored FulfillmentPlan rows. Requires a single order.
     if mapping_tab and shopify_order_id:
-        preview = _build_preview_plan(shopify_order_id, mapping_tab, db)
+        preview = _build_preview_plan(shopify_order_id, mapping_tab, db, period_id=period_id)
         return [preview] if preview else []
 
     q = db.query(models.FulfillmentPlan)
@@ -2542,6 +2535,8 @@ def bulk_auto_plan(body: BulkAutoPlanRequest = BulkAutoPlanRequest(), db: Sessio
       3. Orders with a draft plan and pending boxes that have no box_type_id → apply rules.
     Returns a per-order summary including whether a box type was matched.
     """
+    from routers.orders import _check_plan_mismatch
+
     q = db.query(models.ShopifyOrder).filter(
         models.ShopifyOrder.app_status.in_(["not_processed", "partially_fulfilled"])
     )
@@ -2568,6 +2563,41 @@ def bulk_auto_plan(body: BulkAutoPlanRequest = BulkAutoPlanRequest(), db: Sessio
     for order in all_not_processed:
         existing_plan = existing_plans.get(order.shopify_order_id)
         auto_box_type_id = _apply_package_rules(order, db)
+
+        # Nothing-to-ship guard: skip orders with no fulfillable mapped items
+        # (everything is short-shipped, already fulfilled, or unmapped). Also
+        # clean up any empty pending boxes left behind by earlier auto-plan
+        # runs that didn't have this guard.
+        if not _shopify_items_snapshot(order.shopify_order_id, db):
+            removed_boxes = 0
+            if existing_plan:
+                stale_boxes = (
+                    db.query(models.FulfillmentBox)
+                    .filter(
+                        models.FulfillmentBox.plan_id == existing_plan.id,
+                        models.FulfillmentBox.status == "pending",
+                        models.FulfillmentBox.shipstation_order_id.is_(None),
+                    )
+                    .all()
+                )
+                for b in stale_boxes:
+                    item_count = db.query(models.BoxLineItem).filter(
+                        models.BoxLineItem.box_id == b.id
+                    ).count()
+                    if item_count == 0:
+                        db.delete(b)
+                        removed_boxes += 1
+                if removed_boxes:
+                    db.commit()
+            skipped += 1
+            results.append({
+                "order_id": order.shopify_order_id,
+                "order_number": order.shopify_order_number,
+                "action": "nothing_to_ship",
+                "reason": "All items short-shipped, fulfilled, or unmapped",
+                "empty_boxes_removed": removed_boxes,
+            })
+            continue
 
         try:
             if not existing_plan:

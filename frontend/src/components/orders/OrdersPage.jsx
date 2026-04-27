@@ -123,13 +123,17 @@ function StatusSidebar({ orders, statusFilter, setStatusFilter, holdTags, dnssTa
         o.app_status === 'staged' || o.app_status === 'in_shipstation_not_shipped' || o.app_status === 'in_shipstation_shipped' || o.app_status === 'fulfilled'
       if (!isExcludedFromShipViews) {
         const shipCat = getShipCategory(o)
-        // Check if order should be forced to ship_none due to margin rules
+        // Check if order should be forced to ship_none due to margin rules.
+        // Threshold differs by category: ship_partial requires GM% >= 40%
+        // (partial fulfillment overhead needs more margin to pencil out);
+        // ship_all uses the standard 30% floor.
         const hasMarginOverride = tags.some(t => marginOverrideTags.has(t))
         const marginEntry = marginsMap[o.shopify_order_id]
         const hasMarginData = marginEntry !== undefined
         const gmPct = marginEntry?.gm_pct
         const fulfillableRevenue = marginEntry?.fulfillable_revenue ?? 0
-        const isLowMargin = hasMarginData && !hasMarginOverride && gmPct != null && gmPct < 30
+        const marginThreshold = shipCat === 'ship_partial' ? 40 : 30
+        const isLowMargin = hasMarginData && !hasMarginOverride && gmPct != null && gmPct < marginThreshold
         const isZeroRevenue = hasMarginData && !hasMarginOverride && (fulfillableRevenue <= 0 || gmPct == null)
         const forceShipNone = isLowMargin || isZeroRevenue
 
@@ -471,12 +475,16 @@ export default function OrdersPage({
   const CLIENT_SIDE_FILTERS = new Set(['all', 'not_processed', 'needs_plan', 'on_hold', 'no_box_rule', 'plan_mismatch', 'ss_duplicate', 'cogs_error', 'pending_payment', 'ship_all', 'ship_partial', 'ship_none', 'inv_hold', 'confirmed'])
   // In projections mode, mappingTab drives a live preview re-resolution of pick
   // SKUs and box configs server-side. Empty string = no override (show stored).
+  // periodId, when set, layers the period's short-ship/inventory-hold configs
+  // as in-memory overrides on app_line_status (also no DB writes).
   const previewTab = isProjections && mappingTab ? mappingTab : null
+  const previewPeriodId = isProjections && periodId ? periodId : null
   const ordersParams = {
     ...(statusFilter !== 'all' && !CLIENT_SIDE_FILTERS.has(statusFilter) ? { app_status: statusFilter } : {}),
     ...(search ? { search } : {}),
     ...(tagSearch ? { tag: tagSearch } : {}),
     ...(previewTab ? { mapping_tab: previewTab } : {}),
+    ...(previewPeriodId ? { period_id: previewPeriodId } : {}),
     limit: 2000,
   }
 
@@ -508,14 +516,14 @@ export default function OrdersPage({
   const orderIds = useMemo(() => orders.map(o => o.shopify_order_id), [orders])
   const allOrderIds = useMemo(() => allOrders.map(o => o.shopify_order_id), [allOrders])
   const { data: marginsMap = {} } = useQuery({
-    queryKey: ['orders-margins', orderIds],
-    queryFn: () => orderIds.length ? ordersApi.getBatchMargins(orderIds) : {},
+    queryKey: ['orders-margins', orderIds, previewPeriodId, previewTab],
+    queryFn: () => orderIds.length ? ordersApi.getBatchMargins(orderIds, previewPeriodId, previewTab) : {},
     enabled: orderIds.length > 0,
     staleTime: 2 * 60 * 1000,
   })
   const { data: allMarginsMap = {} } = useQuery({
-    queryKey: ['orders-margins', allOrderIds],
-    queryFn: () => allOrderIds.length ? ordersApi.getBatchMargins(allOrderIds) : {},
+    queryKey: ['orders-margins', allOrderIds, previewPeriodId, previewTab],
+    queryFn: () => allOrderIds.length ? ordersApi.getBatchMargins(allOrderIds, previewPeriodId, previewTab) : {},
     enabled: allOrderIds.length > 0,
     staleTime: 2 * 60 * 1000,
   })
@@ -590,6 +598,25 @@ export default function OrdersPage({
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['projection-confirmed-orders', periodId] })
       setSelectedForBatch(new Set())
+    },
+  })
+
+  const reConfirmAllMutation = useMutation({
+    mutationFn: () => projectionConfirmedOrdersApi.reConfirmAll(periodId, { mapping_tab: mappingTab }),
+    onSuccess: (data) => {
+      qc.invalidateQueries({ queryKey: ['projection-confirmed-orders', periodId] })
+      setSelectedForBatch(new Set())
+      const reasons = (data.results || [])
+        .filter(r => !r.success)
+        .slice(0, 5)
+        .map(r => `  #${r.order_id}: ${r.error}`)
+        .join('\n')
+      const skippedNote = data.skipped > 0 && reasons ? '\n\n' + reasons : ''
+      alert(`Re-confirmed ${data.confirmed} order${data.confirmed !== 1 ? 's' : ''}` +
+            (data.skipped > 0 ? `, skipped ${data.skipped}` : '') + skippedNote)
+    },
+    onError: (err) => {
+      alert(`Re-confirm failed: ${err?.response?.data?.detail || err?.message || 'Unknown error'}`)
     },
   })
 
@@ -903,14 +930,17 @@ export default function OrdersPage({
           o.app_status === 'fulfilled'
         if (excluded) return false
 
-        // Check margin-based reclassification to ship_none
+        // Check margin-based reclassification to ship_none.
+        // Threshold differs by category: ship_partial requires GM% >= 40%
+        // (partial fulfillment needs more margin to pencil out); ship_all uses 30%.
         const orderTags = (o.tags || '').split(',').map(t => t.trim().toLowerCase()).filter(Boolean)
         const hasMarginOverride = orderTags.some(t => marginOverrideTags.has(t))
         const marginEntry = marginsMap[o.shopify_order_id]
         const hasMarginData = marginEntry !== undefined
         const gmPct = marginEntry?.gm_pct
         const fulfillableRevenue = marginEntry?.fulfillable_revenue ?? 0
-        const isLowMargin = hasMarginData && !hasMarginOverride && gmPct != null && gmPct < 30
+        const marginThreshold = cat === 'ship_partial' ? 40 : 30
+        const isLowMargin = hasMarginData && !hasMarginOverride && gmPct != null && gmPct < marginThreshold
         const isZeroRevenue = hasMarginData && !hasMarginOverride && (fulfillableRevenue <= 0 || gmPct == null)
         const forceShipNone = isLowMargin || isZeroRevenue
 
@@ -1263,6 +1293,25 @@ export default function OrdersPage({
                       : `✓ Confirm Selected${selectedForBatch.size > 0 ? ` (${selectedForBatch.size})` : ''}`}
                   </button>
                 )}
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => {
+                    if (!confirm(`Re-confirm every eligible order in this period using "${mappingTab}"? Already-confirmed orders are skipped — this only re-snapshots the unconfirmed ones (e.g. those just kicked back by a CD short-ship/hold change).`)) return
+                    reConfirmAllMutation.mutate()
+                  }}
+                  disabled={
+                    reConfirmAllMutation.isPending ||
+                    !periodId ||
+                    !mappingTab
+                  }
+                  title={
+                    !periodId ? 'Select a projection period first'
+                    : !mappingTab ? 'Select a SKU mapping first'
+                    : 'Bulk-confirm every eligible-but-unconfirmed order using the period\'s current short-ship/hold + mapping config'
+                  }
+                >
+                  {reConfirmAllMutation.isPending ? 'Re-confirming…' : '↻ Re-confirm All'}
+                </button>
                 {statusFilter === 'confirmed' && (
                   <button
                     className="btn btn-secondary"
@@ -1595,6 +1644,7 @@ export default function OrdersPage({
           holdTags={holdTags}
           ssConfigured={ssStatus?.configured}
           previewMappingTab={previewTab}
+          previewPeriodId={previewPeriodId}
         />
       )}
 
