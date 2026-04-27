@@ -140,31 +140,15 @@ def _admin_domain() -> str:
     global _cached_admin_domain
     if _cached_admin_domain:
         return _cached_admin_domain
-    if os.path.exists(_TOKEN_FILE):
-        try:
-            with open(_TOKEN_FILE) as f:
-                d = json.load(f).get("myshopify_domain")
-            if d:
-                _cached_admin_domain = d
-                return d
-        except Exception:
-            pass
+    if SHOPIFY_SHOP_DOMAIN.endswith(".myshopify.com"):
+        _cached_admin_domain = SHOPIFY_SHOP_DOMAIN
+        return _cached_admin_domain
     try:
         resp = requests.get(f"{_base_url()}/shop.json", headers=_headers(), timeout=15)
         resp.raise_for_status()
         d = resp.json().get("shop", {}).get("myshopify_domain")
         if d:
             _cached_admin_domain = d
-            try:
-                td = {}
-                if os.path.exists(_TOKEN_FILE):
-                    with open(_TOKEN_FILE) as f:
-                        td = json.load(f)
-                td["myshopify_domain"] = d
-                with open(_TOKEN_FILE, "w") as f:
-                    json.dump(td, f)
-            except Exception:
-                pass
             return d
     except Exception:
         pass
