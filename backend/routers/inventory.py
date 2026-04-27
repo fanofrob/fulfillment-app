@@ -1050,3 +1050,144 @@ def staged_shortages(
         })
 
     return results
+
+
+# ── Staged boxes by pick SKU (drill-in from Issue SKU column) ─────────────────
+
+@router.get("/staged-boxes-by-pick-sku")
+def staged_boxes_by_pick_sku(
+    pick_sku: str = Query(..., description="Pick SKU to filter by"),
+    warehouse: Optional[str] = Query(None, description="Optional warehouse scope"),
+    db: Session = Depends(get_db),
+):
+    """
+    Return all boxes belonging to staged orders (optionally warehouse-scoped)
+    that contain the given pick_sku. Used by the Issue SKU drill-in page.
+    """
+    from sqlalchemy import func as sa_func
+
+    target = pick_sku.strip()
+    target_lower = target.lower()
+
+    matching_items = (
+        db.query(models.BoxLineItem)
+        .filter(sa_func.lower(models.BoxLineItem.pick_sku) == target_lower)
+        .all()
+    )
+    if not matching_items:
+        return {
+            "pick_sku": target,
+            "warehouse": warehouse,
+            "boxes": [],
+            "total_qty": 0,
+            "order_count": 0,
+        }
+
+    box_ids = list({item.box_id for item in matching_items})
+    qty_by_box: dict = {}
+    for item in matching_items:
+        qty_by_box[item.box_id] = qty_by_box.get(item.box_id, 0.0) + float(item.quantity or 0)
+
+    # Exclude boxes that don't contribute to active demand (matches demand_analysis).
+    EXCLUDED_BOX_STATUSES = ["cancelled", "shipped", "fulfilled"]
+    boxes = (
+        db.query(models.FulfillmentBox)
+        .filter(
+            models.FulfillmentBox.id.in_(box_ids),
+            models.FulfillmentBox.status.notin_(EXCLUDED_BOX_STATUSES),
+        )
+        .all()
+    )
+
+    plan_ids = list({b.plan_id for b in boxes})
+    plans = db.query(models.FulfillmentPlan).filter(models.FulfillmentPlan.id.in_(plan_ids)).all()
+    plan_map = {p.id: p for p in plans}
+
+    order_ids = list({p.shopify_order_id for p in plans})
+    orders_q = db.query(models.ShopifyOrder).filter(
+        models.ShopifyOrder.shopify_order_id.in_(order_ids),
+        models.ShopifyOrder.app_status == "staged",
+    )
+    if warehouse:
+        orders_q = orders_q.filter(models.ShopifyOrder.assigned_warehouse == warehouse)
+    orders = orders_q.all()
+    order_map = {o.shopify_order_id: o for o in orders}
+
+    box_type_ids = list({b.box_type_id for b in boxes if b.box_type_id})
+    box_type_map: dict = {}
+    if box_type_ids:
+        box_types = db.query(models.BoxType).filter(models.BoxType.id.in_(box_type_ids)).all()
+        box_type_map = {bt.id: bt.name for bt in box_types}
+
+    # All pick SKUs per box (so the detail table can show full box contents, not
+    # just the filtered SKU).
+    all_box_items = (
+        db.query(models.BoxLineItem)
+        .filter(models.BoxLineItem.box_id.in_(box_ids))
+        .all()
+    )
+    all_skus_by_box: dict = {}
+    for item in all_box_items:
+        all_skus_by_box.setdefault(item.box_id, set()).add(item.pick_sku)
+
+    result_boxes = []
+    total_qty = 0.0
+    order_ids_in_result: set = set()
+    for box in boxes:
+        plan = plan_map.get(box.plan_id)
+        if not plan:
+            continue
+        order = order_map.get(plan.shopify_order_id)
+        if not order:
+            continue
+        qty = qty_by_box.get(box.id, 0.0)
+        total_qty += qty
+        order_ids_in_result.add(order.shopify_order_id)
+        result_boxes.append({
+            "box_id": box.id,
+            "plan_id": box.plan_id,
+            "box_number": box.box_number,
+            "box_status": box.status,
+            "box_type_name": box_type_map.get(box.box_type_id),
+            "pick_skus": sorted(all_skus_by_box.get(box.id, set())),
+            "target_qty": round(qty, 2),
+            "shopify_order_id": order.shopify_order_id,
+            "shopify_order_number": order.shopify_order_number,
+            "customer_name": order.customer_name,
+            "customer_email": order.customer_email,
+            "shipping_province": order.shipping_province,
+            "created_at_shopify": order.created_at_shopify.isoformat() if order.created_at_shopify else None,
+            "tags": order.tags,
+            "assigned_warehouse": order.assigned_warehouse,
+        })
+
+    result_boxes.sort(key=lambda b: (
+        b.get("shopify_order_number") or b["shopify_order_id"],
+        b["box_number"] or 0,
+    ))
+
+    # Current inventory balance for this pick SKU + warehouse.
+    inv_item = None
+    if warehouse:
+        inv_item = (
+            db.query(models.InventoryItem)
+            .filter(
+                sa_func.lower(models.InventoryItem.pick_sku) == target_lower,
+                models.InventoryItem.warehouse == warehouse,
+            )
+            .first()
+        )
+    on_hand_qty = float(inv_item.on_hand_qty) if inv_item else 0.0
+    committed_qty = float(inv_item.committed_qty) if inv_item else 0.0
+    available_qty = float(inv_item.available_qty) if inv_item else 0.0
+
+    return {
+        "pick_sku": target,
+        "warehouse": warehouse,
+        "boxes": result_boxes,
+        "total_qty": round(total_qty, 2),
+        "order_count": len(order_ids_in_result),
+        "on_hand_qty": round(on_hand_qty, 2),
+        "committed_qty": round(committed_qty, 2),
+        "available_qty": round(available_qty, 2),
+    }

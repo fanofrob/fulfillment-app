@@ -1,6 +1,12 @@
 import axios from 'axios'
 
-const api = axios.create({ baseURL: 'http://localhost:8000/api' })
+// Same-origin: in production the FastAPI backend serves the built frontend,
+// so '/api' hits the same host. In `npm run dev`, Vite proxies '/api' to :8000
+// (see vite.config.js). Override with VITE_API_BASE_URL if you ever need to
+// point the frontend at a different backend.
+const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api'
+
+const api = axios.create({ baseURL: API_BASE })
 
 export const skuMappingApi = {
   list: (params) => api.get('/sku-mappings/', { params }).then(r => r.data),
@@ -95,12 +101,17 @@ export const inventoryApi = {
 
   stagedShortages: (warehouse) =>
     api.get('/inventory/staged-shortages', { params: warehouse ? { warehouse } : {} }).then(r => r.data),
+
+  stagedBoxesByPickSku: (pick_sku, warehouse) =>
+    api.get('/inventory/staged-boxes-by-pick-sku', {
+      params: warehouse ? { pick_sku, warehouse } : { pick_sku },
+    }).then(r => r.data),
 }
 
 export const shopifyAuthApi = {
   status: () => api.get('/shopify/status').then(r => r.data),
   // connect is a browser redirect, not an axios call — use window.location
-  connectUrl: () => 'http://localhost:8000/api/shopify/connect',
+  connectUrl: () => `${API_BASE}/shopify/connect`,
   disconnect: () => api.delete('/shopify/disconnect').then(r => r.data),
 }
 
@@ -267,7 +278,7 @@ export const fulfillmentApi = {
   // Streaming bulk push — returns an EventSource-like reader
   bulkPushStream: ({ order_ids, onProgress, onStart, onDone, onError }) => {
     const ctrl = new AbortController()
-    fetch('http://localhost:8000/api/fulfillment/bulk-push-stream', {
+    fetch(`${API_BASE}/fulfillment/bulk-push-stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ order_ids }),

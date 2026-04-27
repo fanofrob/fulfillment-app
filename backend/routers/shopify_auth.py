@@ -25,11 +25,18 @@ router = APIRouter()
 # Scopes needed for Phase 2 + future phases
 SCOPES = "read_orders,write_orders,write_fulfillments,read_fulfillments,read_products"
 
-# Where Shopify sends the user back after approval
-REDIRECT_URI = "http://localhost:8000/api/shopify/callback"
+# Base URL of this app — used to build the Shopify OAuth redirect URI.
+# Locally: http://localhost:8000
+# Production: https://your-app.up.railway.app  (set APP_BASE_URL in Railway env)
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000").rstrip("/")
+REDIRECT_URI = f"{APP_BASE_URL}/api/shopify/callback"
 
-# After successful OAuth, redirect here so the user lands back in the app
-FRONTEND_SUCCESS_URL = "http://localhost:5173/orders?shopify=connected"
+# After successful OAuth, redirect here so the user lands back in the app.
+# Production: same-origin SPA, so just use the app's own root. Local dev: Vite on :5173.
+FRONTEND_SUCCESS_URL = os.getenv(
+    "SHOPIFY_SUCCESS_REDIRECT",
+    "http://localhost:5173/orders?shopify=connected",
+)
 
 # Simple in-memory nonce store (fine for a single-operator tool)
 _pending_states: set = set()
@@ -134,8 +141,12 @@ def shopify_status():
 @router.delete("/disconnect")
 def shopify_disconnect():
     """Remove the stored access token (forces re-auth)."""
-    shopify_service._cached_token = None
-    token_file = shopify_service._TOKEN_FILE
-    if os.path.exists(token_file):
-        os.remove(token_file)
+    shopify_service.clear_access_token()
+    # Best-effort cleanup of the legacy on-disk token file if it still exists
+    legacy = shopify_service._LEGACY_TOKEN_FILE
+    if os.path.exists(legacy):
+        try:
+            os.remove(legacy)
+        except Exception:
+            pass
     return {"disconnected": True}

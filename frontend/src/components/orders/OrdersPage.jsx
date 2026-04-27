@@ -706,6 +706,12 @@ export default function OrdersPage({
       qc.invalidateQueries(['orders'])
       qc.invalidateQueries(['orders-archived'])
     },
+    onError: (err) => {
+      const detail = err?.response?.data?.detail || err?.message || 'Unknown error'
+      setSyncBanner({ type: 'error', message: `Pull failed: ${detail}` })
+      if (syncBannerTimer.current) clearTimeout(syncBannerTimer.current)
+      syncBannerTimer.current = setTimeout(() => setSyncBanner(null), 10000)
+    },
   })
 
   const syncSSMutation = useMutation({
@@ -1320,7 +1326,7 @@ export default function OrdersPage({
         {shopifyStatus && !shopifyStatus.connected && (
           <div className="setup-banner" style={{ margin: '0 0 12px' }}>
             Shopify not connected.{' '}
-            <a href="http://localhost:8000/api/shopify/connect">Connect Shopify →</a>
+            <a href="/api/shopify/connect">Connect Shopify →</a>
           </div>
         )}
         {pullMutation.isSuccess && (

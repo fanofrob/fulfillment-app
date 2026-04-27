@@ -422,9 +422,7 @@ function StagedOrdersTab() {
         }
       },
       onError: (err) => {
-        setPushState(prev => ({ ...prev, active: false, done: false, error: err?.message || 'Unknown error' }))
-        localStorage.removeItem('pushJob')
-        alert(`Push failed: ${err?.message || 'Unknown error'}`)
+        setPushState(prev => ({ ...prev, error: err?.message || 'Stream disconnected — reconnecting via poller' }))
       },
     })
   }

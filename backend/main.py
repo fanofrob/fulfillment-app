@@ -1,8 +1,12 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI
+import os
+from pathlib import Path
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from sqlalchemy import text, inspect
 from database import engine
 import models
@@ -249,9 +253,14 @@ from services import sheets_service, shopify_service, shipstation_service
 
 app = FastAPI(title="Fulfillment App API")
 
+# CORS_ORIGINS is a comma-separated list of allowed origins.
+# In production the frontend is served from the same origin as the API so CORS
+# isn't strictly needed — but it's cheap to leave flexible. Default covers local dev.
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -279,8 +288,8 @@ app.include_router(purchase_orders.router, prefix="/api/purchase-orders", tags=[
 app.include_router(inventory_count.router, prefix="/api/inventory-count", tags=["Inventory Count"])
 app.include_router(receiving.router, prefix="/api/receiving", tags=["Receiving"])
 
-@app.get("/")
-def root():
+@app.get("/api/ping")
+def ping():
     return {"status": "ok", "message": "Fulfillment App API"}
 
 @app.get("/api/status")
@@ -297,3 +306,35 @@ def status():
 def refresh_all_caches():
     sheets_service.invalidate()
     return {"status": "all caches cleared"}
+
+
+# --- Serve the built frontend (SPA) ---
+# In production the Vite build output lives in frontend/dist and is served from
+# the same origin as the API. Locally, when running `npm run dev`, this block
+# is skipped (dist doesn't exist) and Vite handles the frontend on :5173.
+_FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+
+if _FRONTEND_DIST.is_dir():
+    _assets_dir = _FRONTEND_DIST / "assets"
+    if _assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=_assets_dir), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_fallback(full_path: str):
+        # Don't shadow /api/* routes — let FastAPI return their real 404s
+        if full_path.startswith("api/") or full_path == "api":
+            raise HTTPException(status_code=404)
+        # Serve any real file in dist (favicon, robots.txt, etc.); otherwise
+        # fall back to index.html so React Router can handle the route.
+        if full_path:
+            candidate = _FRONTEND_DIST / full_path
+            if candidate.is_file():
+                return FileResponse(candidate)
+        return FileResponse(_FRONTEND_DIST / "index.html")
+else:
+    @app.get("/", include_in_schema=False)
+    def root_dev_hint():
+        return {
+            "status": "ok",
+            "message": "Fulfillment App API (dev mode — frontend not built; run `npm run dev` for the UI)",
+        }

@@ -705,9 +705,20 @@ def pull_orders(body: schemas.PullOrdersRequest, db: Session = Depends(get_db)):
         sku_lookup = sheets_service.get_sku_mapping_lookup(body.warehouse)
     except FileNotFoundError:
         raise HTTPException(status_code=503, detail="Google Sheets credentials not configured")
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"Google Sheets error: {type(e).__name__}: {e}")
 
-    raw_orders = shopify_service.get_unfulfilled_orders()
-    on_hold_ids = shopify_service.get_on_hold_order_ids()
+    try:
+        raw_orders = shopify_service.get_unfulfilled_orders()
+        on_hold_ids = shopify_service.get_on_hold_order_ids()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"Shopify error: {type(e).__name__}: {e}")
     now = datetime.now(timezone.utc)
 
     created = 0
@@ -935,9 +946,36 @@ def pull_orders(body: schemas.PullOrdersRequest, db: Session = Depends(get_db)):
         .all()
     )
     for stale in stale_orders:
+        # Clean up fulfillment-plan graph before deleting the order — Postgres
+        # enforces the FKs, so deleting the order directly would fail.
+        plan_ids = [
+            pid for (pid,) in db.query(models.FulfillmentPlan.id).filter(
+                models.FulfillmentPlan.shopify_order_id == stale.shopify_order_id
+            ).all()
+        ]
+        if plan_ids:
+            box_ids = [
+                bid for (bid,) in db.query(models.FulfillmentBox.id).filter(
+                    models.FulfillmentBox.plan_id.in_(plan_ids)
+                ).all()
+            ]
+            if box_ids:
+                db.query(models.BoxLineItem).filter(
+                    models.BoxLineItem.box_id.in_(box_ids)
+                ).delete(synchronize_session=False)
+                db.query(models.FulfillmentBox).filter(
+                    models.FulfillmentBox.id.in_(box_ids)
+                ).delete(synchronize_session=False)
+            db.query(models.LineItemChangeEvent).filter(
+                models.LineItemChangeEvent.plan_id.in_(plan_ids)
+            ).delete(synchronize_session=False)
+            db.query(models.FulfillmentPlan).filter(
+                models.FulfillmentPlan.id.in_(plan_ids)
+            ).delete(synchronize_session=False)
+
         db.query(models.ShopifyLineItem).filter(
             models.ShopifyLineItem.shopify_order_id == stale.shopify_order_id
-        ).delete()
+        ).delete(synchronize_session=False)
         db.delete(stale)
         deleted += 1
 
