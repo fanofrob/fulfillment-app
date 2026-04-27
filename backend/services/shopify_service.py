@@ -28,6 +28,7 @@ _TOKEN_KEY = "shopify_access_token"
 
 # In-memory cache so we don't hit the DB on every request
 _cached_token: Optional[str] = None
+_cached_admin_domain: Optional[str] = None
 
 
 def _load_token_from_db() -> Optional[str]:
@@ -134,6 +135,46 @@ def _headers() -> dict:
     }
 
 
+def _admin_domain() -> str:
+    """Canonical *.myshopify.com domain — required for GraphQL (REST works on either)."""
+    global _cached_admin_domain
+    if _cached_admin_domain:
+        return _cached_admin_domain
+    if os.path.exists(_TOKEN_FILE):
+        try:
+            with open(_TOKEN_FILE) as f:
+                d = json.load(f).get("myshopify_domain")
+            if d:
+                _cached_admin_domain = d
+                return d
+        except Exception:
+            pass
+    try:
+        resp = requests.get(f"{_base_url()}/shop.json", headers=_headers(), timeout=15)
+        resp.raise_for_status()
+        d = resp.json().get("shop", {}).get("myshopify_domain")
+        if d:
+            _cached_admin_domain = d
+            try:
+                td = {}
+                if os.path.exists(_TOKEN_FILE):
+                    with open(_TOKEN_FILE) as f:
+                        td = json.load(f)
+                td["myshopify_domain"] = d
+                with open(_TOKEN_FILE, "w") as f:
+                    json.dump(td, f)
+            except Exception:
+                pass
+            return d
+    except Exception:
+        pass
+    return SHOPIFY_SHOP_DOMAIN
+
+
+def _graphql_url() -> str:
+    return f"https://{_admin_domain()}/admin/api/{API_VERSION}/graphql.json"
+
+
 def _parse_next_link(link_header: str) -> Optional[str]:
     """Parse Shopify's Link header to find the next page URL."""
     if not link_header:
@@ -202,7 +243,7 @@ def get_on_hold_order_ids() -> set:
     if not is_configured():
         return set()
 
-    url = f"{_base_url()}/graphql.json"
+    url = _graphql_url()
     headers = {
         "X-Shopify-Access-Token": get_access_token(),
         "Content-Type": "application/json",
