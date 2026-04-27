@@ -269,6 +269,58 @@ def recompute_open_orders(
                 "unmatched": res.get("unmatched", 0),
             }
 
+    # Step 3.5: clean up empty pending boxes attached to orders that now have
+    # nothing to ship (everything short-shipped, fulfilled, or unmapped). These
+    # are leftovers from earlier auto-plan runs that didn't have the
+    # nothing-to-ship guard.
+    empty_boxes_removed = 0
+    empty_pending = (
+        db.query(models.FulfillmentBox)
+        .join(models.FulfillmentPlan, models.FulfillmentPlan.id == models.FulfillmentBox.plan_id)
+        .join(models.ShopifyOrder, models.ShopifyOrder.shopify_order_id == models.FulfillmentPlan.shopify_order_id)
+        .filter(
+            models.FulfillmentBox.status == "pending",
+            models.FulfillmentBox.shipstation_order_id.is_(None),
+            models.FulfillmentPlan.status != "cancelled",
+            models.ShopifyOrder.app_status.in_(RECOMPUTE_STATUSES),
+        )
+        .all()
+    )
+    for box in empty_pending:
+        item_count = (
+            db.query(models.BoxLineItem)
+            .filter(models.BoxLineItem.box_id == box.id)
+            .count()
+        )
+        if item_count > 0:
+            continue
+        # Empty box — only delete if the order has nothing to ship right now
+        plan = db.query(models.FulfillmentPlan).filter(
+            models.FulfillmentPlan.id == box.plan_id
+        ).first()
+        if not plan:
+            continue
+        from sqlalchemy import or_ as _or
+        shippable_count = (
+            db.query(models.ShopifyLineItem)
+            .filter(
+                models.ShopifyLineItem.shopify_order_id == plan.shopify_order_id,
+                models.ShopifyLineItem.sku_mapped == True,
+                models.ShopifyLineItem.pick_sku.isnot(None),
+                models.ShopifyLineItem.fulfillable_quantity > 0,
+                _or(
+                    models.ShopifyLineItem.app_line_status != "short_ship",
+                    models.ShopifyLineItem.app_line_status.is_(None),
+                ),
+            )
+            .count()
+        )
+        if shippable_count == 0:
+            db.delete(box)
+            empty_boxes_removed += 1
+    if empty_boxes_removed:
+        db.commit()
+
     # Step 4: unstage staged orders that still have plan issues
     plan_unstaged = _unstage_orders_with_plan_issues(db)
     db.commit()
@@ -312,4 +364,5 @@ def recompute_open_orders(
         "boxes_deleted_short_ship":    short_ship_result.get("boxes_deleted", 0),
         "orders_unstaged_short_ship":  short_ship_result.get("orders_unstaged", 0),
         "orders_unstaged_inv_hold":    short_ship_result.get("orders_unstaged_hold", 0),
+        "empty_boxes_removed":         empty_boxes_removed,
     }
