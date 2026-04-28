@@ -24,6 +24,19 @@ function getShipCategory(order) {
   return 'ship_all'
 }
 
+// True when more lines are being short-shipped than are actually being fulfilled.
+// Used to raise the ship_partial margin floor (less actually ships, so the
+// remaining items need to carry more margin to be worth running).
+function hasMoreShortThanFulfill(order) {
+  const items = order.line_items || []
+  const toFulfillCount = items.filter(li =>
+    (li.fulfillable_quantity ?? li.quantity ?? 0) > 0 &&
+    !['short_ship', 'removed', 'inventory_hold'].includes(li.app_line_status)
+  ).length
+  const shortShipCount = items.filter(li => li.app_line_status === 'short_ship').length
+  return shortShipCount > toFulfillCount
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 function daysAgo(dateStr) {
@@ -127,15 +140,16 @@ function StatusSidebar({ orders, statusFilter, setStatusFilter, holdTags, dnssTa
         o.app_status === 'staged' || o.app_status === 'in_shipstation_not_shipped' || o.app_status === 'in_shipstation_shipped' || o.app_status === 'fulfilled'
       if (!isExcludedFromShipViews) {
         // Check if order should be forced to ship_none due to margin rules.
-        // Threshold differs by category: ship_partial requires GM% >= 40%
-        // (partial fulfillment overhead needs more margin to pencil out);
-        // ship_all uses the standard 30% floor.
+        // Threshold tiers: ship_all 30%, ship_partial 40%, ship_partial where
+        // more lines are short-shipped than to-fulfill 50% (less ships, so the
+        // remaining items must carry more margin).
         const hasMarginOverride = tags.some(t => marginOverrideTags.has(t))
         const marginEntry = marginsMap[o.shopify_order_id]
         const hasMarginData = marginEntry !== undefined
         const gmPct = marginEntry?.gm_pct
         const fulfillableRevenue = marginEntry?.fulfillable_revenue ?? 0
-        const marginThreshold = shipCat === 'ship_partial' ? 40 : 30
+        const isMostlyShort = shipCat === 'ship_partial' && hasMoreShortThanFulfill(o)
+        const marginThreshold = isMostlyShort ? 50 : (shipCat === 'ship_partial' ? 40 : 30)
         const isLowMargin = hasMarginData && !hasMarginOverride && gmPct != null && gmPct < marginThreshold
         const isZeroRevenue = hasMarginData && !hasMarginOverride && (fulfillableRevenue <= 0 || gmPct == null)
         const forceShipNone = isLowMargin || isZeroRevenue
@@ -945,15 +959,17 @@ export default function OrdersPage({
         if (excluded) return false
 
         // Check margin-based reclassification to ship_none.
-        // Threshold differs by category: ship_partial requires GM% >= 40%
-        // (partial fulfillment needs more margin to pencil out); ship_all uses 30%.
+        // Threshold tiers: ship_all 30%, ship_partial 40%, ship_partial where
+        // more lines are short-shipped than to-fulfill 50% (less ships, so the
+        // remaining items must carry more margin).
         const orderTags = (o.tags || '').split(',').map(t => t.trim().toLowerCase()).filter(Boolean)
         const hasMarginOverride = orderTags.some(t => marginOverrideTags.has(t))
         const marginEntry = marginsMap[o.shopify_order_id]
         const hasMarginData = marginEntry !== undefined
         const gmPct = marginEntry?.gm_pct
         const fulfillableRevenue = marginEntry?.fulfillable_revenue ?? 0
-        const marginThreshold = cat === 'ship_partial' ? 40 : 30
+        const isMostlyShort = cat === 'ship_partial' && hasMoreShortThanFulfill(o)
+        const marginThreshold = isMostlyShort ? 50 : (cat === 'ship_partial' ? 40 : 30)
         const isLowMargin = hasMarginData && !hasMarginOverride && gmPct != null && gmPct < marginThreshold
         const isZeroRevenue = hasMarginData && !hasMarginOverride && (fulfillableRevenue <= 0 || gmPct == null)
         const forceShipNone = isLowMargin || isZeroRevenue
