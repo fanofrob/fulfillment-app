@@ -1845,7 +1845,11 @@ def sync_boxes(db: Session = Depends(get_db)):
                     ).count() > 0
                     if still_needed == 0 and not has_pending_boxes:
                         order.app_status = "fulfilled"
-                    elif order.app_status != "fulfilled":
+                    elif order.app_status not in ("fulfilled", "in_shipstation_not_shipped", "in_shipstation_shipped"):
+                        # Don't clobber in-flight ShipStation statuses — when one box has
+                        # shipped but others are still packed in SS, the order is mid-flight,
+                        # not partially_fulfilled-and-idle. Overwriting here was the path
+                        # that made stuck orders appear re-stageable on the Orders page.
                         order.app_status = "partially_fulfilled"
             except Exception as e:
                 errors.append(f"Order {order_id} fulfillable refresh: {str(e)}")

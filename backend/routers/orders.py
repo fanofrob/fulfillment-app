@@ -1428,6 +1428,10 @@ def stage_order(shopify_order_id: str, db: Session = Depends(get_db)):
     if plan_issue:
         raise HTTPException(status_code=409, detail=plan_issue)
 
+    ss_block = _check_already_in_shipstation(order, db)
+    if ss_block:
+        raise HTTPException(status_code=409, detail=ss_block)
+
     rule_tags = _get_active_rule_tags(db)
     eligibility_error = _check_staging_eligibility(order, db, rule_tags)
     if eligibility_error:
@@ -1478,6 +1482,11 @@ def stage_batch(body: schemas.StageBatchRequest, db: Session = Depends(get_db)):
         plan_issue = _check_plan_issues(order, db)
         if plan_issue:
             results.append({"order_id": order_id, "success": False, "error": plan_issue})
+            continue
+
+        ss_block = _check_already_in_shipstation(order, db)
+        if ss_block:
+            results.append({"order_id": order_id, "success": False, "error": ss_block})
             continue
 
         eligibility_error = _check_staging_eligibility(order, db, rule_tags)
@@ -1653,6 +1662,32 @@ def _check_plan_issues(order, db: Session) -> Optional[str]:
     if order.ss_duplicate:
         return "Order already exists unshipped in ShipStation — cancel the ShipStation order first, then re-check duplicates"
 
+    return None
+
+
+def _check_already_in_shipstation(order, db: Session) -> Optional[str]:
+    """
+    Block staging for orders that already have one or more boxes pushed to
+    ShipStation. Without this guard, an order whose app_status was knocked
+    back to partially_fulfilled (e.g. by the Shopify fulfillable refresh
+    after one box ships while others remain packed in SS) can be re-staged
+    by a user click — leaving live SS boxes attached to a 'staged' order
+    that subsequent pushes can't progress.
+    """
+    pushed = db.query(models.FulfillmentBox).join(
+        models.FulfillmentPlan, models.FulfillmentPlan.id == models.FulfillmentBox.plan_id
+    ).filter(
+        models.FulfillmentPlan.shopify_order_id == order.shopify_order_id,
+        models.FulfillmentPlan.status != "cancelled",
+        models.FulfillmentBox.status != "cancelled",
+        models.FulfillmentBox.shipstation_order_id.isnot(None),
+    ).first()
+    if pushed:
+        return (
+            f"Order already has box {pushed.box_number} in ShipStation "
+            f"(orderId={pushed.shipstation_order_id}). Cancel the box or run "
+            f"the repair endpoint before re-staging."
+        )
     return None
 
 
