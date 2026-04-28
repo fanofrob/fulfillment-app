@@ -14,6 +14,17 @@ import models
 from services import sheets_service
 
 
+def _ensure_utc(dt: datetime | None) -> datetime | None:
+    # SQLite returns naive datetimes from DateTime(timezone=True) columns;
+    # Postgres returns aware. Treat naive values as UTC so Python comparisons
+    # don't raise "can't compare offset-naive and offset-aware datetimes".
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def generate_projection(
     db: Session,
     period_id: int,
@@ -27,7 +38,7 @@ def generate_projection(
     Generate a point-in-time demand projection for a projection period.
     Returns the persisted Projection with lines.
     """
-    now = datetime.utcnow()  # naive UTC to match SQLite storage
+    now = datetime.now(timezone.utc)
     excluded_promo_ids = excluded_promo_ids or []
 
     # ── Step 1: Load and validate period ─────────────────────────────────────
@@ -38,6 +49,10 @@ def generate_projection(
         raise ValueError(f"Projection period {period_id} not found")
     if period.status == "closed":
         raise ValueError(f"Period {period_id} is closed; cannot generate projection")
+    period.start_datetime = _ensure_utc(period.start_datetime)
+    period.end_datetime = _ensure_utc(period.end_datetime)
+    period.fulfillment_start = _ensure_utc(period.fulfillment_start)
+    period.fulfillment_end = _ensure_utc(period.fulfillment_end)
 
     # ── Step 2: Build SKU mapping lookup ─────────────────────────────────────
     sku_lookup = _build_sku_mapping_lookup(db, period, warehouse)
@@ -434,7 +449,7 @@ def _resolve_override_window(
     """Return (hist_start, hist_end) after applying override's range controls."""
     if override:
         if override.custom_range_start and override.custom_range_end:
-            return override.custom_range_start, override.custom_range_end
+            return _ensure_utc(override.custom_range_start), _ensure_utc(override.custom_range_end)
         if override.historical_weeks:
             return global_end - timedelta(weeks=override.historical_weeks), global_end
     return global_start, global_end
@@ -666,10 +681,12 @@ def _calc_projected_demand(
     window_start = hist_range_start
     window_end = hist_range_end
     for o in overrides.values():
-        if o.custom_range_start and o.custom_range_start < window_start:
-            window_start = o.custom_range_start
-        if o.custom_range_end and o.custom_range_end > window_end:
-            window_end = o.custom_range_end
+        crs = _ensure_utc(o.custom_range_start)
+        cre = _ensure_utc(o.custom_range_end)
+        if crs and crs < window_start:
+            window_start = crs
+        if cre and cre > window_end:
+            window_end = cre
     promo_ranges = _load_promo_ranges(db, window_start, window_end, excluded_promo_ids)
 
     # Build the store-wide hourly distribution once — every PT (and the manual-
@@ -724,8 +741,8 @@ def _load_promo_ranges(
     for p in promos:
         result.append({
             "id": p.id,
-            "start": p.start_datetime,
-            "end": p.end_datetime,
+            "start": _ensure_utc(p.start_datetime),
+            "end": _ensure_utc(p.end_datetime),
             "scope": p.scope,
             "affected_skus": set(p.affected_skus) if p.affected_skus else set(),
         })
@@ -734,6 +751,7 @@ def _load_promo_ranges(
 
 def _is_promotional_hour(bucket: datetime, shopify_sku: str, promo_ranges: list[dict]) -> bool:
     """Check if an hour bucket falls within any active promotion."""
+    bucket = _ensure_utc(bucket)
     for promo in promo_ranges:
         if promo["start"] <= bucket <= promo["end"]:
             if promo["scope"] == "store_wide":
@@ -937,7 +955,9 @@ def get_shop_hourly_breakdown(db: Session, projection_id: int) -> dict:
     sku_lookup = _build_sku_mapping_lookup(db, period, warehouse)
     weight_map = _build_weight_map(db)
 
-    now = projection.generated_at or datetime.utcnow()
+    period.start_datetime = _ensure_utc(period.start_datetime)
+    period.end_datetime = _ensure_utc(period.end_datetime)
+    now = _ensure_utc(projection.generated_at) or datetime.now(timezone.utc)
     if now >= period.end_datetime:
         return {"projection_id": projection_id, "period_name": period.name, "hours": []}
     effective_start = max(now, period.start_datetime)
