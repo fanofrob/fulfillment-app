@@ -465,6 +465,7 @@ class ShipStationSyncResult(BaseModel):
     synced: int
     shipped: int
     errors: List[str]
+    healed: Optional[int] = 0
 
 class ShipStationPushBatchRequest(BaseModel):
     order_ids: List[str]

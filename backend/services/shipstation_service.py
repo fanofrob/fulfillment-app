@@ -603,3 +603,113 @@ def sync_in_flight_orders(db) -> dict:
     db.commit()
 
     return {"synced": synced, "shipped": shipped, "errors": errors}
+
+
+def heal_orphan_in_shipstation_orders(db, dry_run: bool = False) -> dict:
+    """
+    Repair orders stuck on app_status='in_shipstation_not_shipped' that no
+    longer have any 'packed' boxes — i.e. all their boxes already shipped,
+    fulfilled, or were cancelled, but the order's status was never advanced.
+    Mirrors the per-order transition logic used by bulk_cancel_ss_boxes.
+
+    Skips orders with no FulfillmentBox rows at all (legacy push_order flow);
+    those are handled by sync_in_flight_orders.
+
+    With dry_run=True, computes the same transition list but rolls back instead
+    of committing, so callers can preview without writing.
+
+    Returns: { healed, skipped_legacy, transitions: [...] }
+    """
+    import models as m
+    from sqlalchemy import or_
+    from routers.inventory import _recompute_committed
+
+    candidates = db.query(m.ShopifyOrder).filter(
+        m.ShopifyOrder.app_status == "in_shipstation_not_shipped",
+    ).all()
+
+    transitions = []
+    skipped_legacy = 0
+    affected_warehouses: set = set()
+
+    for order in candidates:
+        plan = db.query(m.FulfillmentPlan).filter(
+            m.FulfillmentPlan.shopify_order_id == order.shopify_order_id
+        ).first()
+        if not plan:
+            skipped_legacy += 1
+            continue
+
+        all_boxes = db.query(m.FulfillmentBox).filter(
+            m.FulfillmentBox.plan_id == plan.id
+        ).all()
+        if not all_boxes:
+            skipped_legacy += 1
+            continue
+
+        # Stuck criterion: no boxes currently in 'packed'.
+        if any(b.status == "packed" for b in all_boxes):
+            continue
+
+        active_boxes = [b for b in all_boxes if b.status != "cancelled"]
+        shipped_count = sum(1 for b in active_boxes if b.status == "shipped")
+        fulfilled_count = sum(1 for b in active_boxes if b.status == "fulfilled")
+        pending_count = sum(1 for b in active_boxes if b.status == "pending")
+
+        old_status = order.app_status
+
+        if not active_boxes:
+            # Every box was cancelled — return to a re-plannable state.
+            order.app_status = "not_processed"
+            plan.status = "draft"
+        elif pending_count > 0:
+            # Pending boxes exist that were never pushed — order shouldn't be in SS.
+            order.app_status = "staged"
+        elif fulfilled_count == len(active_boxes):
+            # All active boxes fulfilled in Shopify — fulfilled or partially_fulfilled.
+            still_needed = db.query(m.ShopifyLineItem).filter(
+                m.ShopifyLineItem.shopify_order_id == order.shopify_order_id,
+                m.ShopifyLineItem.sku_mapped == True,
+                m.ShopifyLineItem.pick_sku.isnot(None),
+                m.ShopifyLineItem.fulfillable_quantity > 0,
+                or_(
+                    m.ShopifyLineItem.app_line_status != "short_ship",
+                    m.ShopifyLineItem.app_line_status.is_(None),
+                ),
+            ).count()
+            order.app_status = "fulfilled" if still_needed == 0 else "partially_fulfilled"
+        else:
+            # Mix of shipped + fulfilled (or all shipped) — still in SS, post-ship.
+            order.app_status = "in_shipstation_shipped"
+
+        order.last_synced_at = datetime.now(timezone.utc)
+        if order.assigned_warehouse:
+            affected_warehouses.add(order.assigned_warehouse)
+
+        transitions.append({
+            "shopify_order_id": order.shopify_order_id,
+            "shopify_order_number": order.shopify_order_number,
+            "old_status": old_status,
+            "new_status": order.app_status,
+            "boxes": {
+                "shipped": shipped_count,
+                "fulfilled": fulfilled_count,
+                "pending": pending_count,
+                "cancelled": len(all_boxes) - len(active_boxes),
+            },
+        })
+
+    if transitions:
+        db.flush()
+        for wh in affected_warehouses:
+            _recompute_committed(wh, db)
+        if dry_run:
+            db.rollback()
+        else:
+            db.commit()
+
+    return {
+        "healed": len(transitions),
+        "skipped_legacy": skipped_legacy,
+        "transitions": transitions,
+    }

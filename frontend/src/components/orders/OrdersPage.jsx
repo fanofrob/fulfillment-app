@@ -767,6 +767,7 @@ export default function OrdersPage({
         synced: (ss.synced || 0) + (ff.synced || 0),
         shipped: (ss.shipped || 0) + (ff.shipped || 0),
         shopify_fulfillments: ff.shopify_fulfillments || 0,
+        healed: (ss.healed || 0) + (ff.healed || 0),
         errors: [...(ss.errors || []), ...(ff.errors || [])],
       }
     },
@@ -777,6 +778,7 @@ export default function OrdersPage({
       if (data.synced) parts.push(`${data.synced} order${data.synced !== 1 ? 's' : ''} synced`)
       if (data.shipped) parts.push(`${data.shipped} shipped`)
       if (data.shopify_fulfillments) parts.push(`${data.shopify_fulfillments} Shopify fulfillment${data.shopify_fulfillments !== 1 ? 's' : ''} created`)
+      if (data.healed) parts.push(`${data.healed} stuck order${data.healed !== 1 ? 's' : ''} healed`)
       if (data.errors.length) parts.push(`${data.errors.length} error${data.errors.length !== 1 ? 's' : ''}`)
       const message = parts.length ? parts.join(', ') : 'No new updates from ShipStation'
       setSyncBanner({ type: data.errors.length ? 'error' : 'success', message })

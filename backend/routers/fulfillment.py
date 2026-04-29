@@ -1856,10 +1856,16 @@ def sync_boxes(db: Session = Depends(get_db)):
 
         db.commit()
 
+    # Heal orders stuck on in_shipstation_not_shipped whose boxes have all moved
+    # past 'packed'. Mirrors the call in /shipstation/sync so either entry point
+    # keeps the order-level status aligned with actual box state.
+    heal = shipstation_service.heal_orphan_in_shipstation_orders(db)
+
     return {
         "synced": synced,
         "shipped": shipped,
         "shopify_fulfillments": shopify_fulfillments_created,
+        "healed": heal["healed"],
         "errors": errors,
     }
 

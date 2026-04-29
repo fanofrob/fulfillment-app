@@ -393,10 +393,16 @@ def sync(db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"ShipStation sync error: {str(e)}")
 
+    # Heal orders stuck on in_shipstation_not_shipped whose boxes have all moved
+    # past 'packed' (shipped/fulfilled/cancelled). Without this, the sidebar
+    # "In ShipStation" count drifts above the actual SS box count over time.
+    heal = shipstation_service.heal_orphan_in_shipstation_orders(db)
+
     return schemas.ShipStationSyncResult(
         synced=result["synced"],
         shipped=result["shipped"],
         errors=result["errors"],
+        healed=heal["healed"],
     )
 
 
