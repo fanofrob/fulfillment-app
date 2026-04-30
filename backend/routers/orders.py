@@ -107,67 +107,93 @@ def _build_order_response(
     )
 
 
-def _check_plan_mismatch(order_id: str, db: Session) -> bool:
+def _check_plan_mismatch(
+    order_id: str,
+    db: Session,
+    mapping_tab: Optional[str] = None,
+    period_id: Optional[int] = None,
+) -> bool:
     """
     Returns True if the plan's box quantities don't match the order's line items.
     Catches both under-coverage (items missing from boxes) and over-coverage
     (boxes have SKUs or quantities exceeding what the order now requires).
     Note: requires_shipping is intentionally excluded — items with a mapped pick_sku
     must be packed regardless of Shopify's requires_shipping flag (e.g. promo items).
+
+    When `mapping_tab` is provided, `needed` is computed by re-resolving line
+    items against that override mapping instead of the warehouse-default DB
+    pick_skus + SkuMapping. This keeps the mismatch check consistent with a
+    plan that was built against the same override (e.g. Confirmed Orders).
     """
-    line_items = (
-        db.query(
-            models.ShopifyLineItem.pick_sku,
-            models.ShopifyLineItem.fulfillable_quantity,
-            models.ShopifyLineItem.mix_quantity,
-        )
-        .filter(
-            models.ShopifyLineItem.shopify_order_id == order_id,
-            models.ShopifyLineItem.sku_mapped == True,
-            models.ShopifyLineItem.fulfillable_quantity > 0,
-            models.ShopifyLineItem.pick_sku != None,
-            or_(models.ShopifyLineItem.app_line_status.notin_(["short_ship", "removed"]), models.ShopifyLineItem.app_line_status.is_(None)),
-        )
-        .all()
-    )
-
     needed: dict[str, float] = {}
-    for li in line_items:
-        qty = (li.fulfillable_quantity or 0) * (li.mix_quantity or 1.0)
-        needed[li.pick_sku] = needed.get(li.pick_sku, 0.0) + qty
 
-    # Also expand mix-box line items (pick_sku=None, sku_mapped=True) via SkuMapping
-    order_obj = db.query(models.ShopifyOrder).filter(
-        models.ShopifyOrder.shopify_order_id == order_id
-    ).first()
-    warehouse = order_obj.assigned_warehouse if order_obj else None
-    if warehouse:
-        mix_lis = (
+    if mapping_tab:
+        from services import mapping_override
+        override_rows = mapping_override.build_override_line_items(
+            order_id, mapping_tab, db, period_id=period_id
+        )
+        for row in override_rows:
+            if row.get("app_line_status") in ("short_ship", "removed"):
+                continue
+            pick_sku = row.get("pick_sku")
+            if not pick_sku:
+                continue
+            qty = (row.get("fulfillable_quantity") or 0) * (row.get("mix_quantity") or 1.0)
+            if qty <= 0:
+                continue
+            needed[pick_sku] = needed.get(pick_sku, 0.0) + qty
+    else:
+        line_items = (
             db.query(
-                models.ShopifyLineItem.shopify_sku,
+                models.ShopifyLineItem.pick_sku,
                 models.ShopifyLineItem.fulfillable_quantity,
+                models.ShopifyLineItem.mix_quantity,
             )
             .filter(
                 models.ShopifyLineItem.shopify_order_id == order_id,
                 models.ShopifyLineItem.sku_mapped == True,
                 models.ShopifyLineItem.fulfillable_quantity > 0,
-                models.ShopifyLineItem.pick_sku == None,
+                models.ShopifyLineItem.pick_sku != None,
                 or_(models.ShopifyLineItem.app_line_status.notin_(["short_ship", "removed"]), models.ShopifyLineItem.app_line_status.is_(None)),
             )
             .all()
         )
-        for mli in mix_lis:
-            if not mli.shopify_sku:
-                continue
-            sm_rows = db.query(models.SkuMapping).filter(
-                models.SkuMapping.shopify_sku == mli.shopify_sku,
-                models.SkuMapping.warehouse == warehouse,
-                models.SkuMapping.pick_sku != None,
-                models.SkuMapping.is_active == True,
-            ).all()
-            for sm in sm_rows:
-                qty = (mli.fulfillable_quantity or 0) * (sm.mix_quantity or 1.0)
-                needed[sm.pick_sku] = needed.get(sm.pick_sku, 0.0) + qty
+        for li in line_items:
+            qty = (li.fulfillable_quantity or 0) * (li.mix_quantity or 1.0)
+            needed[li.pick_sku] = needed.get(li.pick_sku, 0.0) + qty
+
+        # Also expand mix-box line items (pick_sku=None, sku_mapped=True) via SkuMapping
+        order_obj = db.query(models.ShopifyOrder).filter(
+            models.ShopifyOrder.shopify_order_id == order_id
+        ).first()
+        warehouse = order_obj.assigned_warehouse if order_obj else None
+        if warehouse:
+            mix_lis = (
+                db.query(
+                    models.ShopifyLineItem.shopify_sku,
+                    models.ShopifyLineItem.fulfillable_quantity,
+                )
+                .filter(
+                    models.ShopifyLineItem.shopify_order_id == order_id,
+                    models.ShopifyLineItem.sku_mapped == True,
+                    models.ShopifyLineItem.fulfillable_quantity > 0,
+                    models.ShopifyLineItem.pick_sku == None,
+                    or_(models.ShopifyLineItem.app_line_status.notin_(["short_ship", "removed"]), models.ShopifyLineItem.app_line_status.is_(None)),
+                )
+                .all()
+            )
+            for mli in mix_lis:
+                if not mli.shopify_sku:
+                    continue
+                sm_rows = db.query(models.SkuMapping).filter(
+                    models.SkuMapping.shopify_sku == mli.shopify_sku,
+                    models.SkuMapping.warehouse == warehouse,
+                    models.SkuMapping.pick_sku != None,
+                    models.SkuMapping.is_active == True,
+                ).all()
+                for sm in sm_rows:
+                    qty = (mli.fulfillable_quantity or 0) * (sm.mix_quantity or 1.0)
+                    needed[sm.pick_sku] = needed.get(sm.pick_sku, 0.0) + qty
 
     box_items = (
         db.query(
@@ -268,66 +294,87 @@ def list_orders(
         }
         # Orders with plans where box quantities don't match the order (under or over)
         if plan_order_ids:
-            # Gather line item requirements for all orders with plans
-            # Note: requires_shipping excluded — mapped pick_sku items must be packed
-            # regardless of Shopify's requires_shipping flag (e.g. promo items)
-            li_rows = (
-                db.query(
-                    models.ShopifyLineItem.shopify_order_id,
-                    models.ShopifyLineItem.pick_sku,
-                    models.ShopifyLineItem.fulfillable_quantity,
-                    models.ShopifyLineItem.mix_quantity,
-                )
-                .filter(
-                    models.ShopifyLineItem.shopify_order_id.in_(plan_order_ids),
-                    models.ShopifyLineItem.sku_mapped == True,
-                    models.ShopifyLineItem.fulfillable_quantity > 0,
-                    models.ShopifyLineItem.pick_sku != None,
-                    or_(models.ShopifyLineItem.app_line_status.notin_(["short_ship", "removed"]), models.ShopifyLineItem.app_line_status.is_(None)),
-                )
-                .all()
-            )
             # Aggregate needed qty: order_id -> {pick_sku -> qty}
+            # When mapping_tab is set, re-resolve each order's items against
+            # the override mapping so the mismatch check matches the planner
+            # used on this page (e.g. Confirmed Orders' agg mapping).
             needed: dict[str, dict[str, float]] = {}
-            for li in li_rows:
-                qty = (li.fulfillable_quantity or 0) * (li.mix_quantity or 1.0)
-                needed.setdefault(li.shopify_order_id, {})
-                needed[li.shopify_order_id][li.pick_sku] = (
-                    needed[li.shopify_order_id].get(li.pick_sku, 0.0) + qty
-                )
-            # Also expand mix-box line items (pick_sku=None) via SkuMapping
-            mix_li_rows = (
-                db.query(
-                    models.ShopifyLineItem.shopify_order_id,
-                    models.ShopifyLineItem.shopify_sku,
-                    models.ShopifyLineItem.fulfillable_quantity,
-                    models.ShopifyOrder.assigned_warehouse,
-                )
-                .join(models.ShopifyOrder, models.ShopifyOrder.shopify_order_id == models.ShopifyLineItem.shopify_order_id)
-                .filter(
-                    models.ShopifyLineItem.shopify_order_id.in_(plan_order_ids),
-                    models.ShopifyLineItem.sku_mapped == True,
-                    models.ShopifyLineItem.fulfillable_quantity > 0,
-                    models.ShopifyLineItem.pick_sku == None,
-                    or_(models.ShopifyLineItem.app_line_status.notin_(["short_ship", "removed"]), models.ShopifyLineItem.app_line_status.is_(None)),
-                )
-                .all()
-            )
-            for mli in mix_li_rows:
-                if not mli.shopify_sku or not mli.assigned_warehouse:
-                    continue
-                sm_rows = db.query(models.SkuMapping).filter(
-                    models.SkuMapping.shopify_sku == mli.shopify_sku,
-                    models.SkuMapping.warehouse == mli.assigned_warehouse,
-                    models.SkuMapping.pick_sku != None,
-                    models.SkuMapping.is_active == True,
-                ).all()
-                for sm in sm_rows:
-                    qty = (mli.fulfillable_quantity or 0) * (sm.mix_quantity or 1.0)
-                    needed.setdefault(mli.shopify_order_id, {})
-                    needed[mli.shopify_order_id][sm.pick_sku] = (
-                        needed[mli.shopify_order_id].get(sm.pick_sku, 0.0) + qty
+            if mapping_tab:
+                from services import mapping_override
+                for oid in plan_order_ids:
+                    rows = mapping_override.build_override_line_items(
+                        oid, mapping_tab, db, period_id=period_id
                     )
+                    for row in rows:
+                        if row.get("app_line_status") in ("short_ship", "removed"):
+                            continue
+                        pick_sku = row.get("pick_sku")
+                        if not pick_sku:
+                            continue
+                        qty = (row.get("fulfillable_quantity") or 0) * (row.get("mix_quantity") or 1.0)
+                        if qty <= 0:
+                            continue
+                        needed.setdefault(oid, {})
+                        needed[oid][pick_sku] = needed[oid].get(pick_sku, 0.0) + qty
+            else:
+                # Default: warehouse-resolved DB pick_skus + SkuMapping mix expansion.
+                # Note: requires_shipping excluded — mapped pick_sku items must be packed
+                # regardless of Shopify's requires_shipping flag (e.g. promo items).
+                li_rows = (
+                    db.query(
+                        models.ShopifyLineItem.shopify_order_id,
+                        models.ShopifyLineItem.pick_sku,
+                        models.ShopifyLineItem.fulfillable_quantity,
+                        models.ShopifyLineItem.mix_quantity,
+                    )
+                    .filter(
+                        models.ShopifyLineItem.shopify_order_id.in_(plan_order_ids),
+                        models.ShopifyLineItem.sku_mapped == True,
+                        models.ShopifyLineItem.fulfillable_quantity > 0,
+                        models.ShopifyLineItem.pick_sku != None,
+                        or_(models.ShopifyLineItem.app_line_status.notin_(["short_ship", "removed"]), models.ShopifyLineItem.app_line_status.is_(None)),
+                    )
+                    .all()
+                )
+                for li in li_rows:
+                    qty = (li.fulfillable_quantity or 0) * (li.mix_quantity or 1.0)
+                    needed.setdefault(li.shopify_order_id, {})
+                    needed[li.shopify_order_id][li.pick_sku] = (
+                        needed[li.shopify_order_id].get(li.pick_sku, 0.0) + qty
+                    )
+                # Also expand mix-box line items (pick_sku=None) via SkuMapping
+                mix_li_rows = (
+                    db.query(
+                        models.ShopifyLineItem.shopify_order_id,
+                        models.ShopifyLineItem.shopify_sku,
+                        models.ShopifyLineItem.fulfillable_quantity,
+                        models.ShopifyOrder.assigned_warehouse,
+                    )
+                    .join(models.ShopifyOrder, models.ShopifyOrder.shopify_order_id == models.ShopifyLineItem.shopify_order_id)
+                    .filter(
+                        models.ShopifyLineItem.shopify_order_id.in_(plan_order_ids),
+                        models.ShopifyLineItem.sku_mapped == True,
+                        models.ShopifyLineItem.fulfillable_quantity > 0,
+                        models.ShopifyLineItem.pick_sku == None,
+                        or_(models.ShopifyLineItem.app_line_status.notin_(["short_ship", "removed"]), models.ShopifyLineItem.app_line_status.is_(None)),
+                    )
+                    .all()
+                )
+                for mli in mix_li_rows:
+                    if not mli.shopify_sku or not mli.assigned_warehouse:
+                        continue
+                    sm_rows = db.query(models.SkuMapping).filter(
+                        models.SkuMapping.shopify_sku == mli.shopify_sku,
+                        models.SkuMapping.warehouse == mli.assigned_warehouse,
+                        models.SkuMapping.pick_sku != None,
+                        models.SkuMapping.is_active == True,
+                    ).all()
+                    for sm in sm_rows:
+                        qty = (mli.fulfillable_quantity or 0) * (sm.mix_quantity or 1.0)
+                        needed.setdefault(mli.shopify_order_id, {})
+                        needed[mli.shopify_order_id][sm.pick_sku] = (
+                            needed[mli.shopify_order_id].get(sm.pick_sku, 0.0) + qty
+                        )
             # Gather box item quantities for active (non-shipped/fulfilled/cancelled) boxes
             bi_rows = (
                 db.query(
@@ -724,7 +771,11 @@ def get_order(
             models.FulfillmentBox.box_type_id == None,
             models.FulfillmentBox.status == "pending",
         ).first() is not None
-        has_plan_mismatch = _check_plan_mismatch(shopify_order_id, db)
+        has_plan_mismatch = _check_plan_mismatch(
+            shopify_order_id, db,
+            mapping_tab=mapping_tab,
+            period_id=period_id,
+        )
     return _build_order_response(
         order, db,
         has_plan=has_plan,
