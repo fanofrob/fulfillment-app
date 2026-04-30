@@ -437,6 +437,10 @@ def _validate_override_payload(body: schemas.PeriodProjectionOverrideCreate):
         raise HTTPException(status_code=400, detail="historical_weeks must be positive")
     if body.manual_daily_lbs is not None and body.manual_daily_lbs < 0:
         raise HTTPException(status_code=400, detail="manual_daily_lbs must be non-negative")
+    if body.padding_pct_override is not None and body.padding_pct_override < 0:
+        raise HTTPException(status_code=400, detail="padding_pct_override must be non-negative")
+    if body.inventory_adjustment_pct is not None and not (-100 <= body.inventory_adjustment_pct <= 0):
+        raise HTTPException(status_code=400, detail="inventory_adjustment_pct must be between -100 and 0")
 
 
 @router.get("/{period_id}/overrides", response_model=List[schemas.PeriodProjectionOverrideResponse])

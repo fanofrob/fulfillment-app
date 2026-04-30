@@ -185,6 +185,17 @@ def _migrate_db():
             with engine.connect() as conn:
                 conn.execute(text("ALTER TABLE purchase_plan_lines ADD COLUMN sub_product_type TEXT"))
                 conn.commit()
+    # Add per-row padding & inventory adjustment to period_projection_overrides if missing
+    if "period_projection_overrides" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("period_projection_overrides")}
+        with engine.connect() as conn:
+            for col_name, col_type in [
+                ("padding_pct_override",     "REAL"),
+                ("inventory_adjustment_pct", "REAL"),
+            ]:
+                if col_name not in cols:
+                    conn.execute(text(f"ALTER TABLE period_projection_overrides ADD COLUMN {col_name} {col_type}"))
+            conn.commit()
 
 
 def _seed_ups_rates():

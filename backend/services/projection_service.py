@@ -134,18 +134,28 @@ def generate_projection(
         proj_lbs = projected_demand.get(pt, 0.0)
         proj_orders = projected_orders.get(pt, 0.0)
         total_lbs = conf_lbs + proj_lbs
-        padding_pct = padding_configs.get(pt, 0.0)
-        # Manual-rate overrides can opt out of padding. All other cases pad as normal.
+        global_padding_pct = padding_configs.get(pt, 0.0)
         override = overrides.get(pt)
-        skip_padding = (
+        # Per-period override wins over the global per-product-type config.
+        # Manual-rate's apply_padding=False is an older opt-out that still applies
+        # when no explicit padding_pct_override is set.
+        if override is not None and override.padding_pct_override is not None:
+            effective_padding_pct = override.padding_pct_override
+        elif (
             override is not None
             and override.manual_daily_lbs is not None
             and not override.apply_padding
-        )
-        effective_padding_pct = 0.0 if skip_padding else padding_pct
+        ):
+            effective_padding_pct = 0.0
+        else:
+            effective_padding_pct = global_padding_pct
         padded_lbs = total_lbs * (1 + effective_padding_pct / 100.0)
-        oh_lbs = on_hand.get(pt, 0.0)
-        eoh_lbs = expected_on_hand.get(pt, 0.0)
+        # Inventory adjustment models expiration / shrink before fulfillment.
+        # Range is [-100, 0]; e.g. -50 keeps 50% of on_hand + expected_on_hand.
+        inv_adj = override.inventory_adjustment_pct if override is not None else None
+        inv_factor = 1.0 + (inv_adj / 100.0) if inv_adj is not None else 1.0
+        oh_lbs = on_hand.get(pt, 0.0) * inv_factor
+        eoh_lbs = expected_on_hand.get(pt, 0.0) * inv_factor
         on_order = on_order_map.get(pt, 0.0)
         gap = padded_lbs - oh_lbs - eoh_lbs - on_order
 
@@ -920,20 +930,28 @@ def _build_methodology_report(
         lines.append("")
         lines.append("── Per-Product-Type Overrides ──")
         for o in sorted(overrides, key=lambda x: x.product_type):
+            extras = []
+            if o.padding_pct_override is not None:
+                extras.append(f"padding {o.padding_pct_override:g}%")
+            if o.inventory_adjustment_pct is not None:
+                extras.append(f"inventory {o.inventory_adjustment_pct:+g}%")
+            extras_str = f" [{', '.join(extras)}]" if extras else ""
             if o.manual_daily_lbs is not None:
                 toggles = []
                 if o.apply_demand_multiplier: toggles.append("demand")
                 if o.apply_promotion_multiplier: toggles.append("promo")
-                if o.apply_padding: toggles.append("padding")
+                if o.apply_padding and o.padding_pct_override is None: toggles.append("padding")
                 tgl = f" [multipliers: {', '.join(toggles) or 'none'}]" if toggles else " [no multipliers]"
-                lines.append(f"  {o.product_type}: manual {o.manual_daily_lbs} lbs/day{tgl}")
+                lines.append(f"  {o.product_type}: manual {o.manual_daily_lbs} lbs/day{tgl}{extras_str}")
             elif o.custom_range_start and o.custom_range_end:
                 lines.append(
                     f"  {o.product_type}: custom range "
-                    f"{o.custom_range_start.strftime('%Y-%m-%d')} → {o.custom_range_end.strftime('%Y-%m-%d')}"
+                    f"{o.custom_range_start.strftime('%Y-%m-%d')} → {o.custom_range_end.strftime('%Y-%m-%d')}{extras_str}"
                 )
             elif o.historical_weeks:
-                lines.append(f"  {o.product_type}: {o.historical_weeks}-week window")
+                lines.append(f"  {o.product_type}: {o.historical_weeks}-week window{extras_str}")
+            elif extras:
+                lines.append(f"  {o.product_type}: {', '.join(extras)}")
 
     return "\n".join(lines)
 

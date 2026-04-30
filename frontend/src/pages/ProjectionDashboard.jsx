@@ -665,6 +665,8 @@ function OverrideModal({ periodId, productType, existing, onClose, onSaved }) {
   const [applyDemand, setApplyDemand] = useState(existing?.apply_demand_multiplier ?? false)
   const [applyPromo, setApplyPromo] = useState(existing?.apply_promotion_multiplier ?? true)
   const [applyPadding, setApplyPadding] = useState(existing?.apply_padding ?? true)
+  const [paddingOverride, setPaddingOverride] = useState(existing?.padding_pct_override ?? '')
+  const [invAdjustment, setInvAdjustment] = useState(existing?.inventory_adjustment_pct ?? '')
   const [error, setError] = useState(null)
 
   const qc = useQueryClient()
@@ -691,6 +693,19 @@ function OverrideModal({ periodId, productType, existing, onClose, onSaved }) {
 
   function save() {
     setError(null)
+    // Padding override + inventory adjustment are independent of demand mode.
+    let paddingPctOverride = null
+    if (paddingOverride !== '' && paddingOverride !== null) {
+      const n = parseFloat(paddingOverride)
+      if (isNaN(n) || n < 0) { setError('Padding % must be a non-negative number'); return }
+      paddingPctOverride = n
+    }
+    let inventoryAdjustmentPct = null
+    if (invAdjustment !== '' && invAdjustment !== null) {
+      const n = parseFloat(invAdjustment)
+      if (isNaN(n) || n < -100 || n > 0) { setError('Inventory adjustment must be between -100 and 0'); return }
+      inventoryAdjustmentPct = n
+    }
     const body = {
       product_type: productType,
       historical_weeks: null,
@@ -700,6 +715,8 @@ function OverrideModal({ periodId, productType, existing, onClose, onSaved }) {
       apply_demand_multiplier: applyDemand,
       apply_promotion_multiplier: applyPromo,
       apply_padding: applyPadding,
+      padding_pct_override: paddingPctOverride,
+      inventory_adjustment_pct: inventoryAdjustmentPct,
     }
     if (mode === 'weeks') {
       const n = parseInt(weeks, 10)
@@ -714,13 +731,16 @@ function OverrideModal({ periodId, productType, existing, onClose, onSaved }) {
       if (isNaN(n) || n < 0) { setError('Manual lbs/day must be a non-negative number'); return }
       body.manual_daily_lbs = n
     } else {
-      // 'default' — delete any existing override
-      if (existing) {
-        deleteMut.mutate()
-      } else {
-        onClose()
+      // 'default' demand mode — only persist if padding or inventory adjustment is set,
+      // otherwise treat as a clear-the-override action.
+      if (paddingPctOverride === null && inventoryAdjustmentPct === null) {
+        if (existing) {
+          deleteMut.mutate()
+        } else {
+          onClose()
+        }
+        return
       }
-      return
     }
     upsertMut.mutate(body)
   }
@@ -873,6 +893,77 @@ function OverrideModal({ periodId, productType, existing, onClose, onSaved }) {
               {t.label}
             </label>
           ))}
+        </div>
+
+        {/* Padding override + inventory adjustment — independent of demand mode. */}
+        <div style={{
+          padding: 10, background: '#f8fafc',
+          borderRadius: 4, marginBottom: 16,
+          border: '1px solid #e5e7eb',
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 8 }}>
+            Padding & inventory (per-period):
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <label style={{ fontSize: 12, color: '#555', display: 'block', marginBottom: 4 }}>
+              Padding % override
+            </label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <input
+                type="number" min={0} step="1"
+                value={paddingOverride}
+                onChange={e => setPaddingOverride(e.target.value)}
+                placeholder="(use global)"
+                style={{ width: 100, padding: '4px 8px', fontSize: 13, border: '1px solid #d1d5db', borderRadius: 4 }}
+              />
+              <span style={{ fontSize: 12, color: '#666' }}>%</span>
+              {paddingOverride !== '' && (
+                <button
+                  type="button"
+                  onClick={() => setPaddingOverride('')}
+                  style={{
+                    padding: '2px 8px', fontSize: 11, border: '1px solid #d1d5db',
+                    background: '#fff', borderRadius: 3, cursor: 'pointer', color: '#666',
+                  }}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            <div style={{ fontSize: 10, color: '#999', marginTop: 4 }}>
+              Replaces the global product-type padding for this period only. Leave blank to use global.
+            </div>
+          </div>
+          <div>
+            <label style={{ fontSize: 12, color: '#555', display: 'block', marginBottom: 4 }}>
+              Inventory adjustment %
+            </label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <input
+                type="number" min={-100} max={0} step="1"
+                value={invAdjustment}
+                onChange={e => setInvAdjustment(e.target.value)}
+                placeholder="0"
+                style={{ width: 100, padding: '4px 8px', fontSize: 13, border: '1px solid #d1d5db', borderRadius: 4 }}
+              />
+              <span style={{ fontSize: 12, color: '#666' }}>%</span>
+              {invAdjustment !== '' && (
+                <button
+                  type="button"
+                  onClick={() => setInvAdjustment('')}
+                  style={{
+                    padding: '2px 8px', fontSize: 11, border: '1px solid #d1d5db',
+                    background: '#fff', borderRadius: 3, cursor: 'pointer', color: '#666',
+                  }}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            <div style={{ fontSize: 10, color: '#999', marginTop: 4 }}>
+              Range −100 to 0. Reduces on-hand + expected on-hand to model expiration / shrink. −100 zeros out inventory.
+            </div>
+          </div>
         </div>
 
         {error && (
@@ -1370,9 +1461,13 @@ export default function ProjectionDashboard() {
           : undefined
         let ovrLabel = null
         if (ovr) {
-          if (ovr.manual_daily_lbs != null) ovrLabel = `manual ${ovr.manual_daily_lbs}/d`
-          else if (ovr.custom_range_start) ovrLabel = `range ${ovr.custom_range_start.slice(5,10)}→${ovr.custom_range_end.slice(5,10)}`
-          else if (ovr.historical_weeks) ovrLabel = `${ovr.historical_weeks}wk`
+          const parts = []
+          if (ovr.manual_daily_lbs != null) parts.push(`manual ${ovr.manual_daily_lbs}/d`)
+          else if (ovr.custom_range_start) parts.push(`range ${ovr.custom_range_start.slice(5,10)}→${ovr.custom_range_end.slice(5,10)}`)
+          else if (ovr.historical_weeks) parts.push(`${ovr.historical_weeks}wk`)
+          if (ovr.padding_pct_override != null) parts.push(`pad ${ovr.padding_pct_override}%`)
+          if (ovr.inventory_adjustment_pct != null) parts.push(`inv ${ovr.inventory_adjustment_pct >= 0 ? '+' : ''}${ovr.inventory_adjustment_pct}%`)
+          ovrLabel = parts.length ? parts.join(' · ') : null
         }
         return (
           <span style={{ fontWeight: 500 }}>

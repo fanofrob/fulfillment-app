@@ -589,6 +589,12 @@ class PeriodProjectionOverride(Base):
     apply_demand_multiplier    = Column(Boolean, nullable=False, default=False)
     apply_promotion_multiplier = Column(Boolean, nullable=False, default=True)
     apply_padding              = Column(Boolean, nullable=False, default=True)
+    # Per-period padding override. When set, replaces the global ProjectionPaddingConfig
+    # for this product type. Independent of the demand-mode radios above.
+    padding_pct_override       = Column(Float, nullable=True)
+    # Inventory haircut to model expiration / shrink before fulfillment.
+    # Range: -100 (zero out) to 0 (no adjustment). Applied to on_hand + expected_on_hand.
+    inventory_adjustment_pct   = Column(Float, nullable=True)
     notes                      = Column(Text, nullable=True)
     created_at                 = Column(DateTime(timezone=True), server_default=func.now())
     updated_at                 = Column(DateTime(timezone=True), onupdate=func.now())

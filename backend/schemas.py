@@ -646,6 +646,8 @@ class PeriodProjectionOverrideBase(BaseModel):
     apply_demand_multiplier: bool = False
     apply_promotion_multiplier: bool = True
     apply_padding: bool = True
+    padding_pct_override: Optional[float] = None
+    inventory_adjustment_pct: Optional[float] = None
     notes: Optional[str] = None
 
 
