@@ -178,6 +178,13 @@ def _migrate_db():
                             f"USING NULLIF({col_name}, '')::json"
                         ))
                         conn.commit()
+    # Add sub_product_type to purchase_plan_lines if missing
+    if "purchase_plan_lines" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("purchase_plan_lines")}
+        if "sub_product_type" not in cols:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE purchase_plan_lines ADD COLUMN sub_product_type TEXT"))
+                conn.commit()
 
 
 def _seed_ups_rates():

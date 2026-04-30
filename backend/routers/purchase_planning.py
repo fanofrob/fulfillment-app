@@ -29,6 +29,7 @@ class PurchasePlanLineCreate(BaseModel):
     projection_period_id: int
     vendor_id: Optional[int] = None
     product_type: str = Field(..., min_length=1)
+    sub_product_type: Optional[str] = None
     purchase_weight_lbs: Optional[float] = None
     case_weight_lbs: Optional[float] = None
     quantity: Optional[float] = None
@@ -38,6 +39,8 @@ class PurchasePlanLineCreate(BaseModel):
 class PurchasePlanLineUpdate(BaseModel):
     vendor_id: Optional[int] = None
     product_type: Optional[str] = Field(None, min_length=1)
+    # Empty string clears the substitution. None means "no change".
+    sub_product_type: Optional[str] = None
     purchase_weight_lbs: Optional[float] = None
     case_weight_lbs: Optional[float] = None
     quantity: Optional[float] = None
@@ -68,35 +71,83 @@ def _current_projection_for_period(db: Session, period_id: int) -> Optional[mode
     )
 
 
-def _gap_map_for_period(db: Session, period_id: int) -> dict[str, float]:
-    """{product_type: gap_lbs} from the current projection for this period."""
+def _projection_metrics_for_period(db: Session, period_id: int) -> dict[str, dict]:
+    """{product_type: {gap_lbs, on_hand_lbs}} from the current projection for this period."""
     proj = _current_projection_for_period(db, period_id)
     if not proj:
         return {}
     lines = db.query(models.ProjectionLine).filter(
         models.ProjectionLine.projection_id == proj.id
     ).all()
-    return {l.product_type: float(l.gap_lbs or 0) for l in lines}
+    return {
+        l.product_type: {
+            "gap_lbs": float(l.gap_lbs or 0),
+            "on_hand_lbs": float(l.on_hand_lbs or 0),
+        }
+        for l in lines
+    }
+
+
+def _purchases_by_combo(
+    lines: list[models.PurchasePlanLine],
+) -> dict[tuple[str, str], float]:
+    """
+    Sum purchase_weight_lbs across all lines sharing the same
+    (product_type, sub_product_type) combo. Empty/None sub_product_type
+    is treated as "" so rows with no substitution aggregate together.
+    """
+    out: dict[tuple[str, str], float] = {}
+    for l in lines:
+        if not l.purchase_weight_lbs:
+            continue
+        key = (l.product_type, l.sub_product_type or "")
+        out[key] = out.get(key, 0.0) + float(l.purchase_weight_lbs)
+    return out
 
 
 def _serialize_line(
     line: models.PurchasePlanLine,
-    gap_lbs: Optional[float],
-    purchased_total_for_pt: float,
+    metrics: dict[str, dict],
+    purchases_by_combo: dict[tuple[str, str], float],
 ) -> dict:
     pwh = _purchase_weight_helper(line.purchase_weight_lbs, line.case_weight_lbs)
-    net = None if gap_lbs is None else (gap_lbs - purchased_total_for_pt)
+
+    base = metrics.get(line.product_type)
+    base_gap = base["gap_lbs"] if base else None
+    inventory_lbs = base["on_hand_lbs"] if base else None
+
+    sub_pt = line.sub_product_type or None
+    sub = metrics.get(sub_pt) if sub_pt else None
+    sub_inventory_lbs = sub["on_hand_lbs"] if sub else None
+
+    # Gap shown on this row: original gap minus the sub product type's on-hand
+    # (which can substitute for the base). Sub inventory only counts when a
+    # sub_product_type is set on this row.
+    if base_gap is None:
+        gap_lbs: Optional[float] = None
+    else:
+        gap_lbs = base_gap - (sub_inventory_lbs or 0.0)
+
+    purchased_for_combo = purchases_by_combo.get(
+        (line.product_type, line.sub_product_type or ""), 0.0
+    )
+    net = None if gap_lbs is None else (gap_lbs - purchased_for_combo)
+
     return {
         "id": line.id,
         "projection_period_id": line.projection_period_id,
         "vendor_id": line.vendor_id,
         "product_type": line.product_type,
+        "sub_product_type": line.sub_product_type,
         "purchase_weight_lbs": line.purchase_weight_lbs,
         "case_weight_lbs": line.case_weight_lbs,
         "quantity": line.quantity,
         "notes": line.notes,
+        "inventory_lbs": inventory_lbs,
+        "sub_inventory_lbs": sub_inventory_lbs,
         "gap_lbs": gap_lbs,
         "purchase_weight_helper_lbs": pwh,
+        "purchased_combo_total_lbs": purchased_for_combo,
         "net_after_purchase_lbs": net,
         "created_at": line.created_at.isoformat() if line.created_at else None,
         "updated_at": line.updated_at.isoformat() if line.updated_at else None,
@@ -117,27 +168,14 @@ def list_plan_lines(
         .order_by(models.PurchasePlanLine.id)
         .all()
     )
-    gap_map = _gap_map_for_period(db, projection_period_id)
-
-    # Sum purchase_weight per product_type so net-after-purchase is consistent
-    # across all rows for the same product type (the gap nets across vendors).
-    purchased_by_pt: dict[str, float] = {}
-    for l in lines:
-        if l.purchase_weight_lbs:
-            purchased_by_pt[l.product_type] = purchased_by_pt.get(l.product_type, 0.0) + float(l.purchase_weight_lbs)
+    metrics = _projection_metrics_for_period(db, projection_period_id)
+    purchases = _purchases_by_combo(lines)
 
     return {
         "projection_period_id": projection_period_id,
-        "has_current_projection": bool(gap_map),
-        "items": [
-            _serialize_line(
-                l,
-                gap_lbs=gap_map.get(l.product_type),
-                purchased_total_for_pt=purchased_by_pt.get(l.product_type, 0.0),
-            )
-            for l in lines
-        ],
-        "available_product_types": sorted(gap_map.keys()),
+        "has_current_projection": bool(metrics),
+        "items": [_serialize_line(l, metrics, purchases) for l in lines],
+        "available_product_types": sorted(metrics.keys()),
     }
 
 
@@ -155,6 +193,7 @@ def create_plan_line(body: PurchasePlanLineCreate, db: Session = Depends(get_db)
         projection_period_id=body.projection_period_id,
         vendor_id=body.vendor_id,
         product_type=body.product_type,
+        sub_product_type=(body.sub_product_type or None),
         purchase_weight_lbs=body.purchase_weight_lbs,
         case_weight_lbs=body.case_weight_lbs,
         quantity=body.quantity,
@@ -164,15 +203,12 @@ def create_plan_line(body: PurchasePlanLineCreate, db: Session = Depends(get_db)
     db.commit()
     db.refresh(line)
 
-    gap_map = _gap_map_for_period(db, body.projection_period_id)
-    purchased = sum(
-        float(l.purchase_weight_lbs or 0)
-        for l in db.query(models.PurchasePlanLine).filter_by(
-            projection_period_id=body.projection_period_id,
-            product_type=line.product_type,
-        ).all()
-    )
-    return _serialize_line(line, gap_map.get(line.product_type), purchased)
+    metrics = _projection_metrics_for_period(db, body.projection_period_id)
+    period_lines = db.query(models.PurchasePlanLine).filter_by(
+        projection_period_id=body.projection_period_id
+    ).all()
+    purchases = _purchases_by_combo(period_lines)
+    return _serialize_line(line, metrics, purchases)
 
 
 @router.put("/{line_id}")
@@ -186,19 +222,19 @@ def update_plan_line(line_id: int, body: PurchasePlanLineUpdate, db: Session = D
             raise HTTPException(404, "Vendor not found")
 
     for k, v in body.model_dump(exclude_unset=True).items():
+        # Treat empty-string sub_product_type as "clear the substitution"
+        if k == "sub_product_type" and v == "":
+            v = None
         setattr(line, k, v)
     db.commit()
     db.refresh(line)
 
-    gap_map = _gap_map_for_period(db, line.projection_period_id)
-    purchased = sum(
-        float(l.purchase_weight_lbs or 0)
-        for l in db.query(models.PurchasePlanLine).filter_by(
-            projection_period_id=line.projection_period_id,
-            product_type=line.product_type,
-        ).all()
-    )
-    return _serialize_line(line, gap_map.get(line.product_type), purchased)
+    metrics = _projection_metrics_for_period(db, line.projection_period_id)
+    period_lines = db.query(models.PurchasePlanLine).filter_by(
+        projection_period_id=line.projection_period_id
+    ).all()
+    purchases = _purchases_by_combo(period_lines)
+    return _serialize_line(line, metrics, purchases)
 
 
 @router.delete("/{line_id}")

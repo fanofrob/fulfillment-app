@@ -148,6 +148,26 @@ function ProductTypeCell({ value, productTypes, onSave }) {
   )
 }
 
+function SubProductTypeCell({ value, productTypes, baseProductType, onSave }) {
+  // Dropdown of all available product types for the substitute. Empty option
+  // clears the substitution. Excludes the row's own base product_type.
+  return (
+    <select
+      value={value ?? ''}
+      onChange={(e) => onSave(e.target.value === '' ? '' : e.target.value)}
+      style={{
+        width: '100%', minWidth: 140, padding: '4px 6px', fontSize: 12,
+        border: '1px solid #e5e7eb', borderRadius: 4, background: '#fff',
+      }}
+    >
+      <option value="">—</option>
+      {productTypes
+        .filter((pt) => pt !== baseProductType)
+        .map((pt) => (<option key={pt} value={pt}>{pt}</option>))}
+    </select>
+  )
+}
+
 // ── Column filter input (per-column) ───────────────────────────────────────
 function ColumnFilter({ column }) {
   const value = column.getFilterValue() ?? ''
@@ -288,6 +308,50 @@ export default function PurchasePlanning() {
       filterFn: 'includesString',
     },
     {
+      id: 'sub_product_type',
+      header: 'Sub Product Type',
+      accessorKey: 'sub_product_type',
+      cell: ({ row }) => (
+        <SubProductTypeCell
+          value={row.original.sub_product_type}
+          productTypes={productTypes}
+          baseProductType={row.original.product_type}
+          onSave={(pt) => handleUpdate(row.original.id, { sub_product_type: pt })}
+        />
+      ),
+      filterFn: 'includesString',
+    },
+    {
+      id: 'inventory_lbs',
+      header: 'Inventory (lbs)',
+      accessorKey: 'inventory_lbs',
+      cell: ({ getValue }) => {
+        const v = getValue()
+        return (
+          <span style={{ color: v == null ? '#9ca3af' : '#374151' }}>
+            {v == null ? '—' : fmtNum(v)}
+          </span>
+        )
+      },
+      sortingFn: 'basic',
+      enableColumnFilter: false,
+    },
+    {
+      id: 'sub_inventory_lbs',
+      header: 'Sub Inventory (lbs)',
+      accessorKey: 'sub_inventory_lbs',
+      cell: ({ getValue }) => {
+        const v = getValue()
+        return (
+          <span style={{ color: v == null ? '#9ca3af' : '#374151' }}>
+            {v == null ? '—' : fmtNum(v)}
+          </span>
+        )
+      },
+      sortingFn: 'basic',
+      enableColumnFilter: false,
+    },
+    {
       id: 'gap_lbs',
       header: 'Gap (lbs)',
       accessorKey: 'gap_lbs',
@@ -415,18 +479,21 @@ export default function PurchasePlanning() {
   // ── Render ──────────────────────────────────────────────────────────────
   const period = periods.find((p) => p.id === periodId)
   const totals = useMemo(() => {
-    const totalGap = items.reduce((sum, r) => sum + (r.gap_lbs ?? 0) * 0, 0)  // gap dedup-by-pt
-    const ptSeen = new Set()
+    // Dedup gap by (product_type, sub_product_type) combo so multiple
+    // vendor splits of the same combo only count once. Different sub values
+    // for the same base count separately (parallel substitution strategies).
+    const comboSeen = new Set()
     let gapSum = 0
     let purchaseSum = 0
     for (const r of items) {
-      if (!ptSeen.has(r.product_type)) {
-        ptSeen.add(r.product_type)
+      const key = `${r.product_type}::${r.sub_product_type ?? ''}`
+      if (!comboSeen.has(key)) {
+        comboSeen.add(key)
         if (r.gap_lbs != null) gapSum += r.gap_lbs
       }
       if (r.purchase_weight_lbs != null) purchaseSum += r.purchase_weight_lbs
     }
-    return { gapSum, purchaseSum, netSum: gapSum - purchaseSum, _ignore: totalGap }
+    return { gapSum, purchaseSum, netSum: gapSum - purchaseSum }
   }, [items])
 
   return (
@@ -436,9 +503,11 @@ export default function PurchasePlanning() {
           <h1>Purchase Planning</h1>
           <p>
             Plan purchases against a projection period. Pick a period, fill in
-            vendor / case weight / purchase weight per product type. Net After
-            Purchase = gap − sum of purchase weights for the same product type
-            (so splits across vendors net out together).
+            vendor / case weight / purchase weight per product type. Optionally
+            set a Sub Product Type — its on-hand reduces the row's Gap and
+            purchases on the substitute fill the same gap. Net After Purchase
+            sums across all rows sharing the same (product type, sub product
+            type) combo, so splits across vendors net out together.
           </p>
         </div>
       </div>
@@ -508,7 +577,7 @@ export default function PurchasePlanning() {
 
       {periodId && (
         <div className="data-table-wrap" style={{ overflowX: 'auto' }}>
-          <table className="data-table" style={{ minWidth: 1200 }}>
+          <table className="data-table" style={{ minWidth: 1600 }}>
             <thead>
               {table.getHeaderGroups().map((hg) => (
                 <tr key={hg.id}>

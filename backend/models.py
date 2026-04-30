@@ -847,6 +847,7 @@ class PurchasePlanLine(Base):
     projection_period_id  = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
     vendor_id             = Column(Integer, ForeignKey("vendors.id"), nullable=True, index=True)
     product_type          = Column(String, nullable=False, index=True)
+    sub_product_type      = Column(String, nullable=True, index=True)  # substitute product type whose on-hand can fill base's gap
     purchase_weight_lbs   = Column(Float, nullable=True)   # user input — target buy in lbs
     case_weight_lbs       = Column(Float, nullable=True)   # user input — 1 means no case (per piece/lb)
     quantity              = Column(Float, nullable=True)   # user input — # of cases or lbs or pieces
