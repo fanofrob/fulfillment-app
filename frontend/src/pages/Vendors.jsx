@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { vendorsApi } from '../api'
 
@@ -6,13 +6,90 @@ const COMM_OPTIONS = ['whatsapp', 'email', 'phone']
 
 const EMPTY_VENDOR = {
   name: '', contact_name: '', contact_email: '', contact_phone: '',
-  contact_whatsapp: '', preferred_communication: 'email', notes: '', is_active: true,
+  contact_whatsapp: '', preferred_communication: 'email',
+  url: '', pickup_address: '', agg_location: '',
+  product_catalog: [],
+  notes: '', is_active: true,
 }
 
 const EMPTY_PRODUCT = {
   product_type: '', default_case_weight_lbs: '', default_case_count: '',
   default_price_per_case: '', default_price_per_lb: '', lead_time_days: '',
   order_unit: 'case', is_preferred: false, notes: '',
+}
+
+// ── Multi-select tag input for product_catalog ────────────────────────────
+function CatalogPicker({ value = [], onChange, suggestions = [] }) {
+  const [draft, setDraft] = useState('')
+  const tags = Array.isArray(value) ? value : []
+
+  function addTag(tag) {
+    const t = (tag || '').trim()
+    if (!t) return
+    if (tags.includes(t)) {
+      setDraft('')
+      return
+    }
+    onChange([...tags, t])
+    setDraft('')
+  }
+  function removeTag(t) {
+    onChange(tags.filter(x => x !== t))
+  }
+  function handleKey(e) {
+    if (e.key === 'Enter' || e.key === ',') {
+      e.preventDefault()
+      addTag(draft)
+    } else if (e.key === 'Backspace' && draft === '' && tags.length > 0) {
+      onChange(tags.slice(0, -1))
+    }
+  }
+
+  const listId = 'catalog-suggestions'
+  return (
+    <div style={{
+      border: '1px solid #d1d5db', borderRadius: 4, padding: '4px 6px',
+      display: 'flex', flexWrap: 'wrap', gap: 4, alignItems: 'center',
+      background: '#fff', minHeight: 36,
+    }}>
+      {tags.map(t => (
+        <span key={t} style={{
+          background: '#e0e7ff', color: '#3730a3', borderRadius: 12,
+          padding: '2px 8px', fontSize: 12, display: 'inline-flex',
+          alignItems: 'center', gap: 4,
+        }}>
+          {t}
+          <button
+            type="button"
+            onClick={() => removeTag(t)}
+            style={{
+              background: 'none', border: 'none', color: '#3730a3',
+              cursor: 'pointer', fontSize: 14, lineHeight: 1, padding: 0,
+            }}
+            aria-label={`Remove ${t}`}
+          >×</button>
+        </span>
+      ))}
+      <input
+        type="text"
+        list={listId}
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onKeyDown={handleKey}
+        onBlur={() => addTag(draft)}
+        placeholder={tags.length === 0 ? 'Type and press Enter…' : ''}
+        style={{
+          flex: 1, minWidth: 140, border: 'none', outline: 'none',
+          fontSize: 13, padding: '4px 2px', background: 'transparent',
+        }}
+      />
+      <datalist id={listId}>
+        {suggestions.filter(s => !tags.includes(s)).map(s => (
+          <option key={s} value={s} />
+        ))}
+      </datalist>
+    </div>
+  )
 }
 
 export default function Vendors() {
@@ -25,11 +102,41 @@ export default function Vendors() {
   const [productForm, setProductForm] = useState(EMPTY_PRODUCT)
   const [activeVendorId, setActiveVendorId] = useState(null)
   const [expandedVendor, setExpandedVendor] = useState(null)
+  const [search, setSearch] = useState('')
+  const [catalogFilter, setCatalogFilter] = useState('')
+  const [syncMsg, setSyncMsg] = useState(null)
 
   const { data: vendors = [], isLoading } = useQuery({
     queryKey: ['vendors'],
     queryFn: () => vendorsApi.list(),
   })
+
+  // Build a global suggestion list from every existing vendor's catalog so the
+  // datalist in CatalogPicker can offer auto-complete from previous entries.
+  const catalogSuggestions = useMemo(() => {
+    const set = new Set()
+    for (const v of vendors) {
+      for (const t of (v.product_catalog || [])) set.add(t)
+    }
+    return Array.from(set).sort()
+  }, [vendors])
+
+  const filteredVendors = useMemo(() => {
+    const s = search.trim().toLowerCase()
+    const cf = catalogFilter.trim().toLowerCase()
+    return vendors.filter(v => {
+      if (s) {
+        const hay = [v.name, v.contact_name, v.agg_location, v.pickup_address, v.notes]
+          .filter(Boolean).join(' ').toLowerCase()
+        if (!hay.includes(s)) return false
+      }
+      if (cf) {
+        const matchesCatalog = (v.product_catalog || []).some(t => t.toLowerCase().includes(cf))
+        if (!matchesCatalog) return false
+      }
+      return true
+    })
+  }, [vendors, search, catalogFilter])
 
   const createVendorMut = useMutation({
     mutationFn: vendorsApi.create,
@@ -42,6 +149,14 @@ export default function Vendors() {
   const deleteVendorMut = useMutation({
     mutationFn: vendorsApi.delete,
     onSuccess: () => qc.invalidateQueries(['vendors']),
+  })
+  const syncMut = useMutation({
+    mutationFn: vendorsApi.syncFromSheets,
+    onSuccess: (res) => {
+      qc.invalidateQueries(['vendors'])
+      setSyncMsg(`Synced from RAW_Agg_Partners: ${res.created} created, ${res.updated} updated, ${res.skipped} unchanged (of ${res.total_rows} sheet rows).`)
+    },
+    onError: (err) => setSyncMsg(`Sync failed: ${err?.response?.data?.detail || err.message}`),
   })
 
   const addProductMut = useMutation({
@@ -74,7 +189,11 @@ export default function Vendors() {
     setVendorForm({
       name: v.name || '', contact_name: v.contact_name || '', contact_email: v.contact_email || '',
       contact_phone: v.contact_phone || '', contact_whatsapp: v.contact_whatsapp || '',
-      preferred_communication: v.preferred_communication || 'email', notes: v.notes || '',
+      preferred_communication: v.preferred_communication || 'email',
+      url: v.url || '', pickup_address: v.pickup_address || '',
+      agg_location: v.agg_location || '',
+      product_catalog: Array.isArray(v.product_catalog) ? [...v.product_catalog] : [],
+      notes: v.notes || '',
       is_active: v.is_active,
     })
     setShowVendorModal(true)
@@ -125,18 +244,77 @@ export default function Vendors() {
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
         <h1 style={{ margin: 0 }}>Vendor Management</h1>
-        <button className="btn btn-primary" onClick={() => setShowVendorModal(true)}>+ Add Vendor</button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            className="btn"
+            onClick={() => syncMut.mutate()}
+            disabled={syncMut.isPending}
+            title="Pull vendors from the RAW_Agg_Partners Google Sheet"
+          >
+            {syncMut.isPending ? 'Syncing…' : '↻ Sync from Sheets'}
+          </button>
+          <button className="btn btn-primary" onClick={() => setShowVendorModal(true)}>+ Add Vendor</button>
+        </div>
+      </div>
+
+      {syncMsg && (
+        <div style={{
+          marginBottom: 12, padding: '8px 12px', borderRadius: 6,
+          background: syncMsg.startsWith('Sync failed') ? '#fee2e2' : '#ecfdf5',
+          color: syncMsg.startsWith('Sync failed') ? '#991b1b' : '#065f46',
+          fontSize: 13, display: 'flex', justifyContent: 'space-between',
+        }}>
+          <span>{syncMsg}</span>
+          <button
+            onClick={() => setSyncMsg(null)}
+            style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'inherit' }}
+          >×</button>
+        </div>
+      )}
+
+      {/* Filters */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+        <input
+          type="text"
+          placeholder="Search vendors (name, contact, location)…"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          style={{
+            flex: 1, padding: '6px 10px', border: '1px solid #d1d5db',
+            borderRadius: 4, fontSize: 13,
+          }}
+        />
+        <input
+          type="text"
+          placeholder="Filter by product catalog…"
+          value={catalogFilter}
+          onChange={e => setCatalogFilter(e.target.value)}
+          list="catalog-filter-list"
+          style={{
+            flex: 1, padding: '6px 10px', border: '1px solid #d1d5db',
+            borderRadius: 4, fontSize: 13,
+          }}
+        />
+        <datalist id="catalog-filter-list">
+          {catalogSuggestions.map(s => <option key={s} value={s} />)}
+        </datalist>
       </div>
 
       {isLoading && <p>Loading...</p>}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-        {vendors.map(v => (
+        {filteredVendors.map(v => (
           <div key={v.id} style={{ border: '1px solid #e2e8f0', borderRadius: 8, padding: 16, background: v.is_active ? '#fff' : '#f9fafb' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-              <div>
-                <h3 style={{ margin: '0 0 4px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <h3 style={{ margin: '0 0 4px 0', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                   {v.name}
+                  {v.agg_location && (
+                    <span style={{
+                      fontSize: 11, fontWeight: 500, color: '#1e40af',
+                      background: '#dbeafe', padding: '2px 8px', borderRadius: 12,
+                    }}>{v.agg_location}</span>
+                  )}
                   {!v.is_active && <span style={{ fontSize: 12, color: '#9ca3af', fontWeight: 400 }}>Inactive</span>}
                 </h3>
                 <div style={{ fontSize: 13, color: '#6b7280' }}>
@@ -145,6 +323,26 @@ export default function Vendors() {
                   {v.contact_email && <span> &middot; {v.contact_email}</span>}
                   {v.contact_phone && <span> &middot; {v.contact_phone}</span>}
                 </div>
+                {v.url && (
+                  <div style={{ fontSize: 13, marginTop: 4 }}>
+                    <a href={v.url.startsWith('http') ? v.url : `https://${v.url}`} target="_blank" rel="noreferrer" style={{ color: '#6366f1' }}>{v.url}</a>
+                  </div>
+                )}
+                {v.pickup_address && (
+                  <div style={{ fontSize: 13, color: '#6b7280', marginTop: 4 }}>
+                    📍 {v.pickup_address}
+                  </div>
+                )}
+                {v.product_catalog && v.product_catalog.length > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}>
+                    {v.product_catalog.map(t => (
+                      <span key={t} style={{
+                        fontSize: 11, color: '#3730a3', background: '#e0e7ff',
+                        padding: '2px 8px', borderRadius: 12,
+                      }}>{t}</span>
+                    ))}
+                  </div>
+                )}
                 {v.notes && <div style={{ fontSize: 13, color: '#9ca3af', marginTop: 4 }}>{v.notes}</div>}
               </div>
               <div style={{ display: 'flex', gap: 8 }}>
@@ -206,14 +404,18 @@ export default function Vendors() {
         ))}
       </div>
 
-      {vendors.length === 0 && !isLoading && (
-        <p style={{ color: '#6b7280', textAlign: 'center', marginTop: 40 }}>No vendors yet. Click "+ Add Vendor" to get started.</p>
+      {filteredVendors.length === 0 && !isLoading && (
+        <p style={{ color: '#6b7280', textAlign: 'center', marginTop: 40 }}>
+          {vendors.length === 0
+            ? 'No vendors yet. Click "+ Add Vendor" to get started, or "Sync from Sheets" to import from RAW_Agg_Partners.'
+            : 'No vendors match the current filters.'}
+        </p>
       )}
 
       {/* Vendor Modal */}
       {showVendorModal && (
         <div className="modal-overlay" onClick={closeVendorModal}>
-          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520 }}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 640 }}>
             <h2>{editing ? 'Edit Vendor' : 'New Vendor'}</h2>
             <form onSubmit={handleVendorSubmit}>
               <div className="form-group">
@@ -226,31 +428,54 @@ export default function Vendors() {
                   <input value={vendorForm.contact_name} onChange={vf('contact_name')} />
                 </div>
                 <div className="form-group">
-                  <label>Preferred Communication</label>
-                  <select value={vendorForm.preferred_communication} onChange={vf('preferred_communication')}>
-                    {COMM_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
+                  <label>Cell / Phone</label>
+                  <input value={vendorForm.contact_phone} onChange={vf('contact_phone')} />
                 </div>
                 <div className="form-group">
                   <label>Email</label>
                   <input type="email" value={vendorForm.contact_email} onChange={vf('contact_email')} />
                 </div>
                 <div className="form-group">
-                  <label>Phone</label>
-                  <input value={vendorForm.contact_phone} onChange={vf('contact_phone')} />
-                </div>
-                <div className="form-group">
                   <label>WhatsApp</label>
                   <input value={vendorForm.contact_whatsapp} onChange={vf('contact_whatsapp')} />
                 </div>
-                <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 24 }}>
-                  <input type="checkbox" checked={vendorForm.is_active} onChange={vf('is_active')} />
-                  <label style={{ margin: 0 }}>Active</label>
+                <div className="form-group">
+                  <label>Preferred Communication</label>
+                  <select value={vendorForm.preferred_communication} onChange={vf('preferred_communication')}>
+                    {COMM_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>Agg Location</label>
+                  <input value={vendorForm.agg_location} onChange={vf('agg_location')} placeholder="e.g. LA, Local South, GHF" />
+                </div>
+                <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                  <label>URL</label>
+                  <input value={vendorForm.url} onChange={vf('url')} placeholder="https://example.com" />
+                </div>
+                <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                  <label>Pickup Address</label>
+                  <input value={vendorForm.pickup_address} onChange={vf('pickup_address')} />
+                </div>
+              </div>
+              <div className="form-group">
+                <label>Product Catalog</label>
+                <CatalogPicker
+                  value={vendorForm.product_catalog}
+                  onChange={(next) => setVendorForm({ ...vendorForm, product_catalog: next })}
+                  suggestions={catalogSuggestions}
+                />
+                <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 4 }}>
+                  Type a product (e.g. <code>Fruit: Mango, Kent</code>) and press Enter or comma. Drives the suggested-vendor list in Purchase Planning.
                 </div>
               </div>
               <div className="form-group">
                 <label>Notes</label>
                 <textarea value={vendorForm.notes} onChange={vf('notes')} rows={2} />
+              </div>
+              <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input type="checkbox" checked={vendorForm.is_active} onChange={vf('is_active')} />
+                <label style={{ margin: 0 }}>Active</label>
               </div>
               <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 12 }}>
                 <button type="button" className="btn" onClick={closeVendorModal}>Cancel</button>

@@ -1,6 +1,7 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional, List, Any
 from datetime import date, datetime
+import json
 
 
 # ---------------------------------------------------------------------------
@@ -924,6 +925,10 @@ class VendorBase(BaseModel):
     contact_phone: Optional[str] = None
     contact_whatsapp: Optional[str] = None
     preferred_communication: Optional[str] = None
+    url: Optional[str] = None
+    pickup_address: Optional[str] = None
+    agg_location: Optional[str] = None
+    product_catalog: List[str] = []
     notes: Optional[str] = None
     is_active: bool = True
 
@@ -937,6 +942,10 @@ class VendorUpdate(BaseModel):
     contact_phone: Optional[str] = None
     contact_whatsapp: Optional[str] = None
     preferred_communication: Optional[str] = None
+    url: Optional[str] = None
+    pickup_address: Optional[str] = None
+    agg_location: Optional[str] = None
+    product_catalog: Optional[List[str]] = None
     notes: Optional[str] = None
     is_active: Optional[bool] = None
 
@@ -947,6 +956,23 @@ class VendorResponse(VendorBase):
     updated_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+    @field_validator("product_catalog", mode="before")
+    @classmethod
+    def _parse_catalog(cls, v):
+        # ORM stores product_catalog as a JSON-encoded TEXT column. Decode it
+        # on the way out so the API exposes a clean List[str].
+        if v is None or v == "":
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                return parsed if isinstance(parsed, list) else []
+            except (ValueError, TypeError):
+                return []
+        return []
 
 
 # ---------------------------------------------------------------------------

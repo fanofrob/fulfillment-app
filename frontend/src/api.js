@@ -429,6 +429,8 @@ export const vendorsApi = {
   // Lookups
   getPreferred: (productType) => api.get(`/vendors/preferred/${encodeURIComponent(productType)}`).then(r => r.data),
   getByProductType: (productType) => api.get(`/vendors/by-product-type/${encodeURIComponent(productType)}`).then(r => r.data),
+  // Sheet sync
+  syncFromSheets: () => api.post('/vendors/sync-from-sheets').then(r => r.data),
 }
 
 export const purchaseOrdersApi = {

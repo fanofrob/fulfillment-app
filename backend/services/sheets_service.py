@@ -22,6 +22,7 @@ SPREADSHEET_IDS = {
     "inventory":       "19-0HG0voqQkzBfiMwmCC05KE8pO4lQapvrnI_H7nWDY",
     "fruit_dashboard": "1Blls8QQsdWcOKgeJspyRtbSQ4e3BCpTUF1Rf9CXfgXY",
     "cogs_shipping":   "1IjZT0BMjIMV3r9-B2pMgtpcPIFgvIha-9HAxvsRs6ng",
+    "agg_partners":    "1CdTTV8pMqq_wS9vu0qa8HMykNkqtOverrIsP0WLSUeM",
 }
 
 CREDENTIALS_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "credentials.json")
@@ -737,3 +738,61 @@ def get_sku_mapping_lookup(warehouse: str) -> dict:
 
 def is_configured() -> bool:
     return bool(os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()) or os.path.exists(CREDENTIALS_PATH)
+
+
+# ── Aggregator Partners (vendors) ────────────────────────────────────────────
+
+def pull_agg_partners() -> list:
+    """
+    Pull vendor records from the RAW_Agg_Partners tab.
+
+    Columns (row 1 = header):
+      Name, Contact Name, Cell, Url, Pickup Address, Notes, Fruit, Agg Location
+    Returns list of dicts. Skips rows where Name is empty (sentinel/blank rows).
+    """
+    client = _get_client()
+    ws = client.open_by_key(SPREADSHEET_IDS["agg_partners"]).worksheet("RAW_Agg_Partners")
+    all_values = ws.get_all_values()
+    if len(all_values) < 2:
+        return []
+
+    headers = [h.strip().lower() for h in all_values[0]]
+    def col_idx(name):
+        try:
+            return headers.index(name.lower())
+        except ValueError:
+            return None
+
+    cols = {
+        "name":           col_idx("Name"),
+        "contact_name":   col_idx("Contact Name"),
+        "cell":           col_idx("Cell"),
+        "url":            col_idx("Url"),
+        "pickup_address": col_idx("Pickup Address"),
+        "notes":          col_idx("Notes"),
+        "fruit":          col_idx("Fruit"),
+        "agg_location":   col_idx("Agg Location"),
+    }
+
+    def get(row, key):
+        idx = cols.get(key)
+        if idx is None or idx >= len(row):
+            return ""
+        return str(row[idx]).strip()
+
+    result = []
+    for row in all_values[1:]:
+        name = get(row, "name")
+        if not name:
+            continue
+        result.append({
+            "name":           name,
+            "contact_name":   get(row, "contact_name") or None,
+            "contact_phone":  get(row, "cell") or None,
+            "url":            get(row, "url") or None,
+            "pickup_address": get(row, "pickup_address") or None,
+            "notes":          get(row, "notes") or None,
+            "fruit_raw":      get(row, "fruit") or "",
+            "agg_location":   get(row, "agg_location") or None,
+        })
+    return result

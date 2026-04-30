@@ -66,7 +66,25 @@ function NumberCell({ value, onSave, placeholder, step = 'any' }) {
   )
 }
 
-function VendorCell({ value, vendors, onSave }) {
+function VendorCell({ value, vendors, productType, onSave }) {
+  // Split vendors into "Suggested" (catalog contains the row's product_type)
+  // and "Other". The suggested group renders as an <optgroup> at the top so
+  // the user can pick a likely match without scanning the full list.
+  const pt = (productType || '').trim().toLowerCase()
+  const { suggested, other } = useMemo(() => {
+    if (!pt) return { suggested: [], other: vendors }
+    const sug = []
+    const oth = []
+    for (const v of vendors) {
+      const cat = (v.product_catalog || []).map(t => String(t).toLowerCase())
+      // Match if any catalog tag equals or contains the product type, OR vice-versa.
+      const hit = cat.some(t => t === pt || t.includes(pt) || pt.includes(t))
+      if (hit) sug.push(v)
+      else oth.push(v)
+    }
+    return { suggested: sug, other: oth }
+  }, [vendors, pt])
+
   return (
     <select
       value={value ?? ''}
@@ -77,9 +95,18 @@ function VendorCell({ value, vendors, onSave }) {
       }}
     >
       <option value="">—</option>
-      {vendors.map((v) => (
-        <option key={v.id} value={v.id}>{v.name}</option>
-      ))}
+      {suggested.length > 0 && (
+        <optgroup label={`★ Suggested for "${productType}"`}>
+          {suggested.map((v) => (
+            <option key={v.id} value={v.id}>{v.name}</option>
+          ))}
+        </optgroup>
+      )}
+      <optgroup label={suggested.length > 0 ? 'All vendors' : 'Vendors'}>
+        {other.map((v) => (
+          <option key={v.id} value={v.id}>{v.name}</option>
+        ))}
+      </optgroup>
     </select>
   )
 }
@@ -239,6 +266,7 @@ export default function PurchasePlanning() {
           <VendorCell
             value={row.original.vendor_id}
             vendors={vendors}
+            productType={row.original.product_type}
             onSave={(vendorId) => handleUpdate(row.original.id, { vendor_id: vendorId })}
           />
         )

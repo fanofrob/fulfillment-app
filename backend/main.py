@@ -133,6 +133,19 @@ def _migrate_db():
                 if col_name not in cols:
                     conn.execute(text(f"ALTER TABLE picklist_skus ADD COLUMN {col_name} {col_type}"))
             conn.commit()
+    # Add new vendor columns (url, pickup_address, agg_location, product_catalog) if missing
+    if "vendors" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("vendors")}
+        with engine.connect() as conn:
+            for col_name, col_type in [
+                ("url",             "TEXT"),
+                ("pickup_address",  "TEXT"),
+                ("agg_location",    "TEXT"),
+                ("product_catalog", "TEXT"),
+            ]:
+                if col_name not in cols:
+                    conn.execute(text(f"ALTER TABLE vendors ADD COLUMN {col_name} {col_type}"))
+            conn.commit()
     # Add confirmed-demand review/override fields to projection_periods if missing.
     # confirmed_demand_*_lbs must be JSON: SQLAlchemy's JSON type round-trips
     # dicts on Postgres only when the column is native JSON, not TEXT.

@@ -745,6 +745,14 @@ class Vendor(Base):
     contact_phone            = Column(String, nullable=True)
     contact_whatsapp         = Column(String, nullable=True)
     preferred_communication  = Column(String, nullable=True)  # whatsapp | email | phone
+    url                      = Column(String, nullable=True)
+    pickup_address           = Column(Text, nullable=True)
+    agg_location             = Column(String, nullable=True)
+    # JSON-encoded list of product type tags (multi-select). Used for the
+    # "suggested vendor" feature on Purchase Planning and as a quick filter on
+    # the Vendors page. Detailed pricing/case info per product still lives on
+    # vendor_products.
+    product_catalog          = Column(Text, nullable=True)
     notes                    = Column(Text, nullable=True)
     is_active                = Column(Boolean, nullable=False, default=True)
     created_at               = Column(DateTime(timezone=True), server_default=func.now())
