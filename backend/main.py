@@ -133,19 +133,38 @@ def _migrate_db():
                 if col_name not in cols:
                     conn.execute(text(f"ALTER TABLE picklist_skus ADD COLUMN {col_name} {col_type}"))
             conn.commit()
-    # Add confirmed-demand review/override fields to projection_periods if missing
+    # Add confirmed-demand review/override fields to projection_periods if missing.
+    # confirmed_demand_*_lbs must be JSON: SQLAlchemy's JSON type round-trips
+    # dicts on Postgres only when the column is native JSON, not TEXT.
     if "projection_periods" in insp.get_table_names():
-        cols = {c["name"] for c in insp.get_columns("projection_periods")}
+        cols_info = {c["name"]: c for c in insp.get_columns("projection_periods")}
         with engine.connect() as conn:
             for col_name, col_type in [
-                ("confirmed_demand_auto_lbs",   "TEXT"),
-                ("confirmed_demand_manual_lbs", "TEXT"),
+                ("confirmed_demand_auto_lbs",   "JSON"),
+                ("confirmed_demand_manual_lbs", "JSON"),
                 ("has_manual_confirmed_demand", "BOOLEAN NOT NULL DEFAULT FALSE"),
                 ("confirmed_demand_saved_at",   "TIMESTAMP"),
             ]:
-                if col_name not in cols:
+                if col_name not in cols_info:
                     conn.execute(text(f"ALTER TABLE projection_periods ADD COLUMN {col_name} {col_type}"))
             conn.commit()
+        # Heal pre-existing Postgres deploys where confirmed_demand_*_lbs were
+        # added as TEXT — list_periods crashes with ResponseValidationError
+        # because raw TEXT doesn't deserialize into the Pydantic dict field.
+        if engine.dialect.name == "postgresql":
+            for col_name in ("confirmed_demand_auto_lbs", "confirmed_demand_manual_lbs"):
+                col = cols_info.get(col_name)
+                if col is None:
+                    continue
+                col_type_str = str(col.get("type", "")).upper()
+                if "TEXT" in col_type_str or "CHAR" in col_type_str:
+                    with engine.connect() as conn:
+                        conn.execute(text(
+                            f"ALTER TABLE projection_periods "
+                            f"ALTER COLUMN {col_name} TYPE JSON "
+                            f"USING NULLIF({col_name}, '')::json"
+                        ))
+                        conn.commit()
 
 
 def _seed_ups_rates():
