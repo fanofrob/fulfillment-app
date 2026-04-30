@@ -1428,7 +1428,7 @@ export default function ProjectionDashboard() {
         return (
           <span style={{ textAlign: 'right', display: 'block', fontWeight: 600 }}>
             {formatLbs(row.original.padded_demand_lbs)}
-            {pad > 0 && <span style={{ fontSize: 10, color: '#999', marginLeft: 2 }}>+{(pad * 100).toFixed(0)}%</span>}
+            {pad > 0 && <span style={{ fontSize: 10, color: '#999', marginLeft: 2 }}>+{pad.toFixed(0)}%</span>}
           </span>
         )
       },
