@@ -17,6 +17,7 @@ import HistoricalPromotions from './pages/HistoricalPromotions'
 import ProjectionDashboard from './pages/ProjectionDashboard'
 import Vendors from './pages/Vendors'
 import PurchaseOrders from './pages/PurchaseOrders'
+import PurchasePlanning from './pages/PurchasePlanning'
 import StagingDashboard from './pages/StagingDashboard'
 import IssueSkuDetail from './pages/IssueSkuDetail'
 import InventoryCount from './pages/InventoryCount'
@@ -54,6 +55,7 @@ export default function App() {
         <div className="nav-section-label">Procurement</div>
         <ul>
           <li><NavLink to="/vendors">Vendors</NavLink></li>
+          <li><NavLink to="/purchase-planning">Purchase Planning</NavLink></li>
           <li><NavLink to="/purchase-orders">Purchase Orders</NavLink></li>
         </ul>
         <div className="nav-section-label">Reference Data</div>
@@ -85,6 +87,7 @@ export default function App() {
           <Route path="/historical-data" element={<HistoricalPromotions />} />
           <Route path="/vendors" element={<Vendors />} />
           <Route path="/purchase-orders" element={<PurchaseOrders />} />
+          <Route path="/purchase-planning" element={<PurchasePlanning />} />
           <Route path="/picklist-skus" element={<PicklistSkus />} />
           <Route path="/sku-mapping" element={<SkuMapping />} />
           <Route path="/sku-helper" element={<SkuHelper />} />

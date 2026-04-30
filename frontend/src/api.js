@@ -449,6 +449,16 @@ export const purchaseOrdersApi = {
   getOnOrder: (periodId) => api.get(`/purchase-orders/on-order/${periodId}`).then(r => r.data),
 }
 
+export const purchasePlanningApi = {
+  list: (projectionPeriodId) =>
+    api.get('/purchase-planning/', { params: { projection_period_id: projectionPeriodId } }).then(r => r.data),
+  create: (data) => api.post('/purchase-planning/', data).then(r => r.data),
+  update: (id, data) => api.put(`/purchase-planning/${id}`, data).then(r => r.data),
+  delete: (id) => api.delete(`/purchase-planning/${id}`).then(r => r.data),
+  seed: (projectionPeriodId) =>
+    api.post('/purchase-planning/seed', null, { params: { projection_period_id: projectionPeriodId } }).then(r => r.data),
+}
+
 export const receivingApi = {
   listForPO: (poId) => api.get(`/receiving/po/${poId}`).then(r => r.data),
   receive: (poId, lineId, data) => api.post(`/receiving/po/${poId}/lines/${lineId}/receive`, data).then(r => r.data),

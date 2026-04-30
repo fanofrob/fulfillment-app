@@ -824,6 +824,29 @@ class PurchaseOrderPeriodAllocation(Base):
     updated_at     = Column(DateTime(timezone=True), onupdate=func.now())
 
 
+# ── Purchase Planning (gap-driven, per projection period) ────────────────────
+
+class PurchasePlanLine(Base):
+    """
+    A single planned-purchase row for a projection period. Lighter-weight than
+    PurchaseOrder/PurchaseOrderLine — used as a working surface where the user
+    sees gaps from the projection and decides how much to buy from each vendor
+    for each product type. Multiple rows per (period, product_type) are allowed
+    so a single product type's gap can be split across vendors.
+    """
+    __tablename__ = "purchase_plan_lines"
+    id                    = Column(Integer, primary_key=True, index=True)
+    projection_period_id  = Column(Integer, ForeignKey("projection_periods.id"), nullable=False, index=True)
+    vendor_id             = Column(Integer, ForeignKey("vendors.id"), nullable=True, index=True)
+    product_type          = Column(String, nullable=False, index=True)
+    purchase_weight_lbs   = Column(Float, nullable=True)   # user input — target buy in lbs
+    case_weight_lbs       = Column(Float, nullable=True)   # user input — 1 means no case (per piece/lb)
+    quantity              = Column(Float, nullable=True)   # user input — # of cases or lbs or pieces
+    notes                 = Column(Text, nullable=True)
+    created_at            = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at            = Column(DateTime(timezone=True), onupdate=func.now())
+
+
 # ── Receiving (Phase 5) ──────────────────────────────────────────────────────
 
 class ReceivingRecord(Base):
