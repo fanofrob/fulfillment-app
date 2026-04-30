@@ -506,13 +506,15 @@ export default function OrdersPage({
   }
 
   // Always fetch all orders (no status filter) for sidebar counts. Mapping_tab
-  // only affects margin/COGS preview (not classification), so it's omitted to
-  // keep the cache hot. Period_id IS needed: it layers the period's short-ship
-  // / inventory-hold configs onto app_line_status, which drives ship_partial /
-  // ship_none / inv_hold counts.
+  // and period_id must match the table's params so sidebar classification
+  // (has_plan_mismatch, plan_box_unmatched, app_line_status) lines up with
+  // what the table actually shows — otherwise the sidebar counts disagree
+  // with the displayed list (e.g. Plan Mismatch shows 110 in the sidebar but
+  // 0 orders in the table because the override mapping resolves cleanly).
   const allOrdersParams = {
     ...(search ? { search } : {}),
     ...(tagSearch ? { tag: tagSearch } : {}),
+    ...(previewTab ? { mapping_tab: previewTab } : {}),
     ...(previewPeriodId ? { period_id: previewPeriodId } : {}),
     limit: 2000,
   }
