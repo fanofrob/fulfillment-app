@@ -431,6 +431,9 @@ export const vendorsApi = {
   getByProductType: (productType) => api.get(`/vendors/by-product-type/${encodeURIComponent(productType)}`).then(r => r.data),
   // Sheet sync
   syncFromSheets: () => api.post('/vendors/sync-from-sheets').then(r => r.data),
+  // Duplicate consolidation
+  consolidateDuplicates: (dryRun = false) =>
+    api.post(`/vendors/consolidate-duplicates?dry_run=${dryRun}`).then(r => r.data),
 }
 
 export const purchaseOrdersApi = {

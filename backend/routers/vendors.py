@@ -262,6 +262,112 @@ def get_vendors_for_product_type(product_type: str, db: Session = Depends(get_db
     return [get_vendor(vid, db) for vid in vendor_ids]
 
 
+# ── Duplicate Consolidation ─────────────────────────────────────────────────
+
+@router.post("/consolidate-duplicates")
+def consolidate_duplicates(dry_run: bool = False, db: Session = Depends(get_db)):
+    """
+    Merge vendor records that share the same name (case-insensitive) into a
+    single canonical record. This cleans up the multi-row pattern produced by
+    the source sheet where each fruit appears on its own row.
+
+    Strategy per duplicate group:
+      • Canonical = lowest id (typically the row with full contact info).
+      • For each non-null contact field, take the first non-null value
+        across the group (canonical wins ties).
+      • product_catalog = union of all groups, preserving order.
+      • vendor_products and purchase_orders on duplicates are reassigned
+        to the canonical vendor_id.
+      • Duplicate vendor rows are deleted.
+
+    Pass ?dry_run=true to preview the merge without writing.
+    """
+    vendors = db.query(models.Vendor).order_by(models.Vendor.id).all()
+
+    groups: dict[str, list[models.Vendor]] = {}
+    for v in vendors:
+        key = (v.name or "").strip().lower()
+        if not key:
+            continue
+        groups.setdefault(key, []).append(v)
+
+    contact_fields = (
+        "contact_name", "contact_email", "contact_phone", "contact_whatsapp",
+        "preferred_communication", "url", "pickup_address", "agg_location", "notes",
+    )
+
+    merged_groups = []
+    total_deleted = 0
+
+    for key, members in groups.items():
+        if len(members) < 2:
+            continue
+        canonical = members[0]
+        dups = members[1:]
+
+        # Merge contact fields: canonical wins, otherwise first non-null from dups.
+        for field in contact_fields:
+            if not getattr(canonical, field):
+                for d in dups:
+                    val = getattr(d, field)
+                    if val:
+                        setattr(canonical, field, val)
+                        break
+
+        # Merge product_catalog.
+        def parse(raw):
+            if not raw:
+                return []
+            try:
+                v = json.loads(raw)
+                return v if isinstance(v, list) else []
+            except (ValueError, TypeError):
+                return []
+        merged_catalog = parse(canonical.product_catalog)
+        for d in dups:
+            for tag in parse(d.product_catalog):
+                if tag not in merged_catalog:
+                    merged_catalog.append(tag)
+        canonical.product_catalog = json.dumps(merged_catalog) if merged_catalog else None
+
+        # is_active: stay active if any record was active.
+        if any(d.is_active for d in dups):
+            canonical.is_active = True
+
+        # Reassign FK references then delete duplicates.
+        dup_ids = [d.id for d in dups]
+        if not dry_run and dup_ids:
+            db.query(models.VendorProduct).filter(
+                models.VendorProduct.vendor_id.in_(dup_ids)
+            ).update({"vendor_id": canonical.id}, synchronize_session=False)
+            db.query(models.PurchaseOrder).filter(
+                models.PurchaseOrder.vendor_id.in_(dup_ids)
+            ).update({"vendor_id": canonical.id}, synchronize_session=False)
+            for d in dups:
+                db.delete(d)
+
+        merged_groups.append({
+            "name": canonical.name,
+            "canonical_id": canonical.id,
+            "merged_ids": dup_ids,
+            "final_catalog": merged_catalog,
+            "final_agg_location": canonical.agg_location,
+            "final_phone": canonical.contact_phone,
+        })
+        total_deleted += len(dup_ids)
+
+    if not dry_run:
+        db.commit()
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "duplicate_groups": len(merged_groups),
+        "vendors_deleted": total_deleted,
+        "groups": merged_groups,
+    }
+
+
 # ── Sheet Sync ──────────────────────────────────────────────────────────────
 
 @router.post("/sync-from-sheets")

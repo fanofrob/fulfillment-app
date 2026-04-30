@@ -158,6 +158,32 @@ export default function Vendors() {
     },
     onError: (err) => setSyncMsg(`Sync failed: ${err?.response?.data?.detail || err.message}`),
   })
+  const consolidateMut = useMutation({
+    mutationFn: vendorsApi.consolidateDuplicates,
+    onSuccess: (res) => {
+      qc.invalidateQueries(['vendors'])
+      setSyncMsg(`Consolidated ${res.duplicate_groups} duplicate group${res.duplicate_groups === 1 ? '' : 's'}, removed ${res.vendors_deleted} extra record${res.vendors_deleted === 1 ? '' : 's'}.`)
+    },
+    onError: (err) => setSyncMsg(`Consolidate failed: ${err?.response?.data?.detail || err.message}`),
+  })
+
+  async function handleConsolidate() {
+    try {
+      const preview = await vendorsApi.consolidateDuplicates(true)
+      if (preview.duplicate_groups === 0) {
+        setSyncMsg('No duplicate vendors found.')
+        return
+      }
+      const ok = window.confirm(
+        `Consolidate ${preview.duplicate_groups} duplicate vendor name${preview.duplicate_groups === 1 ? '' : 's'}?\n\n` +
+        `${preview.vendors_deleted} extra record${preview.vendors_deleted === 1 ? '' : 's'} will be merged into a single vendor each, with all product_catalog tags combined. Vendor products and purchase orders are reassigned, then duplicates are deleted.\n\n` +
+        `This action cannot be undone.`
+      )
+      if (ok) consolidateMut.mutate(false)
+    } catch (err) {
+      setSyncMsg(`Preview failed: ${err?.response?.data?.detail || err.message}`)
+    }
+  }
 
   const addProductMut = useMutation({
     mutationFn: ({ vendorId, data }) => vendorsApi.addProduct(vendorId, data),
@@ -252,6 +278,14 @@ export default function Vendors() {
             title="Pull vendors from the RAW_Agg_Partners Google Sheet"
           >
             {syncMut.isPending ? 'Syncing…' : '↻ Sync from Sheets'}
+          </button>
+          <button
+            className="btn"
+            onClick={handleConsolidate}
+            disabled={consolidateMut.isPending}
+            title="Merge vendor records that share the same name"
+          >
+            {consolidateMut.isPending ? 'Consolidating…' : '⇆ Consolidate Duplicates'}
           </button>
           <button className="btn btn-primary" onClick={() => setShowVendorModal(true)}>+ Add Vendor</button>
         </div>
