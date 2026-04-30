@@ -45,16 +45,36 @@ def _ensure_not_archived(period: models.ProjectionPeriod):
 
 
 def _run_cascade(db: Session, period_id: int, changed_skus: set[str]) -> dict:
-    """Run the auto-unconfirm cascade and commit. Returns the cascade summary
-    in the shape `{unconfirmed: int, order_ids: [str], changed_skus: [str]}`.
-    Caller must have already committed the upstream config write."""
+    """Auto-replan + auto-reconfirm cascade. Drops affected confirmed-order
+    rows, runs operations replan + re-confirm using each order's prior
+    mapping_used, and commits. Caller must have already committed the upstream
+    config write.
+
+    Returns:
+      {
+        unconfirmed: int,           # rows dropped before re-confirm
+        order_ids:   [str],         # ids that were dropped
+        reconfirmed: int,           # how many came back with fresh snapshots
+        changed_skus: [str],        # what triggered the cascade
+        replan: {...} | None,       # recompute_open_orders summary, when run
+      }
+    """
     summary = svc.apply_cd_status_to_confirmed_orders(db, period_id, changed_skus)
     if summary["unconfirmed"]:
         db.commit()
+
+    reconfirm = {"reconfirmed": 0, "recompute": None}
+    if summary["items_to_reconfirm"]:
+        reconfirm = svc.replan_and_reconfirm_for_period(
+            db, period_id, summary["items_to_reconfirm"]
+        )
+
     return {
-        "unconfirmed": summary["unconfirmed"],
-        "order_ids": summary["order_ids"],
+        "unconfirmed":  summary["unconfirmed"],
+        "order_ids":    summary["order_ids"],
+        "reconfirmed":  reconfirm["reconfirmed"],
         "changed_skus": sorted(changed_skus),
+        "replan":       reconfirm.get("recompute"),
     }
 
 

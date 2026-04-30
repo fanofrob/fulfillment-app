@@ -350,6 +350,7 @@ def recompute_open_orders(
     return {
         "orders_scanned":              sku_result["orders_scanned"],
         "orders_with_sku_changes":     len(sku_result["orders_changed"]),
+        "orders_changed_ids":          list(sku_result["orders_changed"]),
         "lines_updated":               sku_result["lines_updated"],
         "orders_replanned_created":    replan_result["created"],
         "orders_replanned_repaired":   replan_result["repaired"],

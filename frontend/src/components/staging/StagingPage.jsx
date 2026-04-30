@@ -903,15 +903,20 @@ function ShortShipConfigTab({ mode = 'operations', periodId = null }) {
     }
   }
 
-  // Surface auto-unconfirm cascade from CD config writes. The backend returns
-  // {cascade: {unconfirmed: N, ...}} on every CD short-ship/hold write — when
-  // N>0, the user needs to know to head over to Confirmed Orders and click
-  // "Re-confirm All".
+  // Surface auto-replan/reconfirm cascade from CD config writes. The backend
+  // returns {cascade: {unconfirmed, reconfirmed, ...}} on every CD short-ship/
+  // hold write — affected confirmed orders are auto-replanned and re-confirmed
+  // immediately, no manual follow-up needed.
   const flashCascade = (data) => {
     const items = Array.isArray(data) ? data : [data]
     const totalUnconfirmed = items.reduce((sum, x) => sum + (x?.cascade?.unconfirmed || 0), 0)
+    const totalReconfirmed = items.reduce((sum, x) => sum + (x?.cascade?.reconfirmed || 0), 0)
     if (totalUnconfirmed > 0) {
-      setImportMsg(`${totalUnconfirmed} confirmed order${totalUnconfirmed !== 1 ? 's' : ''} kicked back — re-confirm them on the Confirmed Orders page`)
+      const stuck = totalUnconfirmed - totalReconfirmed
+      const msg = stuck > 0
+        ? `${totalReconfirmed} of ${totalUnconfirmed} confirmed order${totalUnconfirmed !== 1 ? 's' : ''} auto-replanned · ${stuck} couldn't re-confirm — fix on Confirmed Orders page`
+        : `${totalReconfirmed} confirmed order${totalReconfirmed !== 1 ? 's' : ''} auto-replanned and re-confirmed`
+      setImportMsg(msg)
       setTimeout(() => setImportMsg(null), 6000)
     }
   }
@@ -982,13 +987,20 @@ function ShortShipConfigTab({ mode = 'operations', periodId = null }) {
     },
   })
 
+  const cascadeNoteFor = (cascade) => {
+    const u = cascade?.unconfirmed || 0
+    const r = cascade?.reconfirmed || 0
+    if (u === 0) return ''
+    const stuck = u - r
+    return stuck > 0
+      ? ` · ${r}/${u} auto-replanned · ${stuck} couldn't re-confirm`
+      : ` · ${r} auto-replanned & re-confirmed`
+  }
+
   const importShortShipMut = useMutation({
     mutationFn: () => confirmedDemandConfigsApi.importGlobalShortShip(periodId),
     onSuccess: (data) => {
-      const cascadeNote = data?.cascade?.unconfirmed > 0
-        ? ` · ${data.cascade.unconfirmed} confirmed orders kicked back`
-        : ''
-      setImportMsg(`Imported ${data.imported} short-ship from Staging (${data.already_existed} already existed)${cascadeNote}`)
+      setImportMsg(`Imported ${data.imported} short-ship from Staging (${data.already_existed} already existed)${cascadeNoteFor(data?.cascade)}`)
       invalidateAll()
       setTimeout(() => setImportMsg(null), 6000)
     },
@@ -996,10 +1008,7 @@ function ShortShipConfigTab({ mode = 'operations', periodId = null }) {
   const importHoldMut = useMutation({
     mutationFn: () => confirmedDemandConfigsApi.importGlobalInventoryHold(periodId),
     onSuccess: (data) => {
-      const cascadeNote = data?.cascade?.unconfirmed > 0
-        ? ` · ${data.cascade.unconfirmed} confirmed orders kicked back`
-        : ''
-      setImportMsg(`Imported ${data.imported} hold from Staging (${data.already_existed} already existed)${cascadeNote}`)
+      setImportMsg(`Imported ${data.imported} hold from Staging (${data.already_existed} already existed)${cascadeNoteFor(data?.cascade)}`)
       invalidateAll()
       setTimeout(() => setImportMsg(null), 6000)
     },

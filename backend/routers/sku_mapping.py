@@ -32,14 +32,21 @@ def refresh_sku_cache(db: Session = Depends(get_db)):
     """
     Invalidate the SKU mapping cache and recompute all open orders so they
     reflect the latest mappings (re-resolves pick_skus, re-applies short-ship,
-    replans changed orders, unstages anything that no longer fits).
+    replans changed orders, unstages anything that no longer fits). Then
+    refresh the box snapshots of any confirmed orders whose pick_skus changed,
+    across every non-archived projection period — using each row's existing
+    mapping_used so per-order intent is preserved.
     """
     sheets_service.invalidate("sku_walnut")
     sheets_service.invalidate("sku_northlake")
     sheets_service.invalidate("sku_type_data")
 
     from services.order_recompute import recompute_open_orders
+    from services.projection_confirmed_orders_service import auto_reconfirm_across_periods
+
     result = recompute_open_orders(db)
+    reconfirm = auto_reconfirm_across_periods(db, result.get("orders_changed_ids") or [])
+
     return {
         "status": "cache cleared",
         # Legacy field — equivalent to "orders that no longer match staging requirements".
@@ -48,6 +55,8 @@ def refresh_sku_cache(db: Session = Depends(get_db)):
             + result["orders_unstaged_short_ship"]
             + result["orders_unstaged_inv_hold"]
         ),
+        "snapshots_reconfirmed": reconfirm["reconfirmed"],
+        "snapshots_reconfirmed_by_period": reconfirm["results_by_period"],
         **result,
     }
 

@@ -214,20 +214,24 @@ def apply_cd_status_to_confirmed_orders(
     """
     Auto-unconfirm cascade: when a CD short-ship / inventory-hold config row
     changes for `period_id`, drop the confirmation for any order whose stored
-    snapshot or live line items reference one of the changed SKUs. Mirrors
-    Operations' apply_short_ship_to_orders unstage cascade — kicks affected
-    orders back so the user can review GM% impact and re-confirm.
+    snapshot or live line items reference one of the changed SKUs.
 
     `changed_skus` is the set of shopify_skus whose CD status flipped in this
     config write (added, removed, or moved between short-ship/hold).
 
     Caller is responsible for db.commit() — typically the endpoint that already
-    commits the config write.
+    commits the config write. Caller is also expected to follow with
+    `replan_and_reconfirm_for_period(period_id, items_to_reconfirm)` so the
+    affected orders get fresh plans + snapshots immediately.
 
-    Returns {"unconfirmed": int, "order_ids": [str, ...]}.
+    Returns {
+      "unconfirmed": int,
+      "order_ids": [str, ...],
+      "items_to_reconfirm": [{"shopify_order_id": str, "mapping_used": str}, ...]
+    }.
     """
     if not changed_skus:
-        return {"unconfirmed": 0, "order_ids": []}
+        return {"unconfirmed": 0, "order_ids": [], "items_to_reconfirm": []}
 
     confirmed = (
         db.query(models.ProjectionPeriodConfirmedOrder)
@@ -235,28 +239,37 @@ def apply_cd_status_to_confirmed_orders(
         .all()
     )
     if not confirmed:
-        return {"unconfirmed": 0, "order_ids": []}
+        return {"unconfirmed": 0, "order_ids": [], "items_to_reconfirm": []}
 
     affected: list[str] = []
+    items_to_reconfirm: list[dict] = []
     for c in confirmed:
+        hit = False
         # 1) Snapshot reference: SKU was IN the snapshot and just got short-shipped/held
         snap_skus = {
             it.get("shopify_sku") for it in (c.boxes_snapshot or [])
             if it.get("shopify_sku")
         }
         if snap_skus & changed_skus:
+            hit = True
+        else:
+            # 2) Live line reference: SKU was excluded by old config and now isn't
+            line_skus = {
+                li.shopify_sku for li in
+                db.query(models.ShopifyLineItem.shopify_sku)
+                .filter(models.ShopifyLineItem.shopify_order_id == c.shopify_order_id)
+                .all()
+                if li.shopify_sku
+            }
+            if line_skus & changed_skus:
+                hit = True
+        if hit:
             affected.append(c.shopify_order_id)
-            continue
-        # 2) Live line reference: SKU was excluded by old config and now isn't
-        line_skus = {
-            li.shopify_sku for li in
-            db.query(models.ShopifyLineItem.shopify_sku)
-            .filter(models.ShopifyLineItem.shopify_order_id == c.shopify_order_id)
-            .all()
-            if li.shopify_sku
-        }
-        if line_skus & changed_skus:
-            affected.append(c.shopify_order_id)
+            if c.mapping_used:
+                items_to_reconfirm.append({
+                    "shopify_order_id": c.shopify_order_id,
+                    "mapping_used":     c.mapping_used,
+                })
 
     if affected:
         db.query(models.ProjectionPeriodConfirmedOrder).filter(
@@ -264,7 +277,116 @@ def apply_cd_status_to_confirmed_orders(
             models.ProjectionPeriodConfirmedOrder.shopify_order_id.in_(affected),
         ).delete(synchronize_session=False)
 
-    return {"unconfirmed": len(affected), "order_ids": affected}
+    return {
+        "unconfirmed": len(affected),
+        "order_ids": affected,
+        "items_to_reconfirm": items_to_reconfirm,
+    }
+
+
+def replan_and_reconfirm_for_period(
+    db: Session,
+    period_id: int,
+    items: list[dict],
+) -> dict:
+    """
+    For each order in `items` (each {shopify_order_id, mapping_used}):
+      1) Run order_recompute.recompute_open_orders so the operations-level plan
+         reflects the latest SKU mapping + global short-ship config.
+      2) Re-confirm the order in `period_id` using its prior mapping_used so a
+         fresh box snapshot is written.
+
+    Orders are grouped by mapping_used so confirm_orders can run once per
+    distinct mapping. Returns a per-mapping summary plus the recompute summary.
+    """
+    if not items:
+        return {"reconfirmed": 0, "results_by_mapping": {}, "recompute": None}
+
+    from services.order_recompute import recompute_open_orders
+
+    order_ids = [it["shopify_order_id"] for it in items]
+    recompute = recompute_open_orders(db, order_ids=order_ids, auto_replan=True)
+
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for it in items:
+        grouped[it["mapping_used"]].append(it["shopify_order_id"])
+
+    results_by_mapping: dict[str, dict] = {}
+    total_reconfirmed = 0
+    for mapping_tab, oids in grouped.items():
+        results = confirm_orders(db, period_id, oids, mapping_tab)
+        ok = sum(1 for r in results if r.get("success"))
+        total_reconfirmed += ok
+        results_by_mapping[mapping_tab] = {
+            "attempted": len(oids),
+            "reconfirmed": ok,
+            "results": results,
+        }
+    return {
+        "reconfirmed": total_reconfirmed,
+        "results_by_mapping": results_by_mapping,
+        "recompute": recompute,
+    }
+
+
+def auto_reconfirm_across_periods(
+    db: Session,
+    order_ids: list[str],
+) -> dict:
+    """
+    Refresh the confirmed-order box snapshots for `order_ids` in every
+    non-archived period that already had them confirmed. Each row is
+    re-confirmed with its existing mapping_used.
+
+    Use this after a SKU mapping or SKU helper change has run
+    recompute_open_orders — confirmed snapshots that reference orders whose
+    pick_skus just changed become stale and need to be rebuilt.
+
+    Does NOT run recompute_open_orders itself — caller already did.
+    """
+    if not order_ids:
+        return {"reconfirmed": 0, "results_by_period": {}}
+
+    rows = (
+        db.query(
+            models.ProjectionPeriodConfirmedOrder.period_id,
+            models.ProjectionPeriodConfirmedOrder.shopify_order_id,
+            models.ProjectionPeriodConfirmedOrder.mapping_used,
+        )
+        .join(
+            models.ProjectionPeriod,
+            models.ProjectionPeriod.id == models.ProjectionPeriodConfirmedOrder.period_id,
+        )
+        .filter(
+            models.ProjectionPeriodConfirmedOrder.shopify_order_id.in_(order_ids),
+            models.ProjectionPeriod.status != "archived",
+        )
+        .all()
+    )
+
+    grouped: dict[tuple[int, str], list[str]] = defaultdict(list)
+    for period_id, shopify_order_id, mapping_used in rows:
+        if not mapping_used:
+            continue
+        grouped[(period_id, mapping_used)].append(shopify_order_id)
+
+    results_by_period: dict[int, dict] = {}
+    total_reconfirmed = 0
+    for (period_id, mapping_tab), oids in grouped.items():
+        results = confirm_orders(db, period_id, oids, mapping_tab)
+        ok = sum(1 for r in results if r.get("success"))
+        total_reconfirmed += ok
+        per_period = results_by_period.setdefault(period_id, {
+            "attempted": 0, "reconfirmed": 0, "results_by_mapping": {},
+        })
+        per_period["attempted"] += len(oids)
+        per_period["reconfirmed"] += ok
+        per_period["results_by_mapping"][mapping_tab] = {
+            "attempted": len(oids),
+            "reconfirmed": ok,
+            "results": results,
+        }
+    return {"reconfirmed": total_reconfirmed, "results_by_period": results_by_period}
 
 
 def list_unconfirmed_eligible_order_ids(db: Session, period_id: int) -> list[str]:

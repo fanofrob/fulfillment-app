@@ -47,6 +47,24 @@ def _to_dict(item: models.SkuHelperMapping) -> dict:
     }
 
 
+def _replan_and_reconfirm(db: Session) -> dict:
+    """Run after any helper mutation: re-resolve pick_skus on all open orders
+    against the new helper map, replan operations boxes, and refresh the box
+    snapshots of any confirmed orders whose pick_skus changed (across every
+    non-archived projection period, using each row's existing mapping_used)."""
+    from services.order_recompute import recompute_open_orders
+    from services.projection_confirmed_orders_service import auto_reconfirm_across_periods
+
+    recompute = recompute_open_orders(db)
+    reconfirm = auto_reconfirm_across_periods(db, recompute.get("orders_changed_ids") or [])
+    return {
+        "orders_with_sku_changes":  recompute.get("orders_with_sku_changes", 0),
+        "orders_replanned_created": recompute.get("orders_replanned_created", 0),
+        "orders_replanned_repaired": recompute.get("orders_replanned_repaired", 0),
+        "snapshots_reconfirmed":    reconfirm["reconfirmed"],
+    }
+
+
 @router.get("/")
 def list_helpers(
     search: Optional[str] = Query(None),
@@ -82,7 +100,8 @@ def create_helper(body: SkuHelperCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(item)
     sheets_service.invalidate("sku_type_data")
-    return _to_dict(item)
+    cascade = _replan_and_reconfirm(db)
+    return {**_to_dict(item), "cascade": cascade}
 
 
 @router.put("/{item_id}")
@@ -95,7 +114,8 @@ def update_helper(item_id: int, body: SkuHelperUpdate, db: Session = Depends(get
     db.commit()
     db.refresh(item)
     sheets_service.invalidate("sku_type_data")
-    return _to_dict(item)
+    cascade = _replan_and_reconfirm(db)
+    return {**_to_dict(item), "cascade": cascade}
 
 
 @router.delete("/{item_id}")
@@ -106,7 +126,8 @@ def delete_helper(item_id: int, db: Session = Depends(get_db)):
     db.delete(item)
     db.commit()
     sheets_service.invalidate("sku_type_data")
-    return {"detail": "deleted"}
+    cascade = _replan_and_reconfirm(db)
+    return {"detail": "deleted", "cascade": cascade}
 
 
 @router.post("/sync")
@@ -149,9 +170,16 @@ def sync_from_sheet(db: Session = Depends(get_db)):
 
     db.commit()
     sheets_service.invalidate("sku_type_data")
+    cascade = _replan_and_reconfirm(db) if (created or updated) else {
+        "orders_with_sku_changes": 0,
+        "orders_replanned_created": 0,
+        "orders_replanned_repaired": 0,
+        "snapshots_reconfirmed": 0,
+    }
     return {
         "created": created,
         "updated": updated,
         "unchanged": unchanged,
         "total_in_sheet": len(helper_map),
+        "cascade": cascade,
     }
