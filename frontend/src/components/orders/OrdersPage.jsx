@@ -1405,6 +1405,26 @@ export default function OrdersPage({
                 >
                   {forceRefreshAllMutation.isPending ? 'Refreshing…' : '⟳ Force Refresh All'}
                 </button>
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => {
+                    const ids = selectedForBatch.size > 0
+                      ? [...selectedForBatch]
+                      : processedOrders.map(o => o.shopify_order_id)
+                    if (ids.length === 0) return
+                    autoPlanMutation.mutate(ids)
+                  }}
+                  disabled={autoPlanMutation.isPending || processedOrders.length === 0}
+                  title={selectedForBatch.size > 0
+                    ? `Auto-plan ${selectedForBatch.size} selected order${selectedForBatch.size !== 1 ? 's' : ''}`
+                    : `Auto-plan all ${processedOrders.length} orders in current view`}
+                >
+                  {autoPlanMutation.isPending
+                    ? 'Planning…'
+                    : selectedForBatch.size > 0
+                      ? `⚙ Auto Plan (${selectedForBatch.size})`
+                      : `⚙ Auto Plan (${processedOrders.length})`}
+                </button>
                 {statusFilter === 'confirmed' && (
                   <button
                     className="btn btn-secondary"
