@@ -654,6 +654,7 @@ export default function OrdersPage({
         .join('\n')
       const tail = data.skipped > 0 && reasons ? '\n\n' + reasons : ''
       const r = data.recompute || {}
+      const ap = data.auto_plan || {}
       alert(
         `Force refresh complete:\n` +
         `  ${data.reconfirmed} re-confirmed (snapshots refreshed)\n` +
@@ -661,7 +662,7 @@ export default function OrdersPage({
         `  ${data.skipped} skipped\n\n` +
         `Operations replan:\n` +
         `  ${r.orders_with_sku_changes || 0} orders with SKU changes\n` +
-        `  ${r.orders_replanned_created || 0} plans created, ${r.orders_replanned_repaired || 0} repaired` +
+        `  ${ap.created || 0} plans created, ${ap.repaired || 0} repaired, ${ap.unmatched || 0} unmatched` +
         tail
       )
     },

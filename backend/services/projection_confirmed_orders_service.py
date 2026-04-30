@@ -440,10 +440,13 @@ def force_refresh_period(
     """
     Sweep every eligible order in the period through the latest SKU mapping +
     short-ship/hold config:
-      1) recompute_open_orders to refresh pick_skus and replan operations boxes
-      2) re-confirm already-confirmed orders using each row's existing
+      1) recompute_open_orders to refresh pick_skus and replan SKU-changed orders
+      2) bulk_auto_plan to create / repair plans for orders that recompute
+         skipped (no SKU change but still missing a plan or stuck on empty
+         pending boxes from a prior failed run)
+      3) re-confirm already-confirmed orders using each row's existing
          mapping_used (preserves per-order intent)
-      3) confirm currently-unconfirmed eligibles using `fallback_mapping_tab`
+      4) confirm currently-unconfirmed eligibles using `fallback_mapping_tab`
 
     Used to clean up orders that became stale BEFORE the auto-replan cascade
     shipped — i.e. configs that flipped while the system still kicked orders
@@ -458,11 +461,40 @@ def force_refresh_period(
             "newly_confirmed": 0,
             "skipped": 0,
             "recompute": None,
+            "auto_plan": None,
             "results": [],
         }
 
     from services.order_recompute import recompute_open_orders
+    from routers.fulfillment import bulk_auto_plan, BulkAutoPlanRequest
+
     recompute = recompute_open_orders(db, order_ids=eligible_ids, auto_replan=True)
+
+    # Force-replan every eligible order — recompute_open_orders only invokes
+    # bulk_auto_plan when pick_skus changed, so orders that have no plan yet
+    # (or have draft plans with empty/unmatched boxes) but no SKU change stay
+    # broken otherwise. Drop pending unpushed boxes so the planner rebuilds.
+    pending_box_ids = [
+        bid for (bid,) in
+        db.query(models.FulfillmentBox.id)
+        .join(models.FulfillmentPlan, models.FulfillmentPlan.id == models.FulfillmentBox.plan_id)
+        .filter(
+            models.FulfillmentPlan.shopify_order_id.in_(eligible_ids),
+            models.FulfillmentPlan.status != "cancelled",
+            models.FulfillmentBox.status == "pending",
+            models.FulfillmentBox.shipstation_order_id.is_(None),
+        )
+        .all()
+    ]
+    if pending_box_ids:
+        db.query(models.BoxLineItem).filter(
+            models.BoxLineItem.box_id.in_(pending_box_ids)
+        ).delete(synchronize_session=False)
+        db.query(models.FulfillmentBox).filter(
+            models.FulfillmentBox.id.in_(pending_box_ids)
+        ).delete(synchronize_session=False)
+        db.commit()
+    auto_plan = bulk_auto_plan(BulkAutoPlanRequest(order_ids=eligible_ids), db)
 
     confirmed_rows = (
         db.query(models.ProjectionPeriodConfirmedOrder)
@@ -497,6 +529,7 @@ def force_refresh_period(
         "newly_confirmed": newly_confirmed,
         "skipped":         len(all_results) - reconfirmed - newly_confirmed,
         "recompute":       recompute,
+        "auto_plan":       auto_plan,
         "results":         all_results,
     }
 
