@@ -26,9 +26,9 @@ export const rateCardApi = {
 }
 
 export const rulesApi = {
-  listOrders: () => api.get('/rules/orders/').then(r => r.data),
+  listOrders: () => api.get('/rules/orders').then(r => r.data),
   listOrderTags: () => api.get('/rules/orders/tags').then(r => r.data),
-  createOrder: (data) => api.post('/rules/orders/', data).then(r => r.data),
+  createOrder: (data) => api.post('/rules/orders', data).then(r => r.data),
   updateOrder: (id, data) => api.put(`/rules/orders/${id}`, data).then(r => r.data),
   deleteOrder: (id) => api.delete(`/rules/orders/${id}`).then(r => r.data),
   pauseOrder: (id) => api.patch(`/rules/orders/${id}/pause`).then(r => r.data),
