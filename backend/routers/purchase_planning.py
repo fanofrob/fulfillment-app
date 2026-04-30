@@ -189,12 +189,19 @@ def create_plan_line(body: PurchasePlanLineCreate, db: Session = Depends(get_db)
         if not vendor:
             raise HTTPException(404, "Vendor not found")
 
+    metrics_for_default = _projection_metrics_for_period(db, body.projection_period_id)
+    purchase_weight_lbs = body.purchase_weight_lbs
+    if purchase_weight_lbs is None:
+        gap = metrics_for_default.get(body.product_type, {}).get("gap_lbs")
+        if gap is not None and gap > 0:
+            purchase_weight_lbs = gap
+
     line = models.PurchasePlanLine(
         projection_period_id=body.projection_period_id,
         vendor_id=body.vendor_id,
         product_type=body.product_type,
         sub_product_type=(body.sub_product_type or None),
-        purchase_weight_lbs=body.purchase_weight_lbs,
+        purchase_weight_lbs=purchase_weight_lbs,
         case_weight_lbs=body.case_weight_lbs,
         quantity=body.quantity,
         notes=body.notes,
@@ -203,12 +210,11 @@ def create_plan_line(body: PurchasePlanLineCreate, db: Session = Depends(get_db)
     db.commit()
     db.refresh(line)
 
-    metrics = _projection_metrics_for_period(db, body.projection_period_id)
     period_lines = db.query(models.PurchasePlanLine).filter_by(
         projection_period_id=body.projection_period_id
     ).all()
     purchases = _purchases_by_combo(period_lines)
-    return _serialize_line(line, metrics, purchases)
+    return _serialize_line(line, metrics_for_default, purchases)
 
 
 @router.put("/{line_id}")
@@ -288,6 +294,7 @@ def seed_from_projection(
             projection_period_id=projection_period_id,
             product_type=pl.product_type,
             case_weight_lbs=pl.case_weight_lbs,
+            purchase_weight_lbs=pl.gap_lbs,
         ))
         created += 1
     db.commit()

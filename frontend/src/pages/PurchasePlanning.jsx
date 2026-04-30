@@ -32,6 +32,35 @@ function fmtPeriodLabel(p) {
   return `${p.name} (${start} – ${end})${status}`
 }
 
+// ── TSV / selection helpers ────────────────────────────────────────────────
+function cellsEqual(a, b) {
+  if (!a || !b) return false
+  return a.rowIdx === b.rowIdx && a.colIdx === b.colIdx
+}
+
+function selectionBox(sel) {
+  if (!sel.anchor || !sel.focus) return null
+  return {
+    rs: Math.min(sel.anchor.rowIdx, sel.focus.rowIdx),
+    re: Math.max(sel.anchor.rowIdx, sel.focus.rowIdx),
+    cs: Math.min(sel.anchor.colIdx, sel.focus.colIdx),
+    ce: Math.max(sel.anchor.colIdx, sel.focus.colIdx),
+  }
+}
+
+function parseTSV(text) {
+  // Excel/Sheets paste = newline-separated rows, tab-separated cols.
+  // Strip a single trailing newline (added by most copy actions).
+  const normalized = String(text ?? '').replace(/\r\n?/g, '\n')
+  const lines = normalized.split('\n')
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+  return lines.map((l) => l.split('\t'))
+}
+
+function buildTSV(rows) {
+  return rows.map((cells) => cells.join('\t')).join('\n')
+}
+
 // ── Editable input cell ────────────────────────────────────────────────────
 function NumberCell({ value, onSave, placeholder, step = 'any' }) {
   const [draft, setDraft] = useState(value == null ? '' : String(value))
@@ -198,6 +227,10 @@ export default function PurchasePlanning() {
   const [sorting, setSorting] = useState([])
   const [columnFilters, setColumnFilters] = useState([])
   const [actionMsg, setActionMsg] = useState(null)
+  // Excel-like cell selection. anchor = "active" cell (paste target /
+  // range origin), focus = the other end of a shift-click range.
+  // Both reference visible (sorted/filtered) data-row index + editable-col index.
+  const [selection, setSelection] = useState({ anchor: null, focus: null })
 
   // ── Data ────────────────────────────────────────────────────────────────
   const { data: periods = [] } = useQuery({
@@ -270,6 +303,94 @@ export default function PurchasePlanning() {
       product_type: productTypes[0] || 'new product',
     })
   }
+
+  // ── Editable column metadata for copy/paste ─────────────────────────────
+  // Order here defines the colIdx used by the selection model. Must match
+  // visual column order so a range selection across screen columns maps
+  // 1:1 to the indices used for TSV serialize/deserialize.
+  const vendorByName = useMemo(() => {
+    const m = new Map()
+    for (const v of vendors) m.set((v.name || '').trim().toLowerCase(), v.id)
+    return m
+  }, [vendors])
+
+  const productTypeSet = useMemo(() => new Set(productTypes), [productTypes])
+
+  const editableColumnMeta = useMemo(() => [
+    {
+      colId: 'vendor',
+      getValue: (row) => {
+        const v = vendors.find((vv) => vv.id === row.vendor_id)
+        return v ? v.name : ''
+      },
+      // Returns a patch object to apply, or null to skip this cell.
+      parseValue: (str) => {
+        const t = String(str ?? '').trim()
+        if (t === '') return { vendor_id: null }
+        const id = vendorByName.get(t.toLowerCase())
+        if (id == null) return null
+        return { vendor_id: id }
+      },
+    },
+    {
+      colId: 'product_type',
+      getValue: (row) => row.product_type || '',
+      parseValue: (str) => {
+        const t = String(str ?? '').trim()
+        if (t === '') return null  // backend requires non-empty
+        return { product_type: t }
+      },
+    },
+    {
+      colId: 'sub_product_type',
+      getValue: (row) => row.sub_product_type || '',
+      parseValue: (str) => {
+        const t = String(str ?? '').trim()
+        if (t === '') return { sub_product_type: '' }  // empty clears
+        if (!productTypeSet.has(t)) return null
+        return { sub_product_type: t }
+      },
+    },
+    {
+      colId: 'purchase_weight_lbs',
+      getValue: (row) => row.purchase_weight_lbs == null ? '' : String(row.purchase_weight_lbs),
+      parseValue: (str) => {
+        const t = String(str ?? '').trim()
+        if (t === '') return { purchase_weight_lbs: null }
+        const n = Number(t)
+        if (Number.isNaN(n)) return null
+        return { purchase_weight_lbs: n }
+      },
+    },
+    {
+      colId: 'case_weight_lbs',
+      getValue: (row) => row.case_weight_lbs == null ? '' : String(row.case_weight_lbs),
+      parseValue: (str) => {
+        const t = String(str ?? '').trim()
+        if (t === '') return { case_weight_lbs: null }
+        const n = Number(t)
+        if (Number.isNaN(n)) return null
+        return { case_weight_lbs: n }
+      },
+    },
+    {
+      colId: 'quantity',
+      getValue: (row) => row.quantity == null ? '' : String(row.quantity),
+      parseValue: (str) => {
+        const t = String(str ?? '').trim()
+        if (t === '') return { quantity: null }
+        const n = Number(t)
+        if (Number.isNaN(n)) return null
+        return { quantity: n }
+      },
+    },
+  ], [vendors, vendorByName, productTypeSet])
+
+  const colIdxByColId = useMemo(() => {
+    const m = new Map()
+    editableColumnMeta.forEach((c, idx) => m.set(c.colId, idx))
+    return m
+  }, [editableColumnMeta])
 
   // ── Columns ─────────────────────────────────────────────────────────────
   const columns = useMemo(() => [
@@ -476,6 +597,172 @@ export default function PurchasePlanning() {
 
   const groupedByVendor = grouping.includes('vendor')
 
+  // Visible data rows (no group headers). rowIdx in `selection` indexes into this.
+  const dataRows = useMemo(
+    () => table.getRowModel().rows.filter((r) => !r.getIsGrouped()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [table.getRowModel().rows],
+  )
+
+  // Clear selection when the underlying view changes — indices would otherwise
+  // point at the wrong cells.
+  useEffect(() => {
+    setSelection({ anchor: null, focus: null })
+  }, [periodId, grouping, sorting, columnFilters])
+
+  // ── Cell selection: mousedown handler ───────────────────────────────────
+  function handleCellMouseDown(e, rowIdx, colIdx) {
+    if (e.shiftKey) {
+      // Extend range without focusing the input — preventDefault on mousedown
+      // suppresses the focus that would otherwise follow.
+      e.preventDefault()
+      setSelection((s) => ({
+        anchor: s.anchor || { rowIdx, colIdx },
+        focus: { rowIdx, colIdx },
+      }))
+    } else {
+      // Plain click: anchor here, let native focus happen on the input.
+      setSelection({ anchor: { rowIdx, colIdx }, focus: { rowIdx, colIdx } })
+    }
+  }
+
+  // ── Copy / Paste handlers ───────────────────────────────────────────────
+  // Bulk paste applies many cells in parallel without invalidating the query
+  // between each one — invalidate once when the whole batch finishes.
+  async function distributeToCells(matrix, anchor) {
+    if (!matrix.length) return
+    const updates = []  // [{ id, patch }]
+    const byId = new Map()
+    for (let i = 0; i < matrix.length; i++) {
+      const r = anchor.rowIdx + i
+      if (r >= dataRows.length) break
+      const rowItem = dataRows[r].original
+      let patch = byId.get(rowItem.id) || {}
+      let touched = false
+      for (let j = 0; j < matrix[i].length; j++) {
+        const c = anchor.colIdx + j
+        if (c >= editableColumnMeta.length) break
+        const update = editableColumnMeta[c].parseValue(matrix[i][j])
+        if (update) {
+          patch = { ...patch, ...update }
+          touched = true
+        }
+      }
+      if (touched) {
+        byId.set(rowItem.id, patch)
+      }
+    }
+    for (const [id, patch] of byId) {
+      updates.push({ id, patch })
+    }
+    if (!updates.length) return
+    try {
+      await Promise.all(updates.map(({ id, patch }) => purchasePlanningApi.update(id, patch)))
+    } catch (err) {
+      setActionMsg(`Paste failed: ${err?.response?.data?.detail || err.message}`)
+    }
+    qc.invalidateQueries({ queryKey: ['purchase-planning', periodId] })
+
+    // Extend selection to cover the pasted region for visual feedback.
+    const lastRow = Math.min(anchor.rowIdx + matrix.length - 1, dataRows.length - 1)
+    const widest = matrix.reduce((m, r) => Math.max(m, r.length), 0)
+    const lastCol = Math.min(anchor.colIdx + widest - 1, editableColumnMeta.length - 1)
+    setSelection({ anchor, focus: { rowIdx: lastRow, colIdx: lastCol } })
+    setActionMsg(`Pasted ${updates.length} row${updates.length === 1 ? '' : 's'}`)
+  }
+
+  function selectionToTSV() {
+    const box = selectionBox(selection)
+    if (!box) return ''
+    const rows = []
+    for (let r = box.rs; r <= box.re; r++) {
+      if (r >= dataRows.length) continue
+      const rowItem = dataRows[r].original
+      const cells = []
+      for (let c = box.cs; c <= box.ce; c++) {
+        if (c >= editableColumnMeta.length) continue
+        cells.push(editableColumnMeta[c].getValue(rowItem))
+      }
+      rows.push(cells)
+    }
+    return buildTSV(rows)
+  }
+
+  useEffect(() => {
+    function isEditableField(el) {
+      if (!el) return false
+      const tag = el.tagName
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable
+    }
+
+    function onCopy(e) {
+      // Only handle multi-cell range; a single-cell copy lets the focused input
+      // copy its own selected text natively.
+      if (!selection.anchor || !selection.focus) return
+      if (cellsEqual(selection.anchor, selection.focus)) return
+      const tsv = selectionToTSV()
+      if (!tsv) return
+      e.clipboardData.setData('text/plain', tsv)
+      e.preventDefault()
+    }
+
+    function onPaste(e) {
+      if (!selection.anchor) return
+      const text = e.clipboardData?.getData('text/plain') ?? ''
+      if (!text) return
+      const matrix = parseTSV(text)
+      const isMulti = matrix.length > 1 || (matrix[0]?.length ?? 0) > 1
+      // Single-value paste into a focused input: let native handle so the user
+      // can paste mid-text. Only intercept multi-cell pastes.
+      if (!isMulti && isEditableField(document.activeElement)) return
+      e.preventDefault()
+      distributeToCells(matrix, selection.anchor)
+    }
+
+    async function onKeyDown(e) {
+      if (e.key === 'Escape') {
+        if (selection.anchor || selection.focus) {
+          setSelection({ anchor: null, focus: null })
+          if (isEditableField(document.activeElement)) document.activeElement.blur()
+        }
+        return
+      }
+      const cmd = e.metaKey || e.ctrlKey
+      if (!cmd) return
+      const k = e.key.toLowerCase()
+      // Cmd+C with no DOM selection (post shift-click range): the `copy` event
+      // won't fire, so handle it from keydown.
+      if (k === 'c' && selection.anchor && selection.focus && !cellsEqual(selection.anchor, selection.focus)) {
+        if (isEditableField(document.activeElement)) return  // input handles its own copy
+        e.preventDefault()
+        const tsv = selectionToTSV()
+        if (tsv) {
+          try { await navigator.clipboard.writeText(tsv) } catch {}
+        }
+        return
+      }
+      // Cmd+V outside any input: read clipboard async and distribute.
+      if (k === 'v' && selection.anchor && !isEditableField(document.activeElement)) {
+        e.preventDefault()
+        try {
+          const text = await navigator.clipboard.readText()
+          const matrix = parseTSV(text)
+          if (matrix.length) distributeToCells(matrix, selection.anchor)
+        } catch {}
+      }
+    }
+
+    document.addEventListener('copy', onCopy)
+    document.addEventListener('paste', onPaste)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('copy', onCopy)
+      document.removeEventListener('paste', onPaste)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selection, dataRows, editableColumnMeta, periodId])
+
   // ── Render ──────────────────────────────────────────────────────────────
   const period = periods.find((p) => p.id === periodId)
   const totals = useMemo(() => {
@@ -508,6 +795,11 @@ export default function PurchasePlanning() {
             purchases on the substitute fill the same gap. Net After Purchase
             sums across all rows sharing the same (product type, sub product
             type) combo, so splits across vendors net out together.
+          </p>
+          <p style={{ fontSize: 12, color: '#6b7280' }}>
+            <strong>Tip:</strong> Click a cell to select, shift-click to extend
+            a range. Copy/paste with Cmd+C / Cmd+V (Ctrl on Windows) — works
+            with Excel and Google Sheets. Esc to clear the selection.
           </p>
         </div>
       </div>
@@ -631,36 +923,61 @@ export default function PurchasePlanning() {
                   No plan rows yet. Use <strong>Seed from Projection</strong> to auto-create one row per product type with a positive gap, or <strong>+ Add Row</strong> for a blank row.
                 </td></tr>
               )}
-              {table.getRowModel().rows.map((row) => {
-                if (row.getIsGrouped()) {
+              {(() => {
+                const selBox = selectionBox(selection)
+                let dataRowIdx = -1
+                return table.getRowModel().rows.map((row) => {
+                  if (row.getIsGrouped()) {
+                    return (
+                      <tr key={row.id} style={{ background: '#f3f4f6' }}>
+                        <td
+                          colSpan={columns.length}
+                          style={{ cursor: 'pointer', fontWeight: 600 }}
+                          onClick={row.getToggleExpandedHandler()}
+                        >
+                          <span style={{ marginRight: 6, color: '#6b7280' }}>
+                            {row.getIsExpanded() ? '▼' : '▶'}
+                          </span>
+                          Vendor: {row.getValue('vendor')}
+                          <span style={{ marginLeft: 8, color: '#6b7280', fontWeight: 400, fontSize: 12 }}>
+                            ({row.subRows.length} row{row.subRows.length === 1 ? '' : 's'})
+                          </span>
+                        </td>
+                      </tr>
+                    )
+                  }
+                  dataRowIdx += 1
+                  const rIdx = dataRowIdx
                   return (
-                    <tr key={row.id} style={{ background: '#f3f4f6' }}>
-                      <td
-                        colSpan={columns.length}
-                        style={{ cursor: 'pointer', fontWeight: 600 }}
-                        onClick={row.getToggleExpandedHandler()}
-                      >
-                        <span style={{ marginRight: 6, color: '#6b7280' }}>
-                          {row.getIsExpanded() ? '▼' : '▶'}
-                        </span>
-                        Vendor: {row.getValue('vendor')}
-                        <span style={{ marginLeft: 8, color: '#6b7280', fontWeight: 400, fontSize: 12 }}>
-                          ({row.subRows.length} row{row.subRows.length === 1 ? '' : 's'})
-                        </span>
-                      </td>
+                    <tr key={row.id}>
+                      {row.getVisibleCells().map((cell) => {
+                        const colIdx = colIdxByColId.get(cell.column.id)
+                        const isEditable = colIdx !== undefined
+                        const inRange = isEditable && selBox != null
+                          && rIdx >= selBox.rs && rIdx <= selBox.re
+                          && colIdx >= selBox.cs && colIdx <= selBox.ce
+                        const isAnchor = isEditable && selection.anchor
+                          && selection.anchor.rowIdx === rIdx && selection.anchor.colIdx === colIdx
+                        const tdStyle = {
+                          padding: '4px 8px',
+                          background: inRange ? '#eff6ff' : 'transparent',
+                          boxShadow: isAnchor ? 'inset 0 0 0 2px #1d4ed8' : 'none',
+                          position: 'relative',
+                        }
+                        return (
+                          <td
+                            key={cell.id}
+                            style={tdStyle}
+                            onMouseDown={isEditable ? (e) => handleCellMouseDown(e, rIdx, colIdx) : undefined}
+                          >
+                            {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                          </td>
+                        )
+                      })}
                     </tr>
                   )
-                }
-                return (
-                  <tr key={row.id}>
-                    {row.getVisibleCells().map((cell) => (
-                      <td key={cell.id} style={{ padding: '4px 8px' }}>
-                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                      </td>
-                    ))}
-                  </tr>
-                )
-              })}
+                })
+              })()}
             </tbody>
           </table>
         </div>
