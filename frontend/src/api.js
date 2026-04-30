@@ -229,6 +229,7 @@ export const projectionConfirmedOrdersApi = {
   confirmOrders: (periodId, data) => api.post(`/projection-periods/${periodId}/confirm-orders`, data).then(r => r.data),
   unconfirmOrders: (periodId, data) => api.post(`/projection-periods/${periodId}/unconfirm-orders`, data).then(r => r.data),
   reConfirmAll: (periodId, data) => api.post(`/projection-periods/${periodId}/re-confirm-all`, data).then(r => r.data),
+  forceRefreshAll: (periodId, data) => api.post(`/projection-periods/${periodId}/force-refresh-all`, data, { timeout: 300000 }).then(r => r.data),
   getRollup: (periodId) => api.get(`/projection-periods/${periodId}/confirmed-demand-rollup`).then(r => r.data),
   saveConfirmedDemand: (periodId) => api.post(`/projection-periods/${periodId}/save-confirmed-demand`).then(r => r.data),
   revertConfirmedDemand: (periodId) => api.post(`/projection-periods/${periodId}/revert-confirmed-demand`).then(r => r.data),

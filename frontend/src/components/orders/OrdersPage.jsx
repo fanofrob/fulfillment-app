@@ -641,6 +641,35 @@ export default function OrdersPage({
     },
   })
 
+  const forceRefreshAllMutation = useMutation({
+    mutationFn: () => projectionConfirmedOrdersApi.forceRefreshAll(periodId, { mapping_tab: mappingTab }),
+    onSuccess: (data) => {
+      qc.invalidateQueries({ queryKey: ['projection-confirmed-orders', periodId] })
+      qc.invalidateQueries({ queryKey: ['orders'] })
+      setSelectedForBatch(new Set())
+      const reasons = (data.results || [])
+        .filter(r => !r.success)
+        .slice(0, 5)
+        .map(r => `  #${r.order_id}: ${r.error}`)
+        .join('\n')
+      const tail = data.skipped > 0 && reasons ? '\n\n' + reasons : ''
+      const r = data.recompute || {}
+      alert(
+        `Force refresh complete:\n` +
+        `  ${data.reconfirmed} re-confirmed (snapshots refreshed)\n` +
+        `  ${data.newly_confirmed} newly confirmed\n` +
+        `  ${data.skipped} skipped\n\n` +
+        `Operations replan:\n` +
+        `  ${r.orders_with_sku_changes || 0} orders with SKU changes\n` +
+        `  ${r.orders_replanned_created || 0} plans created, ${r.orders_replanned_repaired || 0} repaired` +
+        tail
+      )
+    },
+    onError: (err) => {
+      alert(`Force refresh failed: ${err?.response?.data?.detail || err?.message || 'Unknown error'}`)
+    },
+  })
+
   const holdTags = useMemo(() => new Set(
     orderRules.filter(r => r.action === 'hold' && r.is_active).map(r => r.tag.toLowerCase())
   ), [orderRules])
@@ -1347,6 +1376,33 @@ export default function OrdersPage({
                   }
                 >
                   {reConfirmAllMutation.isPending ? 'Re-confirming…' : '↻ Re-confirm All'}
+                </button>
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => {
+                    if (!confirm(
+                      `Force refresh EVERY eligible order in this period?\n\n` +
+                      `This will:\n` +
+                      `  • Re-resolve pick SKUs against the latest mapping\n` +
+                      `  • Replan operations boxes\n` +
+                      `  • Re-confirm already-confirmed orders (using each order's stored mapping)\n` +
+                      `  • Confirm still-unconfirmed eligibles using "${mappingTab}"\n\n` +
+                      `Use after a SKU mapping or short-ship/hold change to clean up stuck orders.`
+                    )) return
+                    forceRefreshAllMutation.mutate()
+                  }}
+                  disabled={
+                    forceRefreshAllMutation.isPending ||
+                    !periodId ||
+                    !mappingTab
+                  }
+                  title={
+                    !periodId ? 'Select a projection period first'
+                    : !mappingTab ? 'Select a SKU mapping first'
+                    : 'Recompute pick SKUs, replan boxes, and (re-)confirm every eligible order in this period using the latest config'
+                  }
+                >
+                  {forceRefreshAllMutation.isPending ? 'Refreshing…' : '⟳ Force Refresh All'}
                 </button>
                 {statusFilter === 'confirmed' && (
                   <button

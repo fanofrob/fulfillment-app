@@ -389,13 +389,13 @@ def auto_reconfirm_across_periods(
     return {"reconfirmed": total_reconfirmed, "results_by_period": results_by_period}
 
 
-def list_unconfirmed_eligible_order_ids(db: Session, period_id: int) -> list[str]:
+def list_eligible_order_ids_for_period(db: Session, period_id: int) -> list[str]:
     """
-    Return shopify_order_ids that:
-      - are NOT currently in projection_period_confirmed_orders for this period
-      - have app_status in ('not_processed', 'partially_fulfilled') (same filter as confirm)
-      - fall inside the period's fulfillment window (when defined)
-    Used by the Re-confirm All bulk action.
+    Return every shopify_order_id eligible for this period — confirmed or not.
+    Eligibility: app_status in ('not_processed', 'partially_fulfilled') and
+    (when the window is defined) created_at_shopify within fulfillment_start →
+    fulfillment_end. Used by Force Refresh All to recompute + (re-)confirm
+    every order in scope.
     """
     period = (
         db.query(models.ProjectionPeriod)
@@ -404,12 +404,6 @@ def list_unconfirmed_eligible_order_ids(db: Session, period_id: int) -> list[str
     )
     if not period:
         return []
-    confirmed_ids = {
-        r.shopify_order_id for r in
-        db.query(models.ProjectionPeriodConfirmedOrder.shopify_order_id)
-        .filter(models.ProjectionPeriodConfirmedOrder.period_id == period_id)
-        .all()
-    }
     q = db.query(models.ShopifyOrder).filter(
         models.ShopifyOrder.app_status.in_(("not_processed", "partially_fulfilled"))
     )
@@ -418,10 +412,93 @@ def list_unconfirmed_eligible_order_ids(db: Session, period_id: int) -> list[str
             models.ShopifyOrder.created_at_shopify >= period.fulfillment_start,
             models.ShopifyOrder.created_at_shopify <= period.fulfillment_end,
         )
+    return [o.shopify_order_id for o in q.all()]
+
+
+def list_unconfirmed_eligible_order_ids(db: Session, period_id: int) -> list[str]:
+    """
+    Eligible orders (see `list_eligible_order_ids_for_period`) minus those
+    already confirmed for the period. Used by Re-confirm All.
+    """
+    confirmed_ids = {
+        r.shopify_order_id for r in
+        db.query(models.ProjectionPeriodConfirmedOrder.shopify_order_id)
+        .filter(models.ProjectionPeriodConfirmedOrder.period_id == period_id)
+        .all()
+    }
     return [
-        o.shopify_order_id for o in q.all()
-        if o.shopify_order_id not in confirmed_ids
+        oid for oid in list_eligible_order_ids_for_period(db, period_id)
+        if oid not in confirmed_ids
     ]
+
+
+def force_refresh_period(
+    db: Session,
+    period_id: int,
+    fallback_mapping_tab: str,
+) -> dict:
+    """
+    Sweep every eligible order in the period through the latest SKU mapping +
+    short-ship/hold config:
+      1) recompute_open_orders to refresh pick_skus and replan operations boxes
+      2) re-confirm already-confirmed orders using each row's existing
+         mapping_used (preserves per-order intent)
+      3) confirm currently-unconfirmed eligibles using `fallback_mapping_tab`
+
+    Used to clean up orders that became stale BEFORE the auto-replan cascade
+    shipped — i.e. configs that flipped while the system still kicked orders
+    back without auto-replanning.
+
+    Returns counts + per-order results.
+    """
+    eligible_ids = list_eligible_order_ids_for_period(db, period_id)
+    if not eligible_ids:
+        return {
+            "reconfirmed": 0,
+            "newly_confirmed": 0,
+            "skipped": 0,
+            "recompute": None,
+            "results": [],
+        }
+
+    from services.order_recompute import recompute_open_orders
+    recompute = recompute_open_orders(db, order_ids=eligible_ids, auto_replan=True)
+
+    confirmed_rows = (
+        db.query(models.ProjectionPeriodConfirmedOrder)
+        .filter(
+            models.ProjectionPeriodConfirmedOrder.period_id == period_id,
+            models.ProjectionPeriodConfirmedOrder.shopify_order_id.in_(eligible_ids),
+        )
+        .all()
+    )
+    grouped: dict[str, list[str]] = defaultdict(list)
+    confirmed_set: set[str] = set()
+    for r in confirmed_rows:
+        confirmed_set.add(r.shopify_order_id)
+        grouped[r.mapping_used or fallback_mapping_tab].append(r.shopify_order_id)
+
+    all_results: list[dict] = []
+    reconfirmed = 0
+    for mapping_tab, oids in grouped.items():
+        results = confirm_orders(db, period_id, oids, mapping_tab)
+        reconfirmed += sum(1 for r in results if r.get("success"))
+        all_results.extend(results)
+
+    unconfirmed_ids = [oid for oid in eligible_ids if oid not in confirmed_set]
+    newly_confirmed = 0
+    if unconfirmed_ids:
+        results = confirm_orders(db, period_id, unconfirmed_ids, fallback_mapping_tab)
+        newly_confirmed = sum(1 for r in results if r.get("success"))
+        all_results.extend(results)
+
+    return {
+        "reconfirmed":     reconfirmed,
+        "newly_confirmed": newly_confirmed,
+        "skipped":         len(all_results) - reconfirmed - newly_confirmed,
+        "recompute":       recompute,
+        "results":         all_results,
+    }
 
 
 def unconfirm_orders(db: Session, period_id: int, order_ids: list[str]) -> int:

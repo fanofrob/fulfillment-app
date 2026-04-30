@@ -153,6 +153,28 @@ def re_confirm_all(
     }
 
 
+@router.post("/{period_id}/force-refresh-all")
+def force_refresh_all(
+    period_id: int,
+    body: _ReConfirmAllRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Sweep every eligible order in the period through the latest SKU mapping +
+    short-ship/hold config: recomputes pick_skus, replans operations boxes,
+    re-confirms already-confirmed orders (using their stored mapping_used),
+    and confirms still-unconfirmed eligibles (using `mapping_tab`). Use this
+    when the auto-replan cascade missed orders that became stale before it
+    was wired up.
+    """
+    period = _ensure_period(period_id, db)
+    _ensure_not_archived(period)
+    if not body.mapping_tab:
+        raise HTTPException(status_code=400, detail="mapping_tab is required")
+
+    return svc.force_refresh_period(db, period_id, body.mapping_tab)
+
+
 @router.post("/{period_id}/unconfirm-orders")
 def unconfirm_orders(
     period_id: int,
