@@ -577,6 +577,19 @@ def rollup_lbs_by_product_type(db: Session, period_id: int) -> dict[str, float]:
     Dashboard. Snapshots written before the shopify_sku field was added carry
     no shopify_sku — those items are always included (no info to filter on).
     """
+    lbs, _ = rollup_lbs_and_orders_by_product_type(db, period_id)
+    return lbs
+
+
+def rollup_lbs_and_orders_by_product_type(
+    db: Session, period_id: int
+) -> tuple[dict[str, float], dict[str, int]]:
+    """
+    Same rollup as rollup_lbs_by_product_type, but also returns distinct
+    order counts per product type — used by the projection engine so the
+    Projection Dashboard's confirmed_order_count reflects what's actually
+    been confirmed when MANUAL confirmed demand is in play.
+    """
     excluded = load_confirmed_demand_excluded_skus(db, period_id)
     rows = (
         db.query(models.ProjectionPeriodConfirmedOrder)
@@ -584,6 +597,7 @@ def rollup_lbs_by_product_type(db: Session, period_id: int) -> dict[str, float]:
         .all()
     )
     totals: dict[str, float] = defaultdict(float)
+    order_ids: dict[str, set] = defaultdict(set)
     for row in rows:
         for item in (row.boxes_snapshot or []):
             pt = item.get("product_type")
@@ -595,7 +609,10 @@ def rollup_lbs_by_product_type(db: Session, period_id: int) -> dict[str, float]:
             if sku and sku in excluded:
                 continue
             totals[pt] += float(qty) * float(w)
-    return {pt: round(lbs, 2) for pt, lbs in totals.items()}
+            order_ids[pt].add(row.shopify_order_id)
+    lbs = {pt: round(v, 2) for pt, v in totals.items()}
+    counts = {pt: len(ids) for pt, ids in order_ids.items()}
+    return lbs, counts
 
 
 def confirmed_demand_inventory_pivot(db: Session, period_id: int) -> list[dict]:

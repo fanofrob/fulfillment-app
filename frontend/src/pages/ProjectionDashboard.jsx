@@ -226,21 +226,37 @@ function SummaryBar({ projection, period, onRegenerate, isRegenerating }) {
         </div>
 
         <div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
-          {(histSummary?.weekly_breakdown || []).map(w => (
-            <div
-              key={w.week_number}
-              title={`${formatDayOnly(w.week_start)} – ${formatDayOnly(w.week_end)} · ${w.total_orders} orders / ${w.days}d`}
-              style={{
-                display: 'flex', flexDirection: 'column', alignItems: 'center',
-                padding: '4px 10px', background: '#fff',
-                border: '1px solid #e2e8f0', borderRadius: 6, minWidth: 58,
-              }}
-            >
-              <span style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>W{w.week_number}</span>
-              <span style={{ fontSize: 14, fontWeight: 700, color: '#1e293b' }}>{w.avg_orders_per_day}</span>
-              <span style={{ fontSize: 9, color: '#94a3b8' }}>orders/d</span>
-            </div>
-          ))}
+          {(histSummary?.weekly_breakdown || []).map(w => {
+            const dwd = w.days_with_data ?? w.days
+            const noData = dwd === 0
+            const partial = dwd > 0 && dwd < w.days
+            const tooltip =
+              `${formatDayOnly(w.week_start)} – ${formatDayOnly(w.week_end)} · ` +
+              `${w.total_orders} orders across ${dwd}/${w.days} days with data` +
+              (noData ? ' — no data ingested for this week' :
+               partial ? ' — partial ingestion; avg uses days with data only' : '')
+            return (
+              <div
+                key={w.week_number}
+                title={tooltip}
+                style={{
+                  display: 'flex', flexDirection: 'column', alignItems: 'center',
+                  padding: '4px 10px',
+                  background: noData ? '#fef3c7' : partial ? '#fffbeb' : '#fff',
+                  border: `1px solid ${noData ? '#f59e0b' : partial ? '#fcd34d' : '#e2e8f0'}`,
+                  borderRadius: 6, minWidth: 58,
+                }}
+              >
+                <span style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>W{w.week_number}</span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: noData ? '#92400e' : '#1e293b' }}>
+                  {noData ? 'N/A' : w.avg_orders_per_day}
+                </span>
+                <span style={{ fontSize: 9, color: '#94a3b8' }}>
+                  {noData ? 'no data' : partial ? `${dwd}/${w.days}d` : 'orders/d'}
+                </span>
+              </div>
+            )
+          })}
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>

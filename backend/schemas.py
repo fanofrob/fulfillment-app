@@ -818,6 +818,7 @@ class HistoricalWeekBucket(BaseModel):
     week_start: datetime
     week_end: datetime
     days: int
+    days_with_data: int = 0
     total_orders: int
     avg_orders_per_day: float
 
@@ -828,6 +829,7 @@ class HistoricalOrdersSummaryResponse(BaseModel):
     overall_avg_orders_per_day: float = 0.0
     overall_total_orders: int = 0
     overall_days: int = 0
+    overall_days_with_data: int = 0
 
 # Projection comparison (two projections side-by-side by product type)
 class ComparisonLineResponse(BaseModel):

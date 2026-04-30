@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 import models
 from services import sheets_service
+from services import projection_confirmed_orders_service
 
 
 def _ensure_utc(dt: datetime | None) -> datetime | None:
@@ -82,9 +83,23 @@ def generate_projection(
     overrides = _load_overrides(db, period_id)
 
     # ── Step 4: Confirmed demand ─────────────────────────────────────────────
-    confirmed_demand, confirmed_orders, unmapped_skus_confirmed = _calc_confirmed_demand(
+    # Always compute the auto rollup — it gets stored on the period as the
+    # baseline that MANUAL is compared against (and is what the projection uses
+    # when MANUAL isn't set).
+    auto_demand, auto_orders, unmapped_skus_confirmed = _calc_confirmed_demand(
         db, period, sku_lookup, weight_map, short_ship_skus, inventory_hold_skus,
     )
+    # When the user has saved confirmed demand on the Confirmed Demand Dashboard,
+    # use the rollup of the confirmed orders' boxes_snapshot — the same source
+    # the CD dashboard displays. Otherwise the Projection Dashboard would show
+    # a "MANUAL" badge but an auto-derived number, with the two diverging.
+    if period.has_manual_confirmed_demand:
+        confirmed_demand, confirmed_orders = (
+            projection_confirmed_orders_service
+            .rollup_lbs_and_orders_by_product_type(db, period_id)
+        )
+    else:
+        confirmed_demand, confirmed_orders = auto_demand, auto_orders
 
     # ── Step 5: Projected demand (historical forecast) ───────────────────────
     hist_range_start = now - timedelta(weeks=max(historical_weeks, 1))
@@ -237,10 +252,10 @@ def generate_projection(
         db.add(line)
 
     # Write auto confirmed demand onto the period for the review/override layer.
-    # Manual override (if set via Projections Orders UI) is consulted separately
-    # at dashboard time; writing auto here keeps the two sources cleanly split.
+    # Always store the auto-derived value here (not the manual-aware confirmed_demand
+    # the projection just used) so the CD dashboard's "Revert to Auto" stays meaningful.
     period.confirmed_demand_auto_lbs = {
-        pt: round(lbs, 2) for pt, lbs in confirmed_demand.items()
+        pt: round(lbs, 2) for pt, lbs in auto_demand.items()
     }
 
     db.commit()
@@ -1165,7 +1180,11 @@ def get_historical_orders_summary(db: Session, projection_id: int) -> dict:
     ).all()
     day_orders: dict = {d: count for d, count in day_rows}
 
-    # Slice into 7-day buckets, week 1 = oldest
+    # Slice into 7-day buckets, week 1 = oldest. We track calendar days separately
+    # from "days with data" — a missing day in historical_daily_orders means the
+    # ingestion job hasn't covered it, NOT that zero orders happened. Averaging
+    # those missing days as 0 makes a partial-ingestion window look like a sales
+    # collapse, so the average uses days_with_data as the divisor instead.
     weekly = []
     cursor = start
     week_num = 1
@@ -1173,18 +1192,22 @@ def get_historical_orders_summary(db: Session, projection_id: int) -> dict:
         w_end = min(cursor + timedelta(days=7), end)
         total = 0
         days_in_week = 0
+        days_with_data = 0
         d = cursor.date()
         end_d = w_end.date()
         while d < end_d:
-            total += day_orders.get(d, 0)
+            if d in day_orders:
+                total += day_orders[d]
+                days_with_data += 1
             days_in_week += 1
             d += timedelta(days=1)
-        avg = (total / days_in_week) if days_in_week > 0 else 0.0
+        avg = (total / days_with_data) if days_with_data > 0 else 0.0
         weekly.append({
             "week_number": week_num,
             "week_start": cursor,
             "week_end": w_end,
             "days": days_in_week,
+            "days_with_data": days_with_data,
             "total_orders": total,
             "avg_orders_per_day": round(avg, 1),
         })
@@ -1193,7 +1216,8 @@ def get_historical_orders_summary(db: Session, projection_id: int) -> dict:
 
     overall_total = sum(w["total_orders"] for w in weekly)
     overall_days = sum(w["days"] for w in weekly)
-    overall_avg = (overall_total / overall_days) if overall_days > 0 else 0.0
+    overall_days_with_data = sum(w["days_with_data"] for w in weekly)
+    overall_avg = (overall_total / overall_days_with_data) if overall_days_with_data > 0 else 0.0
 
     return {
         "historical_range_start": start,
@@ -1202,6 +1226,7 @@ def get_historical_orders_summary(db: Session, projection_id: int) -> dict:
         "overall_avg_orders_per_day": round(overall_avg, 1),
         "overall_total_orders": overall_total,
         "overall_days": overall_days,
+        "overall_days_with_data": overall_days_with_data,
     }
 
 
