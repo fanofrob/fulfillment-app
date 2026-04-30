@@ -505,11 +505,15 @@ export default function OrdersPage({
     limit: 2000,
   }
 
-  // Always fetch all orders (no status filter) for sidebar counts. Counts don't
-  // depend on the mapping tab, so we don't pass it here — keeps the cache hot.
+  // Always fetch all orders (no status filter) for sidebar counts. Mapping_tab
+  // only affects margin/COGS preview (not classification), so it's omitted to
+  // keep the cache hot. Period_id IS needed: it layers the period's short-ship
+  // / inventory-hold configs onto app_line_status, which drives ship_partial /
+  // ship_none / inv_hold counts.
   const allOrdersParams = {
     ...(search ? { search } : {}),
     ...(tagSearch ? { tag: tagSearch } : {}),
+    ...(previewPeriodId ? { period_id: previewPeriodId } : {}),
     limit: 2000,
   }
 
