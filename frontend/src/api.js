@@ -369,6 +369,11 @@ export const fulfillmentApi = {
 
   // Auto-create plans for all unplanned not_processed orders
   bulkAutoPlan: (orderIds) => api.post('/fulfillment/bulk-auto-plan', orderIds ? { order_ids: orderIds } : {}).then(r => r.data),
+  bulkAutoPlanWithMapping: (orderIds, mappingTab, periodId) => api.post(
+    '/fulfillment/bulk-auto-plan-with-mapping',
+    { order_ids: orderIds, mapping_tab: mappingTab, period_id: periodId || null },
+    { timeout: 300000 },
+  ).then(r => r.data),
 
   // Change detection
   detectChanges: (shopifyOrderId) => api.post('/fulfillment/detect-changes', null, {

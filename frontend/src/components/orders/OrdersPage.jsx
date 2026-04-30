@@ -863,7 +863,15 @@ export default function OrdersPage({
   })
 
   const autoPlanMutation = useMutation({
-    mutationFn: (orderIds) => fulfillmentApi.bulkAutoPlan(orderIds),
+    mutationFn: (orderIds) => (
+      // On Confirmed Orders, plan against the page's selected mapping_tab so
+      // the stored plan matches the on-page preview — bridges the gap when
+      // the warehouse-default mapping doesn't have an order's shopify_sku
+      // but the page-selected mapping does.
+      isProjections && mappingTab
+        ? fulfillmentApi.bulkAutoPlanWithMapping(orderIds, mappingTab, periodId)
+        : fulfillmentApi.bulkAutoPlan(orderIds)
+    ),
     onSuccess: (data) => {
       qc.invalidateQueries(['orders'])
       qc.invalidateQueries(['plans'])
@@ -872,7 +880,12 @@ export default function OrdersPage({
       if (data.repaired > 0) parts.push(`${data.repaired} plans repaired`)
       if (data.unmatched_box_type > 0) parts.push(`${data.unmatched_box_type} with no box rule matched`)
       if (data.skipped > 0) parts.push(`${data.skipped} skipped`)
-      alert(parts.length ? parts.join(', ') : 'All orders already up to date')
+      const reasons = (data.results || [])
+        .filter(r => r.action === 'nothing_to_ship' || r.action === 'no_boxes')
+        .slice(0, 5)
+        .map(r => `  #${r.order_number || r.order_id}: ${r.reason}`)
+        .join('\n')
+      alert((parts.length ? parts.join(', ') : 'All orders already up to date') + (reasons ? '\n\n' + reasons : ''))
     },
   })
 

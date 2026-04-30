@@ -2905,6 +2905,171 @@ def bulk_auto_plan(body: BulkAutoPlanRequest = BulkAutoPlanRequest(), db: Sessio
     }
 
 
+# ── Bulk auto-plan with override mapping ──────────────────────────────────────
+
+class BulkAutoPlanWithMappingRequest(BaseModel):
+    order_ids: List[str]
+    mapping_tab: str
+    period_id: Optional[int] = None
+
+
+@router.post("/bulk-auto-plan-with-mapping")
+def bulk_auto_plan_with_mapping(
+    body: BulkAutoPlanWithMappingRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Auto-plan against a specific SKU mapping tab (and optional period CD
+    short-ship/hold context) instead of each order's warehouse-default DB
+    pick_skus. Used by Confirmed Orders so the stored plan matches the box
+    preview the user sees on the page — even when the warehouse mapping
+    doesn't have the order's shopify_sku but the page-selected mapping does.
+
+    For each order: re-resolves line items via the override mapping, runs
+    `compute_boxes_for_order`, wipes pending unpushed boxes, and writes a
+    fresh FulfillmentBox + BoxLineItem set against the existing (or new)
+    plan. ShopifyLineItem.pick_sku is not modified — the override pick_skus
+    only flow into the plan boxes.
+    """
+    from services import mapping_override
+
+    if not body.order_ids:
+        return {"created": 0, "repaired": 0, "skipped": 0, "unmatched_box_type": 0, "results": []}
+    if not body.mapping_tab:
+        raise HTTPException(status_code=400, detail="mapping_tab is required")
+
+    orders = db.query(models.ShopifyOrder).filter(
+        models.ShopifyOrder.shopify_order_id.in_(body.order_ids),
+        models.ShopifyOrder.app_status.in_(["not_processed", "partially_fulfilled"]),
+    ).all()
+
+    created = 0
+    repaired = 0
+    skipped = 0
+    unmatched = 0
+    results: list[dict] = []
+
+    for order in orders:
+        override_lis = mapping_override.build_override_line_items(
+            order.shopify_order_id, body.mapping_tab, db, period_id=body.period_id
+        )
+        if not override_lis:
+            skipped += 1
+            results.append({
+                "order_id": order.shopify_order_id,
+                "order_number": order.shopify_order_number,
+                "action": "nothing_to_ship",
+                "reason": f"No line items resolved under mapping tab '{body.mapping_tab}'",
+            })
+            continue
+
+        boxes, errors = compute_boxes_for_order(order, override_lis, db)
+        if not boxes:
+            skipped += 1
+            results.append({
+                "order_id": order.shopify_order_id,
+                "order_number": order.shopify_order_number,
+                "action": "no_boxes",
+                "reason": "; ".join(errors) if errors else "Plan produced no shippable boxes",
+            })
+            continue
+
+        plan = (
+            db.query(models.FulfillmentPlan)
+            .filter(
+                models.FulfillmentPlan.shopify_order_id == order.shopify_order_id,
+                models.FulfillmentPlan.status != "cancelled",
+            )
+            .order_by(models.FulfillmentPlan.version.desc())
+            .first()
+        )
+        action = "repaired"
+        if not plan:
+            plan = models.FulfillmentPlan(
+                shopify_order_id=order.shopify_order_id,
+                status="draft",
+            )
+            db.add(plan)
+            db.flush()
+            action = "created"
+        elif plan.status not in ("draft", "needs_reconfiguration"):
+            plan.status = "draft"
+
+        # Wipe pending unpushed boxes so the override mapping rebuilds cleanly.
+        pending = (
+            db.query(models.FulfillmentBox)
+            .filter(
+                models.FulfillmentBox.plan_id == plan.id,
+                models.FulfillmentBox.status == "pending",
+                models.FulfillmentBox.shipstation_order_id.is_(None),
+            )
+            .all()
+        )
+        for b in pending:
+            db.query(models.BoxLineItem).filter(
+                models.BoxLineItem.box_id == b.id
+            ).delete(synchronize_session=False)
+            db.delete(b)
+        db.flush()
+
+        # Build override metadata so BoxLineItem rows carry shopify_sku /
+        # product_title even when the DB ShopifyLineItem lacks a pick_sku.
+        meta_by_key: dict[tuple, dict] = {}
+        for li in override_lis:
+            key = (li.get("pick_sku"), li.get("line_item_id") or "")
+            meta_by_key.setdefault(key, li)
+
+        box_type_matched = all(b["box_type_id"] is not None for b in boxes)
+        next_num = _next_box_number(plan.id, db)
+        for i, box_def in enumerate(boxes):
+            box = models.FulfillmentBox(
+                plan_id=plan.id,
+                box_number=next_num + i,
+                status="pending",
+                box_type_id=box_def["box_type_id"],
+            )
+            db.add(box)
+            db.flush()
+            for (pick_sku, line_item_id), qty in box_def["items"].items():
+                meta = meta_by_key.get((pick_sku, line_item_id), {})
+                db.add(models.BoxLineItem(
+                    box_id=box.id,
+                    pick_sku=pick_sku,
+                    shopify_sku=meta.get("shopify_sku"),
+                    product_title=meta.get("product_title"),
+                    shopify_line_item_id=line_item_id or None,
+                    quantity=qty,
+                ))
+
+        if errors:
+            plan.notes = f"[Auto-plan note: {'; '.join(errors)}]"
+
+        db.commit()
+
+        if action == "created":
+            created += 1
+        else:
+            repaired += 1
+        if not box_type_matched:
+            unmatched += 1
+        results.append({
+            "order_id": order.shopify_order_id,
+            "order_number": order.shopify_order_number,
+            "action": action,
+            "plan_id": plan.id,
+            "box_type_matched": box_type_matched,
+            "mapping_tab": body.mapping_tab,
+        })
+
+    return {
+        "created": created,
+        "repaired": repaired,
+        "skipped": skipped,
+        "unmatched_box_type": unmatched,
+        "results": results,
+    }
+
+
 # ── Change detection ──────────────────────────────────────────────────────────
 
 @router.post("/detect-changes")
