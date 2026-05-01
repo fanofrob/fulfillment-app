@@ -1075,7 +1075,16 @@ export default function PurchasePlanning() {
       </datalist>
 
       {periodId && (
-        <div className="data-table-wrap" style={{ overflowX: 'auto' }}>
+        <div
+          className="data-table-wrap"
+          style={{
+            overflow: 'auto',
+            // Keep the table inside its own scroll container so the sticky
+            // <thead> has something to stick within. 75vh leaves the page
+            // header / toolbar / tip visible; the table scrolls beneath.
+            maxHeight: 'calc(100vh - 220px)',
+          }}
+        >
           <table className="data-table" style={{ minWidth: 1600 }}>
             <thead>
               {table.getHeaderGroups().map((hg) => (
