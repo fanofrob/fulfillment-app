@@ -5,6 +5,7 @@ from datetime import date, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func as sqlfunc
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -264,9 +265,18 @@ def delete_receiving_record(record_id: int, db: Session = Depends(get_db)):
 
 @router.get("/skus-for-product-type/{product_type}", response_model=List[schemas.SkuForProductTypeResponse])
 def get_skus_for_product_type(product_type: str, db: Session = Depends(get_db)):
-    """Return available pick SKUs for a product type, with weight and shelf life info."""
-    mappings = (
-        db.query(models.SkuMapping.pick_sku)
+    """
+    Return pick SKUs that match a product type, sorted by stocked-first so
+    the receiving form can default to one with inventory on hand.
+
+    Two sources are unioned (some product types have one but not the other):
+      1) sku_mappings rows whose product_type matches
+      2) inventory_items whose `name` matches the product type after stripping
+         the category prefix (e.g. "Fruit: Apple, Cosmic Crisp" → "Apple, Cosmic Crisp")
+    """
+    # 1) From sku_mappings (Shopify SKU → pick SKU map)
+    mapping_pick_skus = {
+        row[0] for row in db.query(models.SkuMapping.pick_sku)
         .filter(
             models.SkuMapping.product_type == product_type,
             models.SkuMapping.is_active == True,
@@ -274,8 +284,24 @@ def get_skus_for_product_type(product_type: str, db: Session = Depends(get_db)):
         )
         .distinct()
         .all()
+    }
+
+    # 2) From inventory by name. The PO product_type is "Fruit: Apple, Cosmic Crisp"
+    # while InventoryItem.name is "Apple, Cosmic Crisp" — strip the leading
+    # "Category: " and match case-insensitively. Aggregate qty across warehouses.
+    stripped_name = product_type.split(":", 1)[1].strip() if ":" in product_type else product_type.strip()
+    inventory_rows = (
+        db.query(
+            models.InventoryItem.pick_sku,
+            sqlfunc.sum(models.InventoryItem.on_hand_qty).label("total_qty"),
+        )
+        .filter(sqlfunc.lower(models.InventoryItem.name) == stripped_name.lower())
+        .group_by(models.InventoryItem.pick_sku)
+        .all()
     )
-    pick_skus = [m[0] for m in mappings]
+    inventory_qty_by_sku = {r[0]: float(r[1] or 0) for r in inventory_rows}
+
+    pick_skus = list(mapping_pick_skus | set(inventory_qty_by_sku.keys()))
     if not pick_skus:
         return []
 
@@ -286,6 +312,22 @@ def get_skus_for_product_type(product_type: str, db: Session = Depends(get_db)):
     )
     sku_map = {s.pick_sku: s for s in sku_info}
 
+    # If a pick_sku appears in mappings but not in inventory_items at all, look
+    # up its on-hand across all warehouses (sum) so the frontend default works.
+    missing = [ps for ps in pick_skus if ps not in inventory_qty_by_sku]
+    if missing:
+        extra_inv = (
+            db.query(
+                models.InventoryItem.pick_sku,
+                sqlfunc.sum(models.InventoryItem.on_hand_qty).label("total_qty"),
+            )
+            .filter(models.InventoryItem.pick_sku.in_(missing))
+            .group_by(models.InventoryItem.pick_sku)
+            .all()
+        )
+        for sku, qty in extra_inv:
+            inventory_qty_by_sku[sku] = float(qty or 0)
+
     result = []
     for ps in pick_skus:
         info = sku_map.get(ps)
@@ -293,7 +335,10 @@ def get_skus_for_product_type(product_type: str, db: Session = Depends(get_db)):
             pick_sku=ps,
             weight_lb=info.weight_lb if info else None,
             days_til_expiration=info.days_til_expiration if info else None,
+            total_on_hand=inventory_qty_by_sku.get(ps, 0.0),
         ))
+    # Stocked SKUs first (descending by on-hand), then alphabetical
+    result.sort(key=lambda r: (-r.total_on_hand, r.pick_sku))
     return result
 
 

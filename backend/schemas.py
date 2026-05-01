@@ -1129,3 +1129,6 @@ class SkuForProductTypeResponse(BaseModel):
     pick_sku: str
     weight_lb: Optional[float] = None
     days_til_expiration: Optional[float] = None
+    # Sum of on_hand_qty across warehouses — frontend uses this to default
+    # the receiving form's SKU to one that's actually stocked.
+    total_on_hand: float = 0.0

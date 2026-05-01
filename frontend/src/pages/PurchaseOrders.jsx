@@ -52,7 +52,7 @@ export default function PurchaseOrders() {
   const [allocations, setAllocations] = useState([])
   // Receiving state
   const [receivingLineId, setReceivingLineId] = useState(null)
-  const [receivingForm, setReceivingForm] = useState({ received_cases: '', received_weight_lbs: '', harvest_date: '', confirmed_pick_sku: '', quality_rating: '', quality_notes: '' })
+  const [receivingForm, setReceivingForm] = useState({ received_cases: '', case_weight_lbs: '', received_weight_lbs: '', harvest_date: '', confirmed_pick_sku: '', quality_rating: '', quality_notes: '' })
   const [receivingRecords, setReceivingRecords] = useState([])
   const [availableSkus, setAvailableSkus] = useState([])
 
@@ -251,8 +251,33 @@ export default function PurchaseOrders() {
 
   function openReceiveForm(line) {
     setReceivingLineId(line.id)
-    setReceivingForm({ received_cases: '', received_weight_lbs: '', harvest_date: '', confirmed_pick_sku: '', quality_rating: '', quality_notes: '' })
-    receivingApi.getSkusForProductType(line.product_type).then(setAvailableSkus).catch(() => setAvailableSkus([]))
+    // Pre-fill from the PO line so the user only needs to confirm or tweak.
+    // Cases/case-weight/total-weight default to what was ordered; harvest
+    // defaults to today (the receiving date). The SKU default is filled in
+    // below once we know which SKUs are stocked.
+    const today = new Date().toISOString().slice(0, 10)
+    setReceivingForm({
+      received_cases: line.quantity_cases ?? '',
+      case_weight_lbs: line.case_weight_lbs ?? '',
+      received_weight_lbs: line.total_weight_lbs ?? '',
+      harvest_date: today,
+      confirmed_pick_sku: '',
+      quality_rating: '',
+      quality_notes: '',
+    })
+    receivingApi.getSkusForProductType(line.product_type)
+      .then(skus => {
+        setAvailableSkus(skus)
+        // Default to the first SKU with on-hand > 0 (the API returns them
+        // sorted stocked-first). If nothing is stocked, fall back to the
+        // first SKU in the list so the dropdown isn't left blank.
+        const stocked = skus.find(s => (s.total_on_hand ?? 0) > 0)
+        const fallback = stocked || skus[0]
+        if (fallback) {
+          setReceivingForm(f => ({ ...f, confirmed_pick_sku: fallback.pick_sku }))
+        }
+      })
+      .catch(() => setAvailableSkus([]))
   }
 
   function handleReceiveSubmit(poId, lineId) {
@@ -548,11 +573,38 @@ export default function PurchaseOrders() {
                       {/* Receiving form for this line */}
                       {receivingLineId === line.id && (
                         <tr><td colSpan={9} style={{ padding: '8px', background: '#f9fafb' }}>
-                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 8, marginBottom: 8 }}>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 8, marginBottom: 8 }}>
                             <div className="form-group" style={{ margin: 0 }}>
                               <label style={{ fontSize: 11 }}>Cases Received</label>
                               <input type="number" step="0.1" value={receivingForm.received_cases}
-                                onChange={e => setReceivingForm({ ...receivingForm, received_cases: e.target.value })} />
+                                onChange={e => {
+                                  // Recompute total weight when cases or case-weight changes,
+                                  // unless the user has already typed a custom total weight.
+                                  const cases = e.target.value
+                                  const cw = receivingForm.case_weight_lbs
+                                  setReceivingForm({
+                                    ...receivingForm,
+                                    received_cases: cases,
+                                    received_weight_lbs: (cases !== '' && cw !== '' && cw != null)
+                                      ? Number(cases) * Number(cw)
+                                      : receivingForm.received_weight_lbs,
+                                  })
+                                }} />
+                            </div>
+                            <div className="form-group" style={{ margin: 0 }}>
+                              <label style={{ fontSize: 11 }}>Case Wt (lbs)</label>
+                              <input type="number" step="0.1" value={receivingForm.case_weight_lbs ?? ''}
+                                onChange={e => {
+                                  const cw = e.target.value
+                                  const cases = receivingForm.received_cases
+                                  setReceivingForm({
+                                    ...receivingForm,
+                                    case_weight_lbs: cw,
+                                    received_weight_lbs: (cases !== '' && cw !== '')
+                                      ? Number(cases) * Number(cw)
+                                      : receivingForm.received_weight_lbs,
+                                  })
+                                }} />
                             </div>
                             <div className="form-group" style={{ margin: 0 }}>
                               <label style={{ fontSize: 11 }}>Weight (lbs)</label>
@@ -568,10 +620,11 @@ export default function PurchaseOrders() {
                               <label style={{ fontSize: 11 }}>Confirmed SKU</label>
                               <select value={receivingForm.confirmed_pick_sku}
                                 onChange={e => setReceivingForm({ ...receivingForm, confirmed_pick_sku: e.target.value })}>
-                                <option value="">Select SKU...</option>
+                                {availableSkus.length === 0 && <option value="">No SKUs found</option>}
                                 {availableSkus.map(s => (
                                   <option key={s.pick_sku} value={s.pick_sku}>
                                     {s.pick_sku} ({s.weight_lb ? `${s.weight_lb} lb/pc` : 'no weight'})
+                                    {s.total_on_hand > 0 ? ` · ${s.total_on_hand} on hand` : ''}
                                   </option>
                                 ))}
                               </select>
