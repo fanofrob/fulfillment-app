@@ -427,6 +427,9 @@ function PoSummaryPopover({ poId, anchorRect }) {
       style={{
         ...popoverPanelStyle,
         top, left, width: PANEL_W,
+        // Above sticky table headers (z=4) and sticky cells (z=1/3) so the
+        // panel paints over them instead of letting their content show through.
+        zIndex: 60,
         // No backdrop — popover sits inline under the chip and dismisses on mouseleave.
         pointerEvents: 'none',
       }}

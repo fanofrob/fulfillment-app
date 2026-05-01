@@ -449,7 +449,7 @@ export default function PurchaseOrders() {
       {/* PO Detail Modal */}
       {showDetailModal && (
         <div className="modal-overlay" onClick={() => setShowDetailModal(null)}>
-          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 800 }}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ width: 1100, maxWidth: '95vw' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
               <div>
                 <h2 style={{ margin: '0 0 4px 0' }}>{showDetailModal.po_number}</h2>
