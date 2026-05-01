@@ -146,12 +146,30 @@ def _po_line_product_type(plan: models.PurchasePlanLine) -> str:
 
 def _quantity_cases_from_plan(plan: models.PurchasePlanLine) -> float:
     """Convert the plan row's purchase weight into a whole-case count.
-    Mirrors purchase_weight_helper but returns the case count, not the weight."""
+    Mirrors purchase_weight_helper but returns the case count, not the weight.
+    Returns 0 for "bulk lbs" rows (no case_weight set)."""
     pw = plan.purchase_weight_lbs or 0.0
     cw = plan.case_weight_lbs or 0.0
     if pw <= 0 or cw <= 0:
         return 0.0
     return float(math.ceil(pw / cw))
+
+
+def _total_weight_from_plan(plan: models.PurchasePlanLine) -> Optional[float]:
+    """Total weight to record on the linked PO line.
+
+    Two pricing/order shapes:
+      - Cased: case_weight_lbs is set → total = ceil(purchase / case) * case
+      - Bulk:  no case_weight → total = purchase_weight_lbs directly (e.g.
+        "11 lbs of apricots" with no case structure)
+    Returns None when neither is available."""
+    pw = plan.purchase_weight_lbs
+    cw = plan.case_weight_lbs
+    if cw and cw > 0 and pw and pw > 0:
+        return float(math.ceil(pw / cw)) * float(cw)
+    if pw and pw > 0:
+        return float(pw)
+    return None
 
 
 def _vendor_product(db: Session, vendor_id: int, product_type: str) -> Optional[models.VendorProduct]:
@@ -237,6 +255,11 @@ def _create_po_line_from_plan(
         notes=plan.notes,
     )
     _recompute_line_totals(line)
+    # Bulk fallback: when there's no case structure, _recompute_line_totals
+    # leaves total_weight_lbs=None — fill it from purchase_weight_lbs so the
+    # PO still shows the ordered weight (e.g. "11 lbs of apricots").
+    if line.total_weight_lbs is None:
+        line.total_weight_lbs = _total_weight_from_plan(plan)
     db.add(line)
     db.flush()  # need line.id for allocation + plan.purchase_order_line_id
     _replace_line_allocation(db, line, plan.projection_period_id)
@@ -265,6 +288,9 @@ def _mirror_plan_to_line(db: Session, plan: models.PurchasePlanLine) -> None:
     if plan.notes is not None:
         line.notes = plan.notes
     _recompute_line_totals(line)
+    # Bulk fallback (see _create_po_line_from_plan for rationale).
+    if line.total_weight_lbs is None:
+        line.total_weight_lbs = _total_weight_from_plan(plan)
     _replace_line_allocation(db, line, plan.projection_period_id)
     _recompute_po_subtotal(db, line.purchase_order_id)
 
