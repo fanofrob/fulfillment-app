@@ -46,6 +46,37 @@ class SkuMapping(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
+
+class BundleMapping(Base):
+    """
+    Canonical Shopify SKU → pick SKU bundle mapping. DB-backed source of truth
+    for which pick SKUs make up each Shopify SKU; previously lived only in
+    Google Sheets (INPUT_bundles_cvr_walnut/northlake). A single Shopify SKU
+    can map to multiple pick SKUs (one row per pick line in the bundle).
+
+    Sync from sheets via POST /api/sku-mappings/refresh; rows that have been
+    edited in-app (last_edited_in_app_at IS NOT NULL) are skipped entirely on
+    refresh — app wins on conflict.
+    """
+    __tablename__ = "bundle_mappings"
+    id = Column(Integer, primary_key=True, index=True)
+    warehouse = Column(String, nullable=False, index=True)  # 'walnut' | 'northlake'
+    shopify_sku = Column(String, nullable=False, index=True)
+    pick_sku = Column(String, nullable=True, index=True)
+    mix_quantity = Column(Float, nullable=True, default=1.0)
+    product_type = Column(String, nullable=True)
+    pick_type = Column(String, nullable=True)
+    pick_weight_lb = Column(Float, nullable=True)
+    lineitem_weight = Column(Float, nullable=True)
+    shop_status = Column(String, nullable=True)
+    is_active = Column(Boolean, default=True)
+    notes = Column(Text, nullable=True)
+    last_edited_in_app_at = Column(DateTime(timezone=True), nullable=True)
+    synced_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
 class SkuHelperMapping(Base):
     """
     Variant-to-canonical Shopify SKU normalization. A single product often gets

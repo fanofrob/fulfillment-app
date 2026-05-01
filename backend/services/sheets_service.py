@@ -689,22 +689,36 @@ def get_no_bundle_skus() -> set:
     return _fetch_sku_type_data()["no_bundle_set"]
 
 
-def get_sku_mapping_lookup(warehouse: str) -> dict:
+def _get_bundle_mapping_lookup_base(warehouse: str) -> dict:
     """
-    Returns {shopify_sku: [{"pick_sku": str, "mix_quantity": float}, ...]} for fast O(1) lookup.
-    A single Shopify SKU may map to multiple pick SKUs (bundle), so each value is a list.
-
-    Applies a two-step resolution:
-      1. shopify_sku → helper_sku  (via INPUT_SKU_TYPE "SKU Helper" column)
-      2. helper_sku  → pick_sku    (via INPUT_bundles_cvr_* "picklist sku" column)
-
-    If a shopify_sku already has a direct entry in the bundles_cvr table it is used as-is.
-    If not, the helper indirection is applied so that all variant SKUs that share a helper
-    inherit the same pick_sku mapping without needing their own row in the bundles table.
+    Base Shopify SKU → pick SKU lookup before helper indirection.
+    Reads from the bundle_mappings DB table (canonical source). Falls back to
+    Google Sheets only when the DB has no active rows for the warehouse — i.e.
+    the brief window between deploying DB-backed mappings and running the
+    first /api/sku-mappings/refresh.
     """
-    rows = get_sku_mappings(warehouse, skip=0, limit=100000)
+    from database import SessionLocal
+    import models
+
     result = CaseInsensitiveSkuDict()
-    for r in rows:
+    with SessionLocal() as db:
+        rows = db.query(models.BundleMapping).filter(
+            models.BundleMapping.warehouse == warehouse,
+            models.BundleMapping.is_active == True,
+        ).all()
+        if rows:
+            for r in rows:
+                if r.shopify_sku not in result:
+                    result[r.shopify_sku] = []
+                result[r.shopify_sku].append({
+                    "pick_sku": r.pick_sku,
+                    "mix_quantity": r.mix_quantity or 1.0,
+                })
+            return result
+
+    # DB empty for this warehouse — read directly from sheets as a transitional fallback.
+    sheet_rows = get_sku_mappings(warehouse, skip=0, limit=100000)
+    for r in sheet_rows:
         sku = r.get("shopify_sku")
         if not sku:
             continue
@@ -714,17 +728,32 @@ def get_sku_mapping_lookup(warehouse: str) -> dict:
             "pick_sku": r["pick_sku"],
             "mix_quantity": r.get("mix_quantity") or 1.0,
         })
+    return result
 
-    # Apply SKU type data from INPUT_SKU_TYPE (helper indirection + no-bundle flags).
+
+def get_sku_mapping_lookup(warehouse: str) -> dict:
+    """
+    Returns {shopify_sku: [{"pick_sku": str, "mix_quantity": float}, ...]} for fast O(1) lookup.
+    A single Shopify SKU may map to multiple pick SKUs (bundle), so each value is a list.
+
+    Applies a two-step resolution:
+      1. shopify_sku → helper_sku  (via sku_helper_mappings DB table)
+      2. helper_sku  → pick_sku    (via bundle_mappings DB table; sheet fallback if empty)
+
+    If a shopify_sku already has a direct entry in bundle_mappings it is used as-is.
+    If not, the helper indirection is applied so that all variant SKUs that share a helper
+    inherit the same pick_sku mapping without needing their own row.
+    """
+    result = _get_bundle_mapping_lookup_base(warehouse)
+
+    # Apply SKU type data (helper indirection + no-bundle flags).
     try:
         sku_type = _fetch_sku_type_data()
 
-        # 1. Helper indirection: variant SKU → helper SKU → pick SKU
         for shopify_sku, helper_sku in sku_type["helper_map"].items():
             if shopify_sku not in result and helper_sku in result:
                 result[shopify_sku] = result[helper_sku]
 
-        # 2. No-bundle SKUs: Bundle Needed = FALSE → mark as intentionally no pick
         for sku in sku_type["no_bundle_set"]:
             if sku not in result:
                 result[sku] = [{"pick_sku": None, "mix_quantity": 1.0, "no_bundle": True}]
