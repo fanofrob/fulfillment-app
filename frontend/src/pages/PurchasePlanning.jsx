@@ -498,6 +498,7 @@ export default function PurchasePlanning() {
   const [grouping, setGrouping] = useState([])
   const [sorting, setSorting] = useState([])
   const [columnFilters, setColumnFilters] = useState([])
+  const [expanded, setExpanded] = useState(true)
   const [actionMsg, setActionMsg] = useState(null)
   // Excel-like cell selection. anchor = "active" cell (paste target /
   // range origin), focus = the other end of a shift-click range.
@@ -990,10 +991,11 @@ export default function PurchasePlanning() {
   const table = useReactTable({
     data: items,
     columns,
-    state: { grouping, sorting, columnFilters },
+    state: { grouping, sorting, columnFilters, expanded },
     onGroupingChange: setGrouping,
     onSortingChange: setSorting,
     onColumnFiltersChange: setColumnFilters,
+    onExpandedChange: setExpanded,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
