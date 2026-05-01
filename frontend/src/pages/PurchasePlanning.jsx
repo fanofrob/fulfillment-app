@@ -69,6 +69,18 @@ function buildTSV(rows) {
 const PT_DATALIST_ID = 'pt-list-purchase-planning'
 const VENDOR_DATALIST_ID = 'vendor-list-purchase-planning'
 
+// Shipping status enum — matches the dropdown values asked for. Empty string
+// = "no status set" (clears the column). Order here is the dropdown order.
+const SHIPPING_STATUS_OPTIONS = [
+  'Pending',
+  'Confirmed',
+  'In Transit',
+  'Delivered',
+  'Imported',
+  'N/A',
+]
+const SHIPPING_STATUS_SET = new Set(SHIPPING_STATUS_OPTIONS)
+
 const editorBaseStyle = {
   width: '100%',
   height: '100%',
@@ -192,6 +204,32 @@ function CellEditor({
     )
   }
 
+  if (editorType === 'shippingStatus') {
+    // Native <select> — its dropdown opens immediately on focus, which is
+    // exactly the behavior we want for a constrained-value cell. Choosing an
+    // option fires onChange; we commit and advance down so it feels like
+    // entering a number into the next row.
+    return (
+      <select
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value)
+          // Defer commit so the new draft is in the ref when commitNow reads it.
+          setTimeout(() => commitNow('down'), 0)
+        }}
+        onBlur={() => commitNow(null)}
+        onKeyDown={onKey}
+        style={editorBaseStyle}
+      >
+        <option value="">—</option>
+        {SHIPPING_STATUS_OPTIONS.map((s) => (
+          <option key={s} value={s}>{s}</option>
+        ))}
+      </select>
+    )
+  }
+
   // number
   return (
     <input
@@ -221,12 +259,15 @@ const cellDisplayStyle = {
 }
 
 // Frozen left columns: stay pinned during horizontal scroll. Each entry's
-// `left` is the cumulative width of the columns before it.
+// `left` is the cumulative width of the columns before it. The leading
+// `select` column carries the bulk-delete checkbox; vendor and product_type
+// shift right to make room.
 const STICKY_COLS = {
-  vendor:       { left: 0,   width: 200 },
-  product_type: { left: 200, width: 220 },
+  select:       { left: 0,   width: 36  },
+  vendor:       { left: 36,  width: 200 },
+  product_type: { left: 236, width: 220 },
 }
-const STICKY_LEFT_TOTAL = 200 + 220
+const STICKY_LEFT_TOTAL = 36 + 200 + 220
 
 // ── Column filter input (per-column) ───────────────────────────────────────
 function ColumnFilter({ column }) {
@@ -269,6 +310,13 @@ export default function PurchasePlanning() {
   // don't churn it.
   const draggingRef = useRef(false)
 
+  // Bulk-delete checkbox selection: stored as a Set of plan-line ids so it
+  // survives sorting/filtering/grouping (which can reorder dataRows).
+  const [selectedIds, setSelectedIds] = useState(() => new Set())
+  // Vendor info popover: which vendor's details are open. null = closed.
+  // { vendorId, anchorRect } — anchorRect positions the panel near its icon.
+  const [vendorInfo, setVendorInfo] = useState(null)
+
   // ── Data ────────────────────────────────────────────────────────────────
   const { data: periods = [] } = useQuery({
     queryKey: ['projection-periods'],
@@ -290,13 +338,16 @@ export default function PurchasePlanning() {
     }
   }, [periods, periodId])
 
-  // Sync periodId → URL
+  // Sync periodId → URL. Also clears row-selection so the checkbox set
+  // doesn't carry stale ids from another period.
   useEffect(() => {
     if (periodId != null) {
       const np = new URLSearchParams(urlParams)
       np.set('period_id', String(periodId))
       setUrlParams(np, { replace: true })
     }
+    setSelectedIds(new Set())
+    setVendorInfo(null)
   }, [periodId])  // eslint-disable-line react-hooks/exhaustive-deps
 
   const { data: planData = { items: [], available_product_types: [], has_current_projection: false }, isLoading } = useQuery({
@@ -317,9 +368,14 @@ export default function PurchasePlanning() {
     mutationFn: ({ id, data }) => purchasePlanningApi.update(id, data),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['purchase-planning', periodId] }),
   })
-  const deleteMut = useMutation({
-    mutationFn: (id) => purchasePlanningApi.delete(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['purchase-planning', periodId] }),
+  const bulkDeleteMut = useMutation({
+    mutationFn: (ids) => purchasePlanningApi.bulkDelete(ids),
+    onSuccess: (res) => {
+      setActionMsg(`Deleted ${res.deleted} row${res.deleted === 1 ? '' : 's'}`)
+      setSelectedIds(new Set())
+      qc.invalidateQueries({ queryKey: ['purchase-planning', periodId] })
+    },
+    onError: (err) => setActionMsg(`Bulk delete failed: ${err?.response?.data?.detail || err.message}`),
   })
   const seedMut = useMutation({
     mutationFn: (id) => purchasePlanningApi.seed(id),
@@ -471,6 +527,19 @@ export default function PurchasePlanning() {
         return { quantity: n }
       },
     },
+    {
+      colId: 'shipping_status',
+      editable: true,
+      editorType: 'shippingStatus',
+      getValue: (row) => row.shipping_status || '',
+      getDisplay: (row) => row.shipping_status || '—',
+      parseValue: (str) => {
+        const t = String(str ?? '').trim()
+        if (t === '') return { shipping_status: '' }  // empty string clears
+        if (!SHIPPING_STATUS_SET.has(t)) return null
+        return { shipping_status: t }
+      },
+    },
   ], [vendors, vendorByName, productTypeSet])
 
   const colIdxByColId = useMemo(() => {
@@ -519,6 +588,41 @@ export default function PurchasePlanning() {
 
   // ── Columns ─────────────────────────────────────────────────────────────
   const columns = useMemo(() => [
+    {
+      // Bulk-delete checkbox column. Header rendering is handled inline in
+      // the table body (we need access to dataRows + setSelectedIds, which
+      // live in component scope, not in column meta). The cell render below
+      // only fires for non-grouped data rows.
+      id: 'select',
+      header: '',
+      cell: ({ row }) => {
+        if (row.getIsGrouped()) return null
+        const id = row.original.id
+        const checked = selectedIds.has(id)
+        return (
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={(e) => {
+              setSelectedIds((s) => {
+                const next = new Set(s)
+                if (e.target.checked) next.add(id)
+                else next.delete(id)
+                return next
+              })
+            }}
+            // Don't let the checkbox click bleed into the cell-selection
+            // model — clicking it shouldn't move the spreadsheet anchor.
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            style={{ cursor: 'pointer' }}
+          />
+        )
+      },
+      enableSorting: false,
+      enableColumnFilter: false,
+      enableGrouping: false,
+    },
     {
       id: 'vendor',
       header: 'Vendor',
@@ -650,25 +754,13 @@ export default function PurchasePlanning() {
       enableColumnFilter: false,
     },
     {
-      id: 'actions',
-      header: '',
-      cell: ({ row }) => {
-        if (row.getIsGrouped()) return null
-        return (
-          <button
-            className="btn btn-secondary"
-            style={{ fontSize: 11, padding: '2px 8px', color: '#dc2626' }}
-            onClick={() => {
-              if (window.confirm('Delete this plan row?')) deleteMut.mutate(row.original.id)
-            }}
-          >Delete</button>
-        )
-      },
-      enableSorting: false,
-      enableColumnFilter: false,
-      enableGrouping: false,
+      id: 'shipping_status',
+      header: 'Shipping Status',
+      accessorKey: 'shipping_status',
+      cell: ({ row }) => row.original.shipping_status || '—',
+      filterFn: 'includesString',
     },
-  ], [vendors, productTypes])  // eslint-disable-line react-hooks/exhaustive-deps
+  ], [vendors, productTypes, selectedIds])  // eslint-disable-line react-hooks/exhaustive-deps
 
   const table = useReactTable({
     data: items,
@@ -1035,7 +1127,7 @@ export default function PurchasePlanning() {
           className="btn btn-secondary"
           onClick={() => seedMut.mutate(periodId)}
           disabled={!periodId || seedMut.isPending || !planData.has_current_projection}
-          title={!planData.has_current_projection ? 'No current projection for this period — generate one in Projection Dashboard first' : 'Create one row per product type with positive gap'}
+          title={!planData.has_current_projection ? 'No current projection for this period — generate one in Projection Dashboard first' : 'Create one row per product type from the projection'}
         >{seedMut.isPending ? 'Seeding…' : '↓ Seed from Projection'}</button>
         <button
           className={`btn btn-secondary${groupedByVendor ? ' active' : ''}`}
@@ -1049,6 +1141,21 @@ export default function PurchasePlanning() {
             className="btn btn-secondary"
             onClick={() => { setColumnFilters([]); setSorting([]) }}
           >Clear filters & sort</button>
+        )}
+        {selectedIds.size > 0 && (
+          <button
+            className="btn btn-secondary"
+            style={{ color: '#dc2626', borderColor: '#fecaca' }}
+            onClick={() => {
+              const ids = Array.from(selectedIds)
+              if (window.confirm(`Delete ${ids.length} selected row${ids.length === 1 ? '' : 's'}?`)) {
+                bulkDeleteMut.mutate(ids)
+              }
+            }}
+            disabled={bulkDeleteMut.isPending}
+          >
+            {bulkDeleteMut.isPending ? 'Deleting…' : `Delete ${selectedIds.size} selected`}
+          </button>
         )}
         <span style={{ marginLeft: 'auto', fontSize: 12, color: '#6b7280' }}>
           {items.length} row{items.length === 1 ? '' : 's'}
@@ -1093,7 +1200,7 @@ export default function PurchasePlanning() {
             maxHeight: 'calc(100vh - 220px)',
           }}
         >
-          <table className="data-table" style={{ minWidth: 1600 }}>
+          <table className="data-table" style={{ minWidth: 1780 }}>
             {/* The global CSS sets thead { z-index: 1 }, but the body's
                 sticky-left cells are also at z:1 — so they paint over the
                 header (later in document order wins). Bump thead higher so
@@ -1120,6 +1227,36 @@ export default function PurchasePlanning() {
                         width: sticky.width,
                         minWidth: sticky.width,
                       }),
+                    }
+                    // The bulk-delete checkbox column: render a "select all"
+                    // checkbox instead of the standard sort/filter/group UI.
+                    // Indeterminate when some-but-not-all visible rows are
+                    // selected — mirrors Gmail / standard table behavior.
+                    if (header.column.id === 'select') {
+                      const visibleIds = dataRows.map((r) => r.original.id)
+                      const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id))
+                      const someSelected = visibleIds.some((id) => selectedIds.has(id))
+                      return (
+                        <th key={header.id} style={{ ...thStyle, textAlign: 'center' }}>
+                          <input
+                            type="checkbox"
+                            checked={allSelected}
+                            ref={(el) => { if (el) el.indeterminate = !allSelected && someSelected }}
+                            onChange={(e) => {
+                              const checked = e.target.checked
+                              setSelectedIds((s) => {
+                                const next = new Set(s)
+                                if (checked) visibleIds.forEach((id) => next.add(id))
+                                else visibleIds.forEach((id) => next.delete(id))
+                                return next
+                              })
+                            }}
+                            disabled={visibleIds.length === 0}
+                            title={allSelected ? 'Clear selection' : 'Select all visible rows'}
+                            style={{ cursor: visibleIds.length === 0 ? 'not-allowed' : 'pointer' }}
+                          />
+                        </th>
+                      )
                     }
                     return (
                       <th key={header.id} style={thStyle}>
@@ -1163,7 +1300,7 @@ export default function PurchasePlanning() {
               )}
               {!isLoading && items.length === 0 && (
                 <tr><td colSpan={columns.length} style={{ textAlign: 'center', color: '#9ca3af', padding: 20 }}>
-                  No plan rows yet. Use <strong>Seed from Projection</strong> to auto-create one row per product type with a positive gap, or <strong>+ Add Row</strong> for a blank row.
+                  No plan rows yet. Use <strong>Seed from Projection</strong> to auto-create one row per product type in the projection, or <strong>+ Add Row</strong> for a blank row.
                 </td></tr>
               )}
               {(() => {
@@ -1230,10 +1367,30 @@ export default function PurchasePlanning() {
                           verticalAlign: 'middle',
                           ...stickyStyle,
                         }
-                        // Non-selectable (e.g. the actions column): no selection visuals.
+                        // Non-selectable (the bulk-delete checkbox column).
+                        // No spreadsheet-selection visuals; sticky styling is
+                        // still applied so the column stays pinned during
+                        // horizontal scroll (sticky cells need an opaque
+                        // background or the body cells they overlap bleed
+                        // through during scroll).
                         if (!isSelectable) {
+                          const stickyStyleNS = sticky ? {
+                            position: 'sticky',
+                            left: sticky.left,
+                            zIndex: 1,
+                            width: sticky.width,
+                            minWidth: sticky.width,
+                            background: '#fff',
+                          } : {}
                           return (
-                            <td key={cell.id} style={{ padding: '4px 8px' }}>
+                            <td
+                              key={cell.id}
+                              style={{
+                                padding: '4px 8px',
+                                textAlign: sticky ? 'center' : undefined,
+                                ...stickyStyleNS,
+                              }}
+                            >
                               {flexRender(cell.column.columnDef.cell, cell.getContext())}
                             </td>
                           )
@@ -1282,6 +1439,30 @@ export default function PurchasePlanning() {
                                 }}
                                 onCancel={() => setEditing(null)}
                               />
+                            ) : colId === 'vendor' && row.original.vendor_id ? (
+                              // Vendor cell: name + ⓘ icon that opens the
+                              // vendor info popover. Stop both mousedown and
+                              // click on the icon so it doesn't move the
+                              // spreadsheet anchor or trigger cell editing.
+                              <span style={vendorCellDisplayStyle}>
+                                <span style={vendorNameTextStyle}>
+                                  {colMeta.getDisplay(row.original) || ' '}
+                                </span>
+                                <button
+                                  type="button"
+                                  title="Show vendor details and planned items for this period"
+                                  onMouseDown={(e) => e.stopPropagation()}
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    const rect = e.currentTarget.getBoundingClientRect()
+                                    setVendorInfo({
+                                      vendorId: row.original.vendor_id,
+                                      anchorRect: { top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right },
+                                    })
+                                  }}
+                                  style={vendorInfoIconStyle}
+                                >ⓘ</button>
+                              </span>
                             ) : (
                               <span style={cellDisplayStyle}>
                                 {colMeta.getDisplay(row.original) || ' '}
@@ -1298,6 +1479,261 @@ export default function PurchasePlanning() {
           </table>
         </div>
       )}
+      {vendorInfo && (
+        <VendorInfoPopover
+          vendorId={vendorInfo.vendorId}
+          anchorRect={vendorInfo.anchorRect}
+          vendor={vendors.find((v) => v.id === vendorInfo.vendorId)}
+          items={items.filter((it) => it.vendor_id === vendorInfo.vendorId)}
+          onClose={() => setVendorInfo(null)}
+          period={period}
+        />
+      )}
     </div>
   )
+}
+
+// ── Vendor info popover ─────────────────────────────────────────────────────
+// Floating panel anchored near the ⓘ icon in the vendor cell. Lists vendor
+// contact + address and a copy-paste-ready summary of every planned product
+// type for this vendor in the current period.
+
+function fmtPurchaseAmount(item) {
+  // Prefer the "rounded up to whole case" helper when available, so the line
+  // matches the actual amount they'll buy. Fall back to the raw weight.
+  const lbs = item.purchase_weight_helper_lbs ?? item.purchase_weight_lbs
+  if (lbs == null || lbs === '') return 'TBD lbs'
+  const n = Number(lbs)
+  if (Number.isNaN(n)) return 'TBD lbs'
+  // Drop the decimal when it's already a whole number — looks cleaner in a
+  // copy-pasted message than "100.0 lbs".
+  const text = Number.isInteger(n) ? String(n) : n.toFixed(1)
+  return `${text} lbs`
+}
+
+function buildPlannedItemsText(items) {
+  // One line per row: "<amount> <product_type>" — with the substitute noted
+  // in parentheses when set, so a recipient sees both options together.
+  // Format is intentionally plain so it can be pasted into email, SMS, or
+  // WhatsApp without losing structure.
+  return items
+    .map((it) => {
+      const amount = fmtPurchaseAmount(it)
+      const sub = it.sub_product_type ? ` (or ${it.sub_product_type})` : ''
+      return `${amount} ${it.product_type}${sub}`
+    })
+    .join('\n')
+}
+
+function VendorInfoPopover({ vendor, items, anchorRect, onClose, period }) {
+  const [copied, setCopied] = useState(false)
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  if (!vendor) {
+    return (
+      <div style={popoverBackdropStyle} onClick={onClose}>
+        <div style={{ ...popoverPanelStyle, top: 100, left: 100 }} onClick={(e) => e.stopPropagation()}>
+          <div style={{ padding: 12 }}>Vendor not found.</div>
+        </div>
+      </div>
+    )
+  }
+
+  const PANEL_W = 380
+  const PANEL_MAX_H = 480
+  const margin = 8
+  const vw = typeof window !== 'undefined' ? window.innerWidth : 1200
+  const vh = typeof window !== 'undefined' ? window.innerHeight : 800
+  let top = (anchorRect?.bottom ?? 100) + margin
+  if (top + PANEL_MAX_H > vh) top = Math.max(margin, (anchorRect?.top ?? 100) - PANEL_MAX_H - margin)
+  let left = (anchorRect?.left ?? 100) - 8
+  if (left + PANEL_W > vw - margin) left = vw - PANEL_W - margin
+  if (left < margin) left = margin
+
+  const itemsText = buildPlannedItemsText(items)
+  const headerText = period?.name
+    ? `${vendor.name} — ${period.name}`
+    : vendor.name
+  const fullCopyText = `${headerText}\n\n${itemsText}`
+
+  async function handleCopy() {
+    try {
+      await navigator.clipboard.writeText(fullCopyText)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      // clipboard API can fail in non-secure contexts; user can fall back to
+      // selecting the textarea manually.
+    }
+  }
+
+  const contactLines = []
+  if (vendor.contact_name) contactLines.push(['Contact', vendor.contact_name])
+  if (vendor.contact_email) contactLines.push(['Email', vendor.contact_email])
+  if (vendor.contact_phone) contactLines.push(['Phone', vendor.contact_phone])
+  if (vendor.contact_whatsapp) contactLines.push(['WhatsApp', vendor.contact_whatsapp])
+  if (vendor.preferred_communication) contactLines.push(['Preferred', vendor.preferred_communication])
+
+  return (
+    <div style={popoverBackdropStyle} onMouseDown={onClose}>
+      <div
+        style={{ ...popoverPanelStyle, top, left, width: PANEL_W, maxHeight: PANEL_MAX_H }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div style={popoverHeaderStyle}>
+          <div style={{ fontWeight: 600, fontSize: 14, flex: 1 }}>{vendor.name}</div>
+          <button
+            type="button"
+            onClick={onClose}
+            style={{
+              background: 'none', border: 'none', fontSize: 18, lineHeight: 1,
+              color: '#6b7280', cursor: 'pointer', padding: 0,
+            }}
+            title="Close"
+          >×</button>
+        </div>
+        <div style={popoverBodyStyle}>
+          {vendor.pickup_address && (
+            <div style={popoverSectionStyle}>
+              <div style={popoverLabelStyle}>Pickup address</div>
+              <div style={popoverAddressStyle}>{vendor.pickup_address}</div>
+            </div>
+          )}
+          {contactLines.length > 0 && (
+            <div style={popoverSectionStyle}>
+              <div style={popoverLabelStyle}>Contact</div>
+              <table style={{ borderCollapse: 'collapse', fontSize: 12 }}>
+                <tbody>
+                  {contactLines.map(([k, v]) => (
+                    <tr key={k}>
+                      <td style={{ color: '#6b7280', paddingRight: 8, verticalAlign: 'top' }}>{k}</td>
+                      <td style={{ wordBreak: 'break-all' }}>{v}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div style={popoverSectionStyle}>
+            <div style={{ ...popoverLabelStyle, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ flex: 1 }}>
+                Planned for this period ({items.length} {items.length === 1 ? 'item' : 'items'})
+              </span>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                style={{ fontSize: 11, padding: '2px 8px' }}
+                onClick={handleCopy}
+                disabled={items.length === 0}
+              >{copied ? '✓ Copied' : 'Copy'}</button>
+            </div>
+            {items.length === 0 ? (
+              <div style={{ fontSize: 12, color: '#9ca3af' }}>No items planned for this vendor yet.</div>
+            ) : (
+              <textarea
+                readOnly
+                value={fullCopyText}
+                style={{
+                  width: '100%',
+                  minHeight: 120,
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  fontSize: 12,
+                  padding: 8,
+                  border: '1px solid #e5e7eb',
+                  borderRadius: 4,
+                  resize: 'vertical',
+                  background: '#fafafa',
+                }}
+                onFocus={(e) => e.target.select()}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+const vendorCellDisplayStyle = {
+  display: 'flex',
+  alignItems: 'center',
+  width: '100%',
+  height: '100%',
+  padding: '4px 6px',
+  fontSize: 12,
+  cursor: 'cell',
+  userSelect: 'none',
+}
+
+const vendorNameTextStyle = {
+  flex: 1,
+  whiteSpace: 'nowrap',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+}
+
+const vendorInfoIconStyle = {
+  marginLeft: 4,
+  padding: '0 4px',
+  background: 'transparent',
+  border: 'none',
+  color: '#3b82f6',
+  cursor: 'pointer',
+  fontSize: 13,
+  lineHeight: 1,
+}
+
+const popoverBackdropStyle = {
+  position: 'fixed',
+  top: 0, left: 0, right: 0, bottom: 0,
+  background: 'transparent',
+  zIndex: 50,
+}
+
+const popoverPanelStyle = {
+  position: 'fixed',
+  background: '#fff',
+  border: '1px solid #d1d5db',
+  borderRadius: 6,
+  boxShadow: '0 10px 25px rgba(0,0,0,0.12), 0 4px 10px rgba(0,0,0,0.08)',
+  display: 'flex',
+  flexDirection: 'column',
+  overflow: 'hidden',
+}
+
+const popoverHeaderStyle = {
+  display: 'flex',
+  alignItems: 'center',
+  padding: '8px 12px',
+  borderBottom: '1px solid #e5e7eb',
+  background: '#f9fafb',
+}
+
+const popoverBodyStyle = {
+  padding: '8px 12px',
+  overflowY: 'auto',
+  fontSize: 12,
+}
+
+const popoverSectionStyle = {
+  marginBottom: 12,
+}
+
+const popoverLabelStyle = {
+  fontSize: 11,
+  textTransform: 'uppercase',
+  letterSpacing: 0.5,
+  color: '#6b7280',
+  marginBottom: 4,
+}
+
+const popoverAddressStyle = {
+  fontSize: 12,
+  whiteSpace: 'pre-wrap',
 }

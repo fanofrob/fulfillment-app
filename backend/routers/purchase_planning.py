@@ -33,6 +33,7 @@ class PurchasePlanLineCreate(BaseModel):
     purchase_weight_lbs: Optional[float] = None
     case_weight_lbs: Optional[float] = None
     quantity: Optional[float] = None
+    shipping_status: Optional[str] = None
     notes: Optional[str] = None
 
 
@@ -44,7 +45,13 @@ class PurchasePlanLineUpdate(BaseModel):
     purchase_weight_lbs: Optional[float] = None
     case_weight_lbs: Optional[float] = None
     quantity: Optional[float] = None
+    # Empty string clears, None means "no change".
+    shipping_status: Optional[str] = None
     notes: Optional[str] = None
+
+
+class BulkDeleteBody(BaseModel):
+    ids: list[int] = Field(..., min_length=1)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -142,6 +149,7 @@ def _serialize_line(
         "purchase_weight_lbs": line.purchase_weight_lbs,
         "case_weight_lbs": line.case_weight_lbs,
         "quantity": line.quantity,
+        "shipping_status": line.shipping_status,
         "notes": line.notes,
         "inventory_lbs": inventory_lbs,
         "sub_inventory_lbs": sub_inventory_lbs,
@@ -204,6 +212,7 @@ def create_plan_line(body: PurchasePlanLineCreate, db: Session = Depends(get_db)
         purchase_weight_lbs=purchase_weight_lbs,
         case_weight_lbs=body.case_weight_lbs,
         quantity=body.quantity,
+        shipping_status=(body.shipping_status or None),
         notes=body.notes,
     )
     db.add(line)
@@ -228,8 +237,8 @@ def update_plan_line(line_id: int, body: PurchasePlanLineUpdate, db: Session = D
             raise HTTPException(404, "Vendor not found")
 
     for k, v in body.model_dump(exclude_unset=True).items():
-        # Treat empty-string sub_product_type as "clear the substitution"
-        if k == "sub_product_type" and v == "":
+        # Treat empty-string string fields as "clear it"
+        if k in ("sub_product_type", "shipping_status") and v == "":
             v = None
         setattr(line, k, v)
     db.commit()
@@ -253,15 +262,29 @@ def delete_plan_line(line_id: int, db: Session = Depends(get_db)):
     return {"detail": "deleted"}
 
 
+@router.post("/bulk-delete")
+def bulk_delete_plan_lines(body: BulkDeleteBody, db: Session = Depends(get_db)):
+    """Delete many plan lines in one round trip. Silently skips ids that don't exist."""
+    deleted = (
+        db.query(models.PurchasePlanLine)
+        .filter(models.PurchasePlanLine.id.in_(body.ids))
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return {"deleted": deleted}
+
+
 @router.post("/seed")
 def seed_from_projection(
     projection_period_id: int = Query(...),
     db: Session = Depends(get_db),
 ):
     """
-    Create one plan line per product type with a positive gap from the period's
-    current projection. Skips product types that already have at least one plan
-    line in this period (so re-running is safe and won't duplicate).
+    Create one plan line per product type from the period's current projection,
+    regardless of gap sign. Skips product types that already have at least one
+    plan line in this period (so re-running is safe and won't duplicate).
+    Rows with non-positive gap seed with purchase_weight_lbs=None so the user
+    can decide whether to actually order anything.
     """
     period = db.query(models.ProjectionPeriod).filter_by(id=projection_period_id).first()
     if not period:
@@ -285,16 +308,15 @@ def seed_from_projection(
     created = 0
     skipped = 0
     for pl in proj_lines:
-        if (pl.gap_lbs or 0) <= 0:
-            continue
         if pl.product_type in existing_pts:
             skipped += 1
             continue
+        gap = pl.gap_lbs or 0
         db.add(models.PurchasePlanLine(
             projection_period_id=projection_period_id,
             product_type=pl.product_type,
             case_weight_lbs=pl.case_weight_lbs,
-            purchase_weight_lbs=pl.gap_lbs,
+            purchase_weight_lbs=gap if gap > 0 else None,
         ))
         created += 1
     db.commit()

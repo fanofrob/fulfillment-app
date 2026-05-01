@@ -460,6 +460,7 @@ export const purchasePlanningApi = {
   create: (data) => api.post('/purchase-planning/', data).then(r => r.data),
   update: (id, data) => api.put(`/purchase-planning/${id}`, data).then(r => r.data),
   delete: (id) => api.delete(`/purchase-planning/${id}`).then(r => r.data),
+  bulkDelete: (ids) => api.post('/purchase-planning/bulk-delete', { ids }).then(r => r.data),
   seed: (projectionPeriodId) =>
     api.post('/purchase-planning/seed', null, { params: { projection_period_id: projectionPeriodId } }).then(r => r.data),
 }

@@ -857,6 +857,9 @@ class PurchasePlanLine(Base):
     purchase_weight_lbs   = Column(Float, nullable=True)   # user input — target buy in lbs
     case_weight_lbs       = Column(Float, nullable=True)   # user input — 1 means no case (per piece/lb)
     quantity              = Column(Float, nullable=True)   # user input — # of cases or lbs or pieces
+    # Shipping/order status from the user's perspective. Free-form text so the
+    # set can be expanded without a migration; UI restricts it to a known list.
+    shipping_status       = Column(String, nullable=True)
     notes                 = Column(Text, nullable=True)
     created_at            = Column(DateTime(timezone=True), server_default=func.now())
     updated_at            = Column(DateTime(timezone=True), onupdate=func.now())
