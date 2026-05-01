@@ -1508,19 +1508,23 @@ export default function PurchasePlanning() {
 // type for this vendor in the current period.
 
 function buildPlannedItemsText(items) {
-  // One line per row: "<converted-order> <product_type>".
+  // Two-column layout: "<amount>   <product_type>".
   // - When sub_product_type is set, that substitute IS what we're ordering
   //   from this vendor, so use it and hide the base product type.
   // - Amount uses the same case-vs-lbs rule as the on-screen Converted
   //   Order column, so the copy-pasted message matches the table.
-  // Format is intentionally plain so it can be pasted into email, SMS, or
-  // WhatsApp without losing structure.
-  return items
-    .map((it) => {
-      const amount = fmtConvertedOrder(it) || 'TBD'
-      const name = it.sub_product_type || it.product_type
-      return `${amount} ${name}`
-    })
+  // - Right-pad amounts with regular spaces to the longest amount + a
+  //   2-space gutter so product types line up. The popover textarea is
+  //   monospaced, so spaces give a clean column. Falls back gracefully if
+  //   it's pasted into a non-monospace surface.
+  const rows = items.map((it) => ({
+    amount: fmtConvertedOrder(it) || 'TBD',
+    name: it.sub_product_type || it.product_type,
+  }))
+  if (rows.length === 0) return ''
+  const colWidth = rows.reduce((m, r) => Math.max(m, r.amount.length), 0) + 2
+  return rows
+    .map((r) => `${r.amount.padEnd(colWidth)}${r.name}`)
     .join('\n')
 }
 
