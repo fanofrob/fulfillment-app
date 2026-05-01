@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   useReactTable,
@@ -61,140 +61,164 @@ function buildTSV(rows) {
   return rows.map((cells) => cells.join('\t')).join('\n')
 }
 
-// ── Editable input cell ────────────────────────────────────────────────────
-function NumberCell({ value, onSave, placeholder, step = 'any' }) {
-  const [draft, setDraft] = useState(value == null ? '' : String(value))
-  useEffect(() => {
-    setDraft(value == null ? '' : String(value))
-  }, [value])
+// ── Cell display & editor ──────────────────────────────────────────────────
+// In display mode, every cell is plain text — no input bezels — so the
+// table reads like a spreadsheet, not a form. The editor is only mounted
+// while the user is actively editing one cell.
 
-  function commit() {
-    const trimmed = draft.trim()
-    const next = trimmed === '' ? null : Number(trimmed)
-    if (trimmed !== '' && Number.isNaN(next)) {
-      setDraft(value == null ? '' : String(value))
-      return
+const PT_DATALIST_ID = 'pt-list-purchase-planning'
+
+const editorBaseStyle = {
+  width: '100%',
+  height: '100%',
+  border: 'none',
+  outline: 'none',
+  padding: '4px 6px',
+  fontSize: 12,
+  background: '#fff',
+  font: 'inherit',
+  boxSizing: 'border-box',
+}
+
+function CellEditor({
+  editorType,
+  initialValue,
+  vendors,
+  productTypes,
+  baseProductType,
+  onCommit,   // (advanceDir: 'down' | 'up' | 'right' | 'left' | null) => void; reads draft via ref
+  onCancel,
+}) {
+  const [draft, setDraft] = useState(initialValue ?? '')
+  const draftRef = useRef(draft)
+  draftRef.current = draft
+  const inputRef = useRef(null)
+  // Guards a double-call when the editor is unmounting: keydown commits, then
+  // the input's removal-from-DOM triggers blur which would commit again.
+  const doneRef = useRef(false)
+
+  useEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.focus()
+    if (typeof el.select === 'function') el.select()
+  }, [])
+
+  function commitNow(advance) {
+    if (doneRef.current) return
+    doneRef.current = true
+    onCommit(advance, draftRef.current)
+  }
+  function cancel() {
+    if (doneRef.current) return
+    doneRef.current = true
+    onCancel()
+  }
+  function onKey(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      commitNow(e.shiftKey ? 'up' : 'down')
+    } else if (e.key === 'Tab') {
+      e.preventDefault()
+      commitNow(e.shiftKey ? 'left' : 'right')
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      cancel()
     }
-    if (next !== value) onSave(next)
   }
 
+  if (editorType === 'vendor') {
+    // Re-build suggested vendors at edit time (cheap; only runs while editing).
+    const pt = (baseProductType || '').trim().toLowerCase()
+    const suggested = []
+    const other = []
+    for (const v of vendors) {
+      const cat = (v.product_catalog || []).map((t) => String(t).toLowerCase())
+      const hit = pt && cat.some((t) => t === pt || t.includes(pt) || pt.includes(t))
+      if (hit) suggested.push(v)
+      else other.push(v)
+    }
+    return (
+      <select
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => { setDraft(e.target.value); }}
+        onBlur={() => commitNow(null)}
+        onKeyDown={onKey}
+        style={editorBaseStyle}
+      >
+        <option value="">—</option>
+        {suggested.length > 0 && (
+          <optgroup label={`★ Suggested for "${baseProductType}"`}>
+            {suggested.map((v) => (<option key={v.id} value={v.name}>{v.name}</option>))}
+          </optgroup>
+        )}
+        <optgroup label={suggested.length > 0 ? 'All vendors' : 'Vendors'}>
+          {other.map((v) => (<option key={v.id} value={v.name}>{v.name}</option>))}
+        </optgroup>
+      </select>
+    )
+  }
+
+  if (editorType === 'subProductType') {
+    return (
+      <select
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => commitNow(null)}
+        onKeyDown={onKey}
+        style={editorBaseStyle}
+      >
+        <option value="">—</option>
+        {productTypes
+          .filter((pt) => pt !== baseProductType)
+          .map((pt) => (<option key={pt} value={pt}>{pt}</option>))}
+      </select>
+    )
+  }
+
+  if (editorType === 'productType') {
+    return (
+      <input
+        ref={inputRef}
+        type="text"
+        list={PT_DATALIST_ID}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => commitNow(null)}
+        onKeyDown={onKey}
+        style={editorBaseStyle}
+      />
+    )
+  }
+
+  // number
   return (
     <input
+      ref={inputRef}
       type="number"
-      step={step}
+      step="any"
       value={draft}
-      placeholder={placeholder}
       onChange={(e) => setDraft(e.target.value)}
-      onBlur={commit}
-      onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur() }}
-      style={{
-        width: '100%', minWidth: 70, padding: '4px 6px', fontSize: 12,
-        border: '1px solid #e5e7eb', borderRadius: 4, background: '#fff',
-      }}
+      onBlur={() => commitNow(null)}
+      onKeyDown={onKey}
+      style={editorBaseStyle}
     />
   )
 }
 
-function VendorCell({ value, vendors, productType, onSave }) {
-  // Split vendors into "Suggested" (catalog contains the row's product_type)
-  // and "Other". The suggested group renders as an <optgroup> at the top so
-  // the user can pick a likely match without scanning the full list.
-  const pt = (productType || '').trim().toLowerCase()
-  const { suggested, other } = useMemo(() => {
-    if (!pt) return { suggested: [], other: vendors }
-    const sug = []
-    const oth = []
-    for (const v of vendors) {
-      const cat = (v.product_catalog || []).map(t => String(t).toLowerCase())
-      // Match if any catalog tag equals or contains the product type, OR vice-versa.
-      const hit = cat.some(t => t === pt || t.includes(pt) || pt.includes(t))
-      if (hit) sug.push(v)
-      else oth.push(v)
-    }
-    return { suggested: sug, other: oth }
-  }, [vendors, pt])
-
-  return (
-    <select
-      value={value ?? ''}
-      onChange={(e) => onSave(e.target.value === '' ? null : Number(e.target.value))}
-      style={{
-        width: '100%', minWidth: 120, padding: '4px 6px', fontSize: 12,
-        border: '1px solid #e5e7eb', borderRadius: 4, background: '#fff',
-      }}
-    >
-      <option value="">—</option>
-      {suggested.length > 0 && (
-        <optgroup label={`★ Suggested for "${productType}"`}>
-          {suggested.map((v) => (
-            <option key={v.id} value={v.id}>{v.name}</option>
-          ))}
-        </optgroup>
-      )}
-      <optgroup label={suggested.length > 0 ? 'All vendors' : 'Vendors'}>
-        {other.map((v) => (
-          <option key={v.id} value={v.id}>{v.name}</option>
-        ))}
-      </optgroup>
-    </select>
-  )
-}
-
-function ProductTypeCell({ value, productTypes, onSave }) {
-  // Free-text input with datalist of available product types from the projection.
-  const listId = 'pt-list-purchase-planning'
-  const [draft, setDraft] = useState(value ?? '')
-  useEffect(() => { setDraft(value ?? '') }, [value])
-
-  function commit() {
-    const next = draft.trim()
-    if (next === value) return
-    if (next === '') {
-      setDraft(value ?? '')
-      return
-    }
-    onSave(next)
-  }
-
-  return (
-    <>
-      <input
-        type="text"
-        list={listId}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur() }}
-        style={{
-          width: '100%', minWidth: 140, padding: '4px 6px', fontSize: 12,
-          border: '1px solid #e5e7eb', borderRadius: 4, background: '#fff',
-        }}
-      />
-      <datalist id={listId}>
-        {productTypes.map((pt) => (<option key={pt} value={pt} />))}
-      </datalist>
-    </>
-  )
-}
-
-function SubProductTypeCell({ value, productTypes, baseProductType, onSave }) {
-  // Dropdown of all available product types for the substitute. Empty option
-  // clears the substitution. Excludes the row's own base product_type.
-  return (
-    <select
-      value={value ?? ''}
-      onChange={(e) => onSave(e.target.value === '' ? '' : e.target.value)}
-      style={{
-        width: '100%', minWidth: 140, padding: '4px 6px', fontSize: 12,
-        border: '1px solid #e5e7eb', borderRadius: 4, background: '#fff',
-      }}
-    >
-      <option value="">—</option>
-      {productTypes
-        .filter((pt) => pt !== baseProductType)
-        .map((pt) => (<option key={pt} value={pt}>{pt}</option>))}
-    </select>
-  )
+const cellDisplayStyle = {
+  display: 'block',
+  width: '100%',
+  height: '100%',
+  padding: '4px 6px',
+  fontSize: 12,
+  whiteSpace: 'nowrap',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  cursor: 'cell',
+  userSelect: 'none',
 }
 
 // ── Column filter input (per-column) ───────────────────────────────────────
@@ -231,6 +255,12 @@ export default function PurchasePlanning() {
   // range origin), focus = the other end of a shift-click range.
   // Both reference visible (sorted/filtered) data-row index + editable-col index.
   const [selection, setSelection] = useState({ anchor: null, focus: null })
+  // Edit mode: { rowIdx, colIdx, initialValue }. Null when not editing.
+  const [editing, setEditing] = useState(null)
+  // Drag-select tracking — mousedown on a cell starts a drag; mouseenter on
+  // others extends `focus`; mouseup ends it. Lives in a ref so re-renders
+  // don't churn it.
+  const draggingRef = useRef(false)
 
   // ── Data ────────────────────────────────────────────────────────────────
   const { data: periods = [] } = useQuery({
@@ -319,9 +349,14 @@ export default function PurchasePlanning() {
   const editableColumnMeta = useMemo(() => [
     {
       colId: 'vendor',
+      editorType: 'vendor',
       getValue: (row) => {
         const v = vendors.find((vv) => vv.id === row.vendor_id)
         return v ? v.name : ''
+      },
+      getDisplay: (row) => {
+        const v = vendors.find((vv) => vv.id === row.vendor_id)
+        return v ? v.name : '—'
       },
       // Returns a patch object to apply, or null to skip this cell.
       parseValue: (str) => {
@@ -334,7 +369,9 @@ export default function PurchasePlanning() {
     },
     {
       colId: 'product_type',
+      editorType: 'productType',
       getValue: (row) => row.product_type || '',
+      getDisplay: (row) => row.product_type || '',
       parseValue: (str) => {
         const t = String(str ?? '').trim()
         if (t === '') return null  // backend requires non-empty
@@ -343,7 +380,9 @@ export default function PurchasePlanning() {
     },
     {
       colId: 'sub_product_type',
+      editorType: 'subProductType',
       getValue: (row) => row.sub_product_type || '',
+      getDisplay: (row) => row.sub_product_type || '—',
       parseValue: (str) => {
         const t = String(str ?? '').trim()
         if (t === '') return { sub_product_type: '' }  // empty clears
@@ -353,7 +392,9 @@ export default function PurchasePlanning() {
     },
     {
       colId: 'purchase_weight_lbs',
+      editorType: 'number',
       getValue: (row) => row.purchase_weight_lbs == null ? '' : String(row.purchase_weight_lbs),
+      getDisplay: (row) => row.purchase_weight_lbs == null ? '' : fmtNum(row.purchase_weight_lbs),
       parseValue: (str) => {
         const t = String(str ?? '').trim()
         if (t === '') return { purchase_weight_lbs: null }
@@ -364,7 +405,9 @@ export default function PurchasePlanning() {
     },
     {
       colId: 'case_weight_lbs',
+      editorType: 'number',
       getValue: (row) => row.case_weight_lbs == null ? '' : String(row.case_weight_lbs),
+      getDisplay: (row) => row.case_weight_lbs == null ? '' : fmtNum(row.case_weight_lbs),
       parseValue: (str) => {
         const t = String(str ?? '').trim()
         if (t === '') return { case_weight_lbs: null }
@@ -375,7 +418,9 @@ export default function PurchasePlanning() {
     },
     {
       colId: 'quantity',
+      editorType: 'number',
       getValue: (row) => row.quantity == null ? '' : String(row.quantity),
+      getDisplay: (row) => row.quantity == null ? '' : fmtNum(row.quantity),
       parseValue: (str) => {
         const t = String(str ?? '').trim()
         if (t === '') return { quantity: null }
@@ -392,6 +437,31 @@ export default function PurchasePlanning() {
     return m
   }, [editableColumnMeta])
 
+  // Latest-value refs for use inside event handlers whose effect we don't
+  // want to re-bind on every render. Updated in render, read on event.
+  const dataRowsRef = useRef([])
+  const editableColumnMetaRef = useRef(editableColumnMeta)
+  editableColumnMetaRef.current = editableColumnMeta
+
+  // ── Edit transitions ────────────────────────────────────────────────────
+  function startEditing(rowIdx, colIdx, initialValue) {
+    setEditing({ rowIdx, colIdx, initialValue: initialValue ?? null })
+  }
+  function cancelEditing() {
+    setEditing(null)
+  }
+  // Move the anchor without entering edit mode. Used by Tab/Enter advance and
+  // arrow-key navigation. Caller passes the current dataRows length so we
+  // don't capture a stale value across re-renders.
+  function moveAnchor(rowIdx, colIdx, dir, rowsLen) {
+    let nr = rowIdx, nc = colIdx
+    if (dir === 'right') nc = Math.min(editableColumnMeta.length - 1, colIdx + 1)
+    else if (dir === 'left') nc = Math.max(0, colIdx - 1)
+    else if (dir === 'down') nr = Math.min(rowsLen - 1, rowIdx + 1)
+    else if (dir === 'up') nr = Math.max(0, rowIdx - 1)
+    setSelection({ anchor: { rowIdx: nr, colIdx: nc }, focus: { rowIdx: nr, colIdx: nc } })
+  }
+
   // ── Columns ─────────────────────────────────────────────────────────────
   const columns = useMemo(() => [
     {
@@ -401,16 +471,12 @@ export default function PurchasePlanning() {
         const v = vendors.find((vv) => vv.id === row.vendor_id)
         return v ? v.name : '—'
       },
+      // Editable: rendered by the td block below. This stub only covers
+      // unusual paths (e.g. tooling that calls flexRender directly).
       cell: ({ row, getValue }) => {
         if (row.getIsGrouped()) return getValue()
-        return (
-          <VendorCell
-            value={row.original.vendor_id}
-            vendors={vendors}
-            productType={row.original.product_type}
-            onSave={(vendorId) => handleUpdate(row.original.id, { vendor_id: vendorId })}
-          />
-        )
+        const v = vendors.find((vv) => vv.id === row.original.vendor_id)
+        return v ? v.name : '—'
       },
       filterFn: 'includesString',
       enableGrouping: true,
@@ -419,27 +485,14 @@ export default function PurchasePlanning() {
       id: 'product_type',
       header: 'Product Type',
       accessorKey: 'product_type',
-      cell: ({ row }) => (
-        <ProductTypeCell
-          value={row.original.product_type}
-          productTypes={productTypes}
-          onSave={(pt) => handleUpdate(row.original.id, { product_type: pt })}
-        />
-      ),
+      cell: ({ row }) => row.original.product_type || '',
       filterFn: 'includesString',
     },
     {
       id: 'sub_product_type',
       header: 'Sub Product Type',
       accessorKey: 'sub_product_type',
-      cell: ({ row }) => (
-        <SubProductTypeCell
-          value={row.original.sub_product_type}
-          productTypes={productTypes}
-          baseProductType={row.original.product_type}
-          onSave={(pt) => handleUpdate(row.original.id, { sub_product_type: pt })}
-        />
-      ),
+      cell: ({ row }) => row.original.sub_product_type || '—',
       filterFn: 'includesString',
     },
     {
@@ -506,13 +559,7 @@ export default function PurchasePlanning() {
       id: 'purchase_weight_lbs',
       header: 'Purchase Weight (lbs)',
       accessorKey: 'purchase_weight_lbs',
-      cell: ({ row }) => (
-        <NumberCell
-          value={row.original.purchase_weight_lbs}
-          placeholder="lbs"
-          onSave={(n) => handleUpdate(row.original.id, { purchase_weight_lbs: n })}
-        />
-      ),
+      cell: ({ row }) => fmtNum(row.original.purchase_weight_lbs),
       sortingFn: 'basic',
       enableColumnFilter: false,
     },
@@ -535,13 +582,7 @@ export default function PurchasePlanning() {
       id: 'case_weight_lbs',
       header: 'Case Weight (lbs)',
       accessorKey: 'case_weight_lbs',
-      cell: ({ row }) => (
-        <NumberCell
-          value={row.original.case_weight_lbs}
-          placeholder="1 = no case"
-          onSave={(n) => handleUpdate(row.original.id, { case_weight_lbs: n })}
-        />
-      ),
+      cell: ({ row }) => fmtNum(row.original.case_weight_lbs),
       sortingFn: 'basic',
       enableColumnFilter: false,
     },
@@ -549,13 +590,7 @@ export default function PurchasePlanning() {
       id: 'quantity',
       header: 'Qty (cases / lb / pieces)',
       accessorKey: 'quantity',
-      cell: ({ row }) => (
-        <NumberCell
-          value={row.original.quantity}
-          placeholder="qty"
-          onSave={(n) => handleUpdate(row.original.id, { quantity: n })}
-        />
-      ),
+      cell: ({ row }) => fmtNum(row.original.quantity),
       sortingFn: 'basic',
       enableColumnFilter: false,
     },
@@ -603,6 +638,7 @@ export default function PurchasePlanning() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [table.getRowModel().rows],
   )
+  dataRowsRef.current = dataRows
 
   // Clear selection when the underlying view changes — indices would otherwise
   // point at the wrong cells.
@@ -611,20 +647,48 @@ export default function PurchasePlanning() {
   }, [periodId, grouping, sorting, columnFilters])
 
   // ── Cell selection: mousedown handler ───────────────────────────────────
+  // mousedown on a cell starts a drag selection. mouseEnter on other cells
+  // extends the focus while the mouse is held; a window-level mouseup ends
+  // the drag. Plain click → single-cell selection. Shift-click → extend range
+  // from the existing anchor.
   function handleCellMouseDown(e, rowIdx, colIdx) {
+    // Cells we're editing should accept native input events; don't hijack.
+    if (editing && editing.rowIdx === rowIdx && editing.colIdx === colIdx) return
+    e.preventDefault()  // don't let focus land on neighboring inputs
     if (e.shiftKey) {
-      // Extend range without focusing the input — preventDefault on mousedown
-      // suppresses the focus that would otherwise follow.
-      e.preventDefault()
       setSelection((s) => ({
         anchor: s.anchor || { rowIdx, colIdx },
         focus: { rowIdx, colIdx },
       }))
     } else {
-      // Plain click: anchor here, let native focus happen on the input.
       setSelection({ anchor: { rowIdx, colIdx }, focus: { rowIdx, colIdx } })
+      draggingRef.current = true
+    }
+    // Cancel any in-progress edit elsewhere
+    if (editing && (editing.rowIdx !== rowIdx || editing.colIdx !== colIdx)) {
+      setEditing(null)
     }
   }
+  function handleCellMouseEnter(rowIdx, colIdx) {
+    if (!draggingRef.current) return
+    setSelection((s) => ({
+      anchor: s.anchor || { rowIdx, colIdx },
+      focus: { rowIdx, colIdx },
+    }))
+  }
+  function handleCellDoubleClick(rowIdx, colIdx) {
+    const colMeta = editableColumnMeta[colIdx]
+    if (!colMeta) return
+    const rowItem = dataRows[rowIdx]?.original
+    if (!rowItem) return
+    startEditing(rowIdx, colIdx, colMeta.getValue(rowItem))
+  }
+  // End drag-selection on window mouseup so the user can release outside the table.
+  useEffect(() => {
+    function onMouseUp() { draggingRef.current = false }
+    window.addEventListener('mouseup', onMouseUp)
+    return () => window.removeEventListener('mouseup', onMouseUp)
+  }, [])
 
   // ── Copy / Paste handlers ───────────────────────────────────────────────
   // Bulk paste applies many cells in parallel without invalidating the query
@@ -719,21 +783,81 @@ export default function PurchasePlanning() {
       distributeToCells(matrix, selection.anchor)
     }
 
+    function clearSelectionCells() {
+      const rows = dataRowsRef.current
+      const cols = editableColumnMetaRef.current
+      const box = selectionBox(selection)
+      if (!box) return
+      const updates = []
+      for (let r = box.rs; r <= box.re; r++) {
+        const rowItem = rows[r]?.original
+        if (!rowItem) continue
+        const patch = {}
+        for (let c = box.cs; c <= box.ce; c++) {
+          const colMeta = cols[c]
+          if (!colMeta) continue
+          const cleared = colMeta.parseValue('')
+          if (cleared) Object.assign(patch, cleared)
+        }
+        if (Object.keys(patch).length) updates.push({ id: rowItem.id, patch })
+      }
+      if (updates.length) {
+        Promise.all(updates.map(({ id, patch }) => purchasePlanningApi.update(id, patch)))
+          .then(() => qc.invalidateQueries({ queryKey: ['purchase-planning', periodId] }))
+      }
+    }
+
     async function onKeyDown(e) {
-      if (e.key === 'Escape') {
-        if (selection.anchor || selection.focus) {
-          setSelection({ anchor: null, focus: null })
-          if (isEditableField(document.activeElement)) document.activeElement.blur()
+      const rows = dataRowsRef.current
+      const cols = editableColumnMetaRef.current
+      // Ignore keystrokes that originate inside any input (column filters,
+      // toolbar selects, the active cell editor). They handle their own keys.
+      if (isEditableField(document.activeElement)) {
+        if (e.key === 'Escape' && editing) {
+          // Editor handles its own Escape via its onKeyDown; nothing to do.
         }
         return
       }
+      if (e.key === 'Escape') {
+        if (editing) { setEditing(null); return }
+        if (selection.anchor || selection.focus) setSelection({ anchor: null, focus: null })
+        return
+      }
       const cmd = e.metaKey || e.ctrlKey
+
+      // Active-cell navigation when not editing.
+      const anc = selection.anchor
+      if (!editing && anc) {
+        if (e.key === 'ArrowUp')    { e.preventDefault(); moveAnchor(anc.rowIdx, anc.colIdx, 'up',    rows.length); return }
+        if (e.key === 'ArrowDown')  { e.preventDefault(); moveAnchor(anc.rowIdx, anc.colIdx, 'down',  rows.length); return }
+        if (e.key === 'ArrowLeft')  { e.preventDefault(); moveAnchor(anc.rowIdx, anc.colIdx, 'left',  rows.length); return }
+        if (e.key === 'ArrowRight') { e.preventDefault(); moveAnchor(anc.rowIdx, anc.colIdx, 'right', rows.length); return }
+        if (e.key === 'Tab')        { e.preventDefault(); moveAnchor(anc.rowIdx, anc.colIdx, e.shiftKey ? 'left' : 'right', rows.length); return }
+        if (e.key === 'Enter' || e.key === 'F2') {
+          e.preventDefault()
+          const colMeta = cols[anc.colIdx]
+          const rowItem = rows[anc.rowIdx]?.original
+          if (colMeta && rowItem) startEditing(anc.rowIdx, anc.colIdx, colMeta.getValue(rowItem))
+          return
+        }
+        if (!cmd && (e.key === 'Backspace' || e.key === 'Delete')) {
+          e.preventDefault()
+          clearSelectionCells()
+          return
+        }
+        // Type-to-edit: a printable single-character keypress replaces the
+        // current value with that char and enters edit mode.
+        if (!cmd && e.key.length === 1) {
+          e.preventDefault()
+          startEditing(anc.rowIdx, anc.colIdx, e.key)
+          return
+        }
+      }
+
       if (!cmd) return
       const k = e.key.toLowerCase()
-      // Cmd+C with no DOM selection (post shift-click range): the `copy` event
-      // won't fire, so handle it from keydown.
-      if (k === 'c' && selection.anchor && selection.focus && !cellsEqual(selection.anchor, selection.focus)) {
-        if (isEditableField(document.activeElement)) return  // input handles its own copy
+      // Cmd+C: copy selected range as TSV.
+      if (k === 'c' && selection.anchor && selection.focus) {
         e.preventDefault()
         const tsv = selectionToTSV()
         if (tsv) {
@@ -741,14 +865,22 @@ export default function PurchasePlanning() {
         }
         return
       }
-      // Cmd+V outside any input: read clipboard async and distribute.
-      if (k === 'v' && selection.anchor && !isEditableField(document.activeElement)) {
+      // Cmd+V: paste (distributes TSV from anchor).
+      if (k === 'v' && selection.anchor) {
         e.preventDefault()
         try {
           const text = await navigator.clipboard.readText()
           const matrix = parseTSV(text)
           if (matrix.length) distributeToCells(matrix, selection.anchor)
         } catch {}
+        return
+      }
+      // Cmd+X: cut = copy then clear.
+      if (k === 'x' && selection.anchor && selection.focus) {
+        e.preventDefault()
+        const tsv = selectionToTSV()
+        if (tsv) { try { await navigator.clipboard.writeText(tsv) } catch {} }
+        clearSelectionCells()
       }
     }
 
@@ -761,7 +893,7 @@ export default function PurchasePlanning() {
       document.removeEventListener('keydown', onKeyDown)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selection, dataRows, editableColumnMeta, periodId])
+  }, [selection, periodId, editing])
 
   // ── Render ──────────────────────────────────────────────────────────────
   const period = periods.find((p) => p.id === periodId)
@@ -797,9 +929,11 @@ export default function PurchasePlanning() {
             type) combo, so splits across vendors net out together.
           </p>
           <p style={{ fontSize: 12, color: '#6b7280' }}>
-            <strong>Tip:</strong> Click a cell to select, shift-click to extend
-            a range. Copy/paste with Cmd+C / Cmd+V (Ctrl on Windows) — works
-            with Excel and Google Sheets. Esc to clear the selection.
+            <strong>Spreadsheet shortcuts:</strong> click to select a cell,
+            drag or shift-click for a range, arrow keys to move, double-click
+            (or Enter / F2 / start typing) to edit, Tab/Enter commits.
+            Cmd/Ctrl+C, V, X for copy / paste / cut — works with Excel & Google
+            Sheets. Delete or Backspace clears, Esc cancels.
           </p>
         </div>
       </div>
@@ -867,6 +1001,10 @@ export default function PurchasePlanning() {
         <div className="empty">Select a projection period to begin planning purchases.</div>
       )}
 
+      <datalist id={PT_DATALIST_ID}>
+        {productTypes.map((pt) => (<option key={pt} value={pt} />))}
+      </datalist>
+
       {periodId && (
         <div className="data-table-wrap" style={{ overflowX: 'auto' }}>
           <table className="data-table" style={{ minWidth: 1600 }}>
@@ -932,7 +1070,7 @@ export default function PurchasePlanning() {
                       <tr key={row.id} style={{ background: '#f3f4f6' }}>
                         <td
                           colSpan={columns.length}
-                          style={{ cursor: 'pointer', fontWeight: 600 }}
+                          style={{ cursor: 'pointer', fontWeight: 600, padding: '4px 8px' }}
                           onClick={row.getToggleExpandedHandler()}
                         >
                           <span style={{ marginRight: 6, color: '#6b7280' }}>
@@ -951,26 +1089,69 @@ export default function PurchasePlanning() {
                   return (
                     <tr key={row.id}>
                       {row.getVisibleCells().map((cell) => {
-                        const colIdx = colIdxByColId.get(cell.column.id)
+                        const colId = cell.column.id
+                        const colIdx = colIdxByColId.get(colId)
                         const isEditable = colIdx !== undefined
                         const inRange = isEditable && selBox != null
                           && rIdx >= selBox.rs && rIdx <= selBox.re
                           && colIdx >= selBox.cs && colIdx <= selBox.ce
                         const isAnchor = isEditable && selection.anchor
                           && selection.anchor.rowIdx === rIdx && selection.anchor.colIdx === colIdx
+                        const isEditing = isEditable && editing
+                          && editing.rowIdx === rIdx && editing.colIdx === colIdx
                         const tdStyle = {
-                          padding: '4px 8px',
-                          background: inRange ? '#eff6ff' : 'transparent',
-                          boxShadow: isAnchor ? 'inset 0 0 0 2px #1d4ed8' : 'none',
+                          padding: 0,  // inner display/editor owns the padding
+                          background: inRange && !isAnchor ? '#dbeafe' : 'transparent',
+                          // Active cell gets a thicker spreadsheet-style outline.
+                          boxShadow: isAnchor
+                            ? 'inset 0 0 0 2px #1d4ed8'
+                            : (inRange ? 'inset 0 0 0 1px #93c5fd' : 'none'),
                           position: 'relative',
+                          height: 28,
+                          verticalAlign: 'middle',
                         }
+                        if (!isEditable) {
+                          return (
+                            <td key={cell.id} style={{ ...tdStyle, padding: '4px 8px' }}>
+                              {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                            </td>
+                          )
+                        }
+                        const colMeta = editableColumnMeta[colIdx]
                         return (
                           <td
                             key={cell.id}
                             style={tdStyle}
-                            onMouseDown={isEditable ? (e) => handleCellMouseDown(e, rIdx, colIdx) : undefined}
+                            onMouseDown={(e) => handleCellMouseDown(e, rIdx, colIdx)}
+                            onMouseEnter={() => handleCellMouseEnter(rIdx, colIdx)}
+                            onDoubleClick={() => handleCellDoubleClick(rIdx, colIdx)}
                           >
-                            {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                            {isEditing ? (
+                              <CellEditor
+                                editorType={colMeta.editorType}
+                                initialValue={
+                                  editing.initialValue != null
+                                    ? editing.initialValue
+                                    : colMeta.getValue(row.original)
+                                }
+                                vendors={vendors}
+                                productTypes={productTypes}
+                                baseProductType={row.original.product_type}
+                                onCommit={(dir, draftValue) => {
+                                  const update = colMeta.parseValue(draftValue)
+                                  if (update) {
+                                    updateMut.mutate({ id: row.original.id, data: update })
+                                  }
+                                  setEditing(null)
+                                  if (dir) moveAnchor(rIdx, colIdx, dir, dataRows.length)
+                                }}
+                                onCancel={() => setEditing(null)}
+                              />
+                            ) : (
+                              <span style={cellDisplayStyle}>
+                                {colMeta.getDisplay(row.original) || ' '}
+                              </span>
+                            )}
                           </td>
                         )
                       })}
