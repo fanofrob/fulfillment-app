@@ -303,7 +303,7 @@ models.Base.metadata.create_all(bind=engine)
 _seed_ups_rates()
 _seed_gm_settings()
 
-from routers import sku_mapping, sku_helper, cogs, rate_cards, rules, inventory, orders, shopify_auth, shipstation, fulfillment, picklist_skus, products, gm_settings, projection_periods, projection_confirmed_orders, historical_data, projections, vendors, purchase_orders, purchase_planning, inventory_count, receiving
+from routers import sku_mapping, sku_helper, shopify_sku_rules, cogs, rate_cards, rules, inventory, orders, shopify_auth, shipstation, fulfillment, picklist_skus, products, gm_settings, projection_periods, projection_confirmed_orders, historical_data, projections, vendors, purchase_orders, purchase_planning, inventory_count, receiving
 from services import sheets_service, shopify_service, shipstation_service
 
 app = FastAPI(title="Fulfillment App API")
@@ -332,6 +332,7 @@ app.include_router(shipstation.router, prefix="/api/shipstation", tags=["ShipSta
 app.include_router(fulfillment.router, prefix="/api/fulfillment", tags=["Fulfillment"])
 app.include_router(picklist_skus.router, prefix="/api/picklist-skus", tags=["Picklist SKUs"])
 app.include_router(sku_helper.router, prefix="/api/sku-helper", tags=["SKU Helper"])
+app.include_router(shopify_sku_rules.router, prefix="/api/shopify-sku-rules", tags=["Shopify SKU Rules"])
 app.include_router(products.router, prefix="/api/products", tags=["Products"])
 app.include_router(gm_settings.router, prefix="/api/gm-settings", tags=["GM Settings"])
 app.include_router(projection_periods.router, prefix="/api/projection-periods", tags=["Projection Periods"])

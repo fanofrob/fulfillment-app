@@ -77,6 +77,40 @@ class BundleMapping(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 
+class ShopifySkuRule(Base):
+    """
+    Per-canonical-Shopify-SKU rules describing the bundle's confirmed weight
+    and the constraints on the pick SKUs that compose it. Lookups for variant
+    SKUs (e.g. -2lb_2, -1lb_pos) resolve through sku_helper_mappings first;
+    rules are stored only on the canonical SKU.
+
+    All fields are optional / nullable; an absent rule means "no constraints
+    declared yet". Constraint violations surface as warnings on the SKU Mapping
+    page error dashboard, never as save blockers.
+    """
+    __tablename__ = "shopify_sku_rules"
+    id = Column(Integer, primary_key=True, index=True)
+    shopify_sku = Column(String, nullable=False, unique=True, index=True)  # canonical
+    weight_lb = Column(Float, nullable=True)  # confirmed weight of the Shopify SKU
+    kind = Column(String, nullable=True)  # 'single' | 'multi' | NULL
+
+    # Single-SKU rules
+    single_substitute_product_types = Column(JSON, nullable=True)  # list[str]
+
+    # Multi-SKU rules
+    multi_min_picks = Column(Integer, nullable=True)
+    multi_max_picks = Column(Integer, nullable=True)
+    multi_min_categories = Column(Integer, nullable=True)  # over PicklistSku.category (Basic/Tropical/Exotic)
+    multi_max_categories = Column(Integer, nullable=True)
+    multi_max_cost_per_lb = Column(Float, nullable=True)
+    multi_allowed_product_types = Column(JSON, nullable=True)  # list[str]
+    multi_required_picks = Column(JSON, nullable=True)  # list[{pick_sku: str, qty: float}]
+
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
 class SkuHelperMapping(Base):
     """
     Variant-to-canonical Shopify SKU normalization. A single product often gets
