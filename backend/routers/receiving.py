@@ -55,20 +55,28 @@ def _get_record_or_404(db: Session, record_id: int) -> models.ReceivingRecord:
 
 
 def _validate_sku_for_product_type(db: Session, pick_sku: str, product_type: str):
-    """Verify pick_sku belongs to the given product_type via sku_mappings."""
-    mapping = (
-        db.query(models.SkuMapping)
-        .filter(
-            models.SkuMapping.pick_sku == pick_sku,
-            models.SkuMapping.product_type == product_type,
-            models.SkuMapping.is_active == True,
-        )
-        .first()
-    )
-    if not mapping:
+    """Verify pick_sku is a real SKU.
+
+    The receiving form's dropdown deliberately surfaces SKUs from inventory
+    and the broader catalog (not just sku_mappings rows for this product
+    type) so the user can correct mismatches in the field — the UI flags
+    off-list picks with "Not in suggestions". This validator therefore only
+    rejects SKUs that don't exist anywhere; product-type alignment is the
+    user's call.
+    """
+    exists = db.query(models.PicklistSku.pick_sku).filter(
+        models.PicklistSku.pick_sku == pick_sku
+    ).first()
+    if not exists:
+        # Some inventory items reference SKUs that don't (yet) have a PicklistSku
+        # row — accept those too rather than failing the receipt.
+        exists = db.query(models.InventoryItem.pick_sku).filter(
+            models.InventoryItem.pick_sku == pick_sku
+        ).first()
+    if not exists:
         raise HTTPException(
             status_code=422,
-            detail=f"SKU '{pick_sku}' does not match product type '{product_type}'",
+            detail=f"Unknown SKU '{pick_sku}'",
         )
 
 
