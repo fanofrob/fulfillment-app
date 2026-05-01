@@ -111,6 +111,128 @@ def list_sku_mappings(
     return items[skip:skip + limit]
 
 
+@router.get("/grouped")
+def list_grouped_sku_mappings(
+    warehouse: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    errors_only: bool = Query(False),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """
+    One row per (warehouse, shopify_sku) with all pick lines aggregated, rule attached
+    (resolved through sku_helper_mappings), and a summary block (total pick weight,
+    Shopify weight, diff, pick count, distinct categories) computed for the page tooltip.
+    """
+    from collections import OrderedDict
+    from routers.shopify_sku_rules import get_rule_for_shopify_sku
+
+    q = db.query(models.BundleMapping)
+    if warehouse:
+        q = q.filter(models.BundleMapping.warehouse == warehouse)
+    if search:
+        s = f"%{search.lower()}%"
+        q = q.filter(or_(
+            func.lower(models.BundleMapping.shopify_sku).like(s),
+            func.lower(models.BundleMapping.pick_sku).like(s),
+        ))
+    rows = q.order_by(models.BundleMapping.shopify_sku, models.BundleMapping.warehouse).all()
+    if not rows:
+        return []
+
+    grouped: "OrderedDict[tuple, list]" = OrderedDict()
+    for r in rows:
+        grouped.setdefault((r.warehouse, r.shopify_sku), []).append(r)
+
+    all_pick_skus = {r.pick_sku for r in rows if r.pick_sku}
+    pick_meta: dict[str, dict] = {}
+    if all_pick_skus:
+        for p in db.query(models.PicklistSku).filter(models.PicklistSku.pick_sku.in_(all_pick_skus)).all():
+            cost = p.cost_per_lb
+            if cost is None and p.cost_per_case is not None and p.case_weight_lb:
+                cost = p.cost_per_case / p.case_weight_lb
+            pick_meta[p.pick_sku] = {
+                "picklist_weight_lb": p.weight_lb,
+                "cost_per_lb": cost,
+                "category": p.category,
+            }
+
+    result = []
+    for (wh, sku), lines in grouped.items():
+        pick_lines: list[dict] = []
+        total_pick_weight = 0.0
+        agg_errors: set[str] = set()
+        for line in lines:
+            meta = pick_meta.get(line.pick_sku, {})
+            pw = line.pick_weight_lb if line.pick_weight_lb is not None else meta.get("picklist_weight_lb")
+            line_total = (line.mix_quantity or 0) * (pw or 0)
+            total_pick_weight += line_total
+            line_errors = _row_errors(line)
+            agg_errors.update(line_errors)
+            pick_lines.append({
+                "id": line.id,
+                "pick_sku": line.pick_sku,
+                "mix_quantity": line.mix_quantity,
+                "pick_weight_lb": pw,
+                "product_type": line.product_type,
+                "pick_type": line.pick_type,
+                "shop_status": line.shop_status,
+                "is_active": line.is_active,
+                "cost_per_lb": meta.get("cost_per_lb"),
+                "category": meta.get("category"),
+                "line_total_weight": round(line_total, 4),
+                "last_edited_in_app_at": line.last_edited_in_app_at.isoformat() if line.last_edited_in_app_at else None,
+                "errors": line_errors,
+            })
+
+        rule = get_rule_for_shopify_sku(db, sku)
+        rule_dict = None
+        shopify_weight = None
+        if rule:
+            rule_dict = {
+                "id": rule.id,
+                "shopify_sku": rule.shopify_sku,
+                "weight_lb": rule.weight_lb,
+                "kind": rule.kind,
+                "single_substitute_product_types": rule.single_substitute_product_types,
+                "multi_min_picks": rule.multi_min_picks,
+                "multi_max_picks": rule.multi_max_picks,
+                "multi_min_categories": rule.multi_min_categories,
+                "multi_max_categories": rule.multi_max_categories,
+                "multi_max_cost_per_lb": rule.multi_max_cost_per_lb,
+                "multi_allowed_product_types": rule.multi_allowed_product_types,
+                "multi_required_picks": rule.multi_required_picks,
+            }
+            shopify_weight = rule.weight_lb
+
+        weight_diff = None
+        weight_diff_pct = None
+        if shopify_weight is not None and shopify_weight > 0:
+            weight_diff = round(total_pick_weight - shopify_weight, 4)
+            weight_diff_pct = round((total_pick_weight - shopify_weight) / shopify_weight, 4)
+
+        result.append({
+            "shopify_sku": sku,
+            "warehouse": wh,
+            "pick_lines": pick_lines,
+            "rule": rule_dict,
+            "summary": {
+                "total_pick_weight": round(total_pick_weight, 4),
+                "shopify_weight": shopify_weight,
+                "weight_diff": weight_diff,
+                "weight_diff_pct": weight_diff_pct,
+                "pick_count": len(pick_lines),
+                "categories": sorted({pl["category"] for pl in pick_lines if pl["category"]}),
+            },
+            "errors": sorted(agg_errors),
+        })
+
+    if errors_only:
+        result = [r for r in result if r["errors"]]
+    return result[skip:skip + limit]
+
+
 @router.post("/refresh")
 def refresh_sku_mappings(db: Session = Depends(get_db)):
     """

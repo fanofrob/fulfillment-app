@@ -10,7 +10,18 @@ const api = axios.create({ baseURL: API_BASE })
 
 export const skuMappingApi = {
   list: (params) => api.get('/sku-mappings/', { params }).then(r => r.data),
+  listGrouped: (params) => api.get('/sku-mappings/grouped', { params }).then(r => r.data),
   refresh: () => api.post('/sku-mappings/refresh').then(r => r.data),
+  create: (data) => api.post('/sku-mappings/', data).then(r => r.data),
+  update: (id, data) => api.put(`/sku-mappings/${id}`, data).then(r => r.data),
+  remove: (id) => api.delete(`/sku-mappings/${id}`).then(r => r.data),
+}
+
+export const shopifySkuRulesApi = {
+  list: (params) => api.get('/shopify-sku-rules/', { params }).then(r => r.data),
+  lookup: (shopify_sku) => api.get('/shopify-sku-rules/lookup', { params: { shopify_sku } }).then(r => r.data),
+  upsert: (shopify_sku, data) => api.put(`/shopify-sku-rules/by-shopify-sku/${encodeURIComponent(shopify_sku)}`, data).then(r => r.data),
+  remove: (id) => api.delete(`/shopify-sku-rules/${id}`).then(r => r.data),
 }
 
 export const cogsApi = {
