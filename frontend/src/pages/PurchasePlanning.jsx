@@ -67,6 +67,7 @@ function buildTSV(rows) {
 // while the user is actively editing one cell.
 
 const PT_DATALIST_ID = 'pt-list-purchase-planning'
+const VENDOR_DATALIST_ID = 'vendor-list-purchase-planning'
 
 const editorBaseStyle = {
   width: '100%',
@@ -128,7 +129,10 @@ function CellEditor({
   }
 
   if (editorType === 'vendor') {
-    // Re-build suggested vendors at edit time (cheap; only runs while editing).
+    // Use input + datalist instead of <select> — native <select> auto-opens
+    // its dropdown on focus, which fights the spreadsheet feel. Datalist
+    // gives autocomplete without the modal popup. Sort vendors so ones whose
+    // catalog mentions the row's product_type show up first in the suggestions.
     const pt = (baseProductType || '').trim().toLowerCase()
     const suggested = []
     const other = []
@@ -138,43 +142,38 @@ function CellEditor({
       if (hit) suggested.push(v)
       else other.push(v)
     }
+    const ordered = [...suggested, ...other]
     return (
-      <select
-        ref={inputRef}
-        value={draft}
-        onChange={(e) => { setDraft(e.target.value); }}
-        onBlur={() => commitNow(null)}
-        onKeyDown={onKey}
-        style={editorBaseStyle}
-      >
-        <option value="">—</option>
-        {suggested.length > 0 && (
-          <optgroup label={`★ Suggested for "${baseProductType}"`}>
-            {suggested.map((v) => (<option key={v.id} value={v.name}>{v.name}</option>))}
-          </optgroup>
-        )}
-        <optgroup label={suggested.length > 0 ? 'All vendors' : 'Vendors'}>
-          {other.map((v) => (<option key={v.id} value={v.name}>{v.name}</option>))}
-        </optgroup>
-      </select>
+      <>
+        <input
+          ref={inputRef}
+          type="text"
+          list={VENDOR_DATALIST_ID}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={() => commitNow(null)}
+          onKeyDown={onKey}
+          style={editorBaseStyle}
+        />
+        <datalist id={VENDOR_DATALIST_ID}>
+          {ordered.map((v) => (<option key={v.id} value={v.name} />))}
+        </datalist>
+      </>
     )
   }
 
   if (editorType === 'subProductType') {
     return (
-      <select
+      <input
         ref={inputRef}
+        type="text"
+        list={PT_DATALIST_ID}
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={() => commitNow(null)}
         onKeyDown={onKey}
         style={editorBaseStyle}
-      >
-        <option value="">—</option>
-        {productTypes
-          .filter((pt) => pt !== baseProductType)
-          .map((pt) => (<option key={pt} value={pt}>{pt}</option>))}
-      </select>
+      />
     )
   }
 
@@ -346,9 +345,15 @@ export default function PurchasePlanning() {
 
   const productTypeSet = useMemo(() => new Set(productTypes), [productTypes])
 
-  const editableColumnMeta = useMemo(() => [
+  // Selection grid metadata: ALL columns the user can highlight, in DOM
+  // (visible) order. Editable cols carry editorType + parseValue; read-only
+  // cols only contribute to copy/range — paste skips them. Order matters
+  // because shift-click and drag operate on these indices.
+  const numStr = (v) => v == null ? '' : fmtNum(v)
+  const gridColumnMeta = useMemo(() => [
     {
       colId: 'vendor',
+      editable: true,
       editorType: 'vendor',
       getValue: (row) => {
         const v = vendors.find((vv) => vv.id === row.vendor_id)
@@ -358,7 +363,6 @@ export default function PurchasePlanning() {
         const v = vendors.find((vv) => vv.id === row.vendor_id)
         return v ? v.name : '—'
       },
-      // Returns a patch object to apply, or null to skip this cell.
       parseValue: (str) => {
         const t = String(str ?? '').trim()
         if (t === '') return { vendor_id: null }
@@ -369,32 +373,55 @@ export default function PurchasePlanning() {
     },
     {
       colId: 'product_type',
+      editable: true,
       editorType: 'productType',
       getValue: (row) => row.product_type || '',
       getDisplay: (row) => row.product_type || '',
       parseValue: (str) => {
         const t = String(str ?? '').trim()
-        if (t === '') return null  // backend requires non-empty
+        if (t === '') return null
         return { product_type: t }
       },
     },
     {
       colId: 'sub_product_type',
+      editable: true,
       editorType: 'subProductType',
       getValue: (row) => row.sub_product_type || '',
       getDisplay: (row) => row.sub_product_type || '—',
       parseValue: (str) => {
         const t = String(str ?? '').trim()
-        if (t === '') return { sub_product_type: '' }  // empty clears
+        if (t === '') return { sub_product_type: '' }
         if (!productTypeSet.has(t)) return null
         return { sub_product_type: t }
       },
     },
     {
+      colId: 'inventory_lbs',
+      editable: false,
+      getValue: (row) => numStr(row.inventory_lbs),
+    },
+    {
+      colId: 'sub_inventory_lbs',
+      editable: false,
+      getValue: (row) => numStr(row.sub_inventory_lbs),
+    },
+    {
+      colId: 'gap_lbs',
+      editable: false,
+      getValue: (row) => numStr(row.gap_lbs),
+    },
+    {
+      colId: 'net_after_purchase_lbs',
+      editable: false,
+      getValue: (row) => numStr(row.net_after_purchase_lbs),
+    },
+    {
       colId: 'purchase_weight_lbs',
+      editable: true,
       editorType: 'number',
       getValue: (row) => row.purchase_weight_lbs == null ? '' : String(row.purchase_weight_lbs),
-      getDisplay: (row) => row.purchase_weight_lbs == null ? '' : fmtNum(row.purchase_weight_lbs),
+      getDisplay: (row) => numStr(row.purchase_weight_lbs),
       parseValue: (str) => {
         const t = String(str ?? '').trim()
         if (t === '') return { purchase_weight_lbs: null }
@@ -404,10 +431,16 @@ export default function PurchasePlanning() {
       },
     },
     {
+      colId: 'purchase_weight_helper_lbs',
+      editable: false,
+      getValue: (row) => numStr(row.purchase_weight_helper_lbs),
+    },
+    {
       colId: 'case_weight_lbs',
+      editable: true,
       editorType: 'number',
       getValue: (row) => row.case_weight_lbs == null ? '' : String(row.case_weight_lbs),
-      getDisplay: (row) => row.case_weight_lbs == null ? '' : fmtNum(row.case_weight_lbs),
+      getDisplay: (row) => numStr(row.case_weight_lbs),
       parseValue: (str) => {
         const t = String(str ?? '').trim()
         if (t === '') return { case_weight_lbs: null }
@@ -418,9 +451,10 @@ export default function PurchasePlanning() {
     },
     {
       colId: 'quantity',
+      editable: true,
       editorType: 'number',
       getValue: (row) => row.quantity == null ? '' : String(row.quantity),
-      getDisplay: (row) => row.quantity == null ? '' : fmtNum(row.quantity),
+      getDisplay: (row) => numStr(row.quantity),
       parseValue: (str) => {
         const t = String(str ?? '').trim()
         if (t === '') return { quantity: null }
@@ -433,15 +467,15 @@ export default function PurchasePlanning() {
 
   const colIdxByColId = useMemo(() => {
     const m = new Map()
-    editableColumnMeta.forEach((c, idx) => m.set(c.colId, idx))
+    gridColumnMeta.forEach((c, idx) => m.set(c.colId, idx))
     return m
-  }, [editableColumnMeta])
+  }, [gridColumnMeta])
 
   // Latest-value refs for use inside event handlers whose effect we don't
   // want to re-bind on every render. Updated in render, read on event.
   const dataRowsRef = useRef([])
-  const editableColumnMetaRef = useRef(editableColumnMeta)
-  editableColumnMetaRef.current = editableColumnMeta
+  const gridColumnMetaRef = useRef(gridColumnMeta)
+  gridColumnMetaRef.current = gridColumnMeta
 
   // ── Edit transitions ────────────────────────────────────────────────────
   function startEditing(rowIdx, colIdx, initialValue) {
@@ -455,11 +489,24 @@ export default function PurchasePlanning() {
   // don't capture a stale value across re-renders.
   function moveAnchor(rowIdx, colIdx, dir, rowsLen) {
     let nr = rowIdx, nc = colIdx
-    if (dir === 'right') nc = Math.min(editableColumnMeta.length - 1, colIdx + 1)
+    if (dir === 'right') nc = Math.min(gridColumnMeta.length - 1, colIdx + 1)
     else if (dir === 'left') nc = Math.max(0, colIdx - 1)
     else if (dir === 'down') nr = Math.min(rowsLen - 1, rowIdx + 1)
     else if (dir === 'up') nr = Math.max(0, rowIdx - 1)
     setSelection({ anchor: { rowIdx: nr, colIdx: nc }, focus: { rowIdx: nr, colIdx: nc } })
+  }
+  // Shift+Arrow: keep anchor pinned and slide the focus by one cell.
+  function extendFocus(dir, rowsLen) {
+    setSelection((s) => {
+      if (!s.anchor) return s
+      const f = s.focus || s.anchor
+      let nr = f.rowIdx, nc = f.colIdx
+      if (dir === 'right') nc = Math.min(gridColumnMeta.length - 1, nc + 1)
+      else if (dir === 'left') nc = Math.max(0, nc - 1)
+      else if (dir === 'down') nr = Math.min(rowsLen - 1, nr + 1)
+      else if (dir === 'up') nr = Math.max(0, nr - 1)
+      return { anchor: s.anchor, focus: { rowIdx: nr, colIdx: nc } }
+    })
   }
 
   // ── Columns ─────────────────────────────────────────────────────────────
@@ -677,8 +724,8 @@ export default function PurchasePlanning() {
     }))
   }
   function handleCellDoubleClick(rowIdx, colIdx) {
-    const colMeta = editableColumnMeta[colIdx]
-    if (!colMeta) return
+    const colMeta = gridColumnMeta[colIdx]
+    if (!colMeta || !colMeta.editable) return
     const rowItem = dataRows[rowIdx]?.original
     if (!rowItem) return
     startEditing(rowIdx, colIdx, colMeta.getValue(rowItem))
@@ -705,8 +752,10 @@ export default function PurchasePlanning() {
       let touched = false
       for (let j = 0; j < matrix[i].length; j++) {
         const c = anchor.colIdx + j
-        if (c >= editableColumnMeta.length) break
-        const update = editableColumnMeta[c].parseValue(matrix[i][j])
+        if (c >= gridColumnMeta.length) break
+        const colMeta = gridColumnMeta[c]
+        if (!colMeta.editable) continue  // read-only cells silently skip
+        const update = colMeta.parseValue(matrix[i][j])
         if (update) {
           patch = { ...patch, ...update }
           touched = true
@@ -730,7 +779,7 @@ export default function PurchasePlanning() {
     // Extend selection to cover the pasted region for visual feedback.
     const lastRow = Math.min(anchor.rowIdx + matrix.length - 1, dataRows.length - 1)
     const widest = matrix.reduce((m, r) => Math.max(m, r.length), 0)
-    const lastCol = Math.min(anchor.colIdx + widest - 1, editableColumnMeta.length - 1)
+    const lastCol = Math.min(anchor.colIdx + widest - 1, gridColumnMeta.length - 1)
     setSelection({ anchor, focus: { rowIdx: lastRow, colIdx: lastCol } })
     setActionMsg(`Pasted ${updates.length} row${updates.length === 1 ? '' : 's'}`)
   }
@@ -744,8 +793,8 @@ export default function PurchasePlanning() {
       const rowItem = dataRows[r].original
       const cells = []
       for (let c = box.cs; c <= box.ce; c++) {
-        if (c >= editableColumnMeta.length) continue
-        cells.push(editableColumnMeta[c].getValue(rowItem))
+        if (c >= gridColumnMeta.length) continue
+        cells.push(gridColumnMeta[c].getValue(rowItem))
       }
       rows.push(cells)
     }
@@ -785,7 +834,7 @@ export default function PurchasePlanning() {
 
     function clearSelectionCells() {
       const rows = dataRowsRef.current
-      const cols = editableColumnMetaRef.current
+      const cols = gridColumnMetaRef.current
       const box = selectionBox(selection)
       if (!box) return
       const updates = []
@@ -795,7 +844,7 @@ export default function PurchasePlanning() {
         const patch = {}
         for (let c = box.cs; c <= box.ce; c++) {
           const colMeta = cols[c]
-          if (!colMeta) continue
+          if (!colMeta || !colMeta.editable) continue
           const cleared = colMeta.parseValue('')
           if (cleared) Object.assign(patch, cleared)
         }
@@ -809,7 +858,7 @@ export default function PurchasePlanning() {
 
     async function onKeyDown(e) {
       const rows = dataRowsRef.current
-      const cols = editableColumnMetaRef.current
+      const cols = gridColumnMetaRef.current
       // Ignore keystrokes that originate inside any input (column filters,
       // toolbar selects, the active cell editor). They handle their own keys.
       if (isEditableField(document.activeElement)) {
@@ -828,16 +877,30 @@ export default function PurchasePlanning() {
       // Active-cell navigation when not editing.
       const anc = selection.anchor
       if (!editing && anc) {
-        if (e.key === 'ArrowUp')    { e.preventDefault(); moveAnchor(anc.rowIdx, anc.colIdx, 'up',    rows.length); return }
-        if (e.key === 'ArrowDown')  { e.preventDefault(); moveAnchor(anc.rowIdx, anc.colIdx, 'down',  rows.length); return }
-        if (e.key === 'ArrowLeft')  { e.preventDefault(); moveAnchor(anc.rowIdx, anc.colIdx, 'left',  rows.length); return }
-        if (e.key === 'ArrowRight') { e.preventDefault(); moveAnchor(anc.rowIdx, anc.colIdx, 'right', rows.length); return }
-        if (e.key === 'Tab')        { e.preventDefault(); moveAnchor(anc.rowIdx, anc.colIdx, e.shiftKey ? 'left' : 'right', rows.length); return }
+        // Arrow keys: plain → move anchor; with shift → extend the focus
+        // (selection range), keeping anchor pinned, like Excel.
+        const arrowDir = {
+          ArrowUp: 'up', ArrowDown: 'down',
+          ArrowLeft: 'left', ArrowRight: 'right',
+        }[e.key]
+        if (arrowDir) {
+          e.preventDefault()
+          if (e.shiftKey) extendFocus(arrowDir, rows.length)
+          else moveAnchor(anc.rowIdx, anc.colIdx, arrowDir, rows.length)
+          return
+        }
+        if (e.key === 'Tab') {
+          e.preventDefault()
+          moveAnchor(anc.rowIdx, anc.colIdx, e.shiftKey ? 'left' : 'right', rows.length)
+          return
+        }
         if (e.key === 'Enter' || e.key === 'F2') {
           e.preventDefault()
           const colMeta = cols[anc.colIdx]
           const rowItem = rows[anc.rowIdx]?.original
-          if (colMeta && rowItem) startEditing(anc.rowIdx, anc.colIdx, colMeta.getValue(rowItem))
+          if (colMeta && colMeta.editable && rowItem) {
+            startEditing(anc.rowIdx, anc.colIdx, colMeta.getValue(rowItem))
+          }
           return
         }
         if (!cmd && (e.key === 'Backspace' || e.key === 'Delete')) {
@@ -846,10 +909,14 @@ export default function PurchasePlanning() {
           return
         }
         // Type-to-edit: a printable single-character keypress replaces the
-        // current value with that char and enters edit mode.
+        // current value with that char and enters edit mode (only for
+        // editable cols — read-only cells just ignore the keypress).
         if (!cmd && e.key.length === 1) {
-          e.preventDefault()
-          startEditing(anc.rowIdx, anc.colIdx, e.key)
+          const colMeta = cols[anc.colIdx]
+          if (colMeta && colMeta.editable) {
+            e.preventDefault()
+            startEditing(anc.rowIdx, anc.colIdx, e.key)
+          }
           return
         }
       }
@@ -929,11 +996,13 @@ export default function PurchasePlanning() {
             type) combo, so splits across vendors net out together.
           </p>
           <p style={{ fontSize: 12, color: '#6b7280' }}>
-            <strong>Spreadsheet shortcuts:</strong> click to select a cell,
-            drag or shift-click for a range, arrow keys to move, double-click
-            (or Enter / F2 / start typing) to edit, Tab/Enter commits.
-            Cmd/Ctrl+C, V, X for copy / paste / cut — works with Excel & Google
-            Sheets. Delete or Backspace clears, Esc cancels.
+            <strong>Spreadsheet shortcuts:</strong> click to select, drag or
+            shift-click for a range, arrow keys to move, shift+arrow to extend
+            the range. Double-click / Enter / F2 / start typing to edit (Tab
+            and Enter commit). Cmd/Ctrl+C, V, X copy / paste / cut — works
+            with Excel & Google Sheets. Read-only columns (Inventory, Gap…)
+            are still selectable for copy. Delete / Backspace clears, Esc
+            cancels.
           </p>
         </div>
       </div>
@@ -1091,18 +1160,20 @@ export default function PurchasePlanning() {
                       {row.getVisibleCells().map((cell) => {
                         const colId = cell.column.id
                         const colIdx = colIdxByColId.get(colId)
-                        const isEditable = colIdx !== undefined
-                        const inRange = isEditable && selBox != null
+                        // colIdx === undefined for non-selectable cols (just 'actions').
+                        const isSelectable = colIdx !== undefined
+                        const colMeta = isSelectable ? gridColumnMeta[colIdx] : null
+                        const isEditable = !!colMeta?.editable
+                        const inRange = isSelectable && selBox != null
                           && rIdx >= selBox.rs && rIdx <= selBox.re
                           && colIdx >= selBox.cs && colIdx <= selBox.ce
-                        const isAnchor = isEditable && selection.anchor
+                        const isAnchor = isSelectable && selection.anchor
                           && selection.anchor.rowIdx === rIdx && selection.anchor.colIdx === colIdx
                         const isEditing = isEditable && editing
                           && editing.rowIdx === rIdx && editing.colIdx === colIdx
                         const tdStyle = {
-                          padding: 0,  // inner display/editor owns the padding
+                          padding: 0,
                           background: inRange && !isAnchor ? '#dbeafe' : 'transparent',
-                          // Active cell gets a thicker spreadsheet-style outline.
                           boxShadow: isAnchor
                             ? 'inset 0 0 0 2px #1d4ed8'
                             : (inRange ? 'inset 0 0 0 1px #93c5fd' : 'none'),
@@ -1110,14 +1181,29 @@ export default function PurchasePlanning() {
                           height: 28,
                           verticalAlign: 'middle',
                         }
-                        if (!isEditable) {
+                        // Non-selectable (e.g. the actions column): no selection visuals.
+                        if (!isSelectable) {
                           return (
-                            <td key={cell.id} style={{ ...tdStyle, padding: '4px 8px' }}>
+                            <td key={cell.id} style={{ padding: '4px 8px' }}>
                               {flexRender(cell.column.columnDef.cell, cell.getContext())}
                             </td>
                           )
                         }
-                        const colMeta = editableColumnMeta[colIdx]
+                        // Read-only but selectable: keep the column's existing
+                        // formatted renderer (coloured gap / net values etc.) and
+                        // wrap with selection styles + handlers. No double-click.
+                        if (!isEditable) {
+                          return (
+                            <td
+                              key={cell.id}
+                              style={{ ...tdStyle, padding: '4px 8px' }}
+                              onMouseDown={(e) => handleCellMouseDown(e, rIdx, colIdx)}
+                              onMouseEnter={() => handleCellMouseEnter(rIdx, colIdx)}
+                            >
+                              {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                            </td>
+                          )
+                        }
                         return (
                           <td
                             key={cell.id}
