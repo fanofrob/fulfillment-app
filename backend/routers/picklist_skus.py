@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -13,6 +13,8 @@ from services import sheets_service
 
 router = APIRouter()
 
+PicklistCategory = Literal["Basic", "Tropical", "Exotic"]
+
 
 class PicklistSkuUpdate(BaseModel):
     customer_description: Optional[str] = None
@@ -21,7 +23,7 @@ class PicklistSkuUpdate(BaseModel):
     pactor: Optional[float] = None
     temperature: Optional[str] = None
     type: Optional[str] = None
-    category: Optional[str] = None
+    category: Optional[PicklistCategory] = None
     status: Optional[str] = None
     cc_item_id: Optional[str] = None
     notes: Optional[str] = None
@@ -104,6 +106,7 @@ def get_missing_cogs_skus(db: Session = Depends(get_db)):
 @router.get("/")
 def list_picklist_skus(
     search: Optional[str] = Query(None),
+    category: Optional[str] = Query(None, description="Filter by category. Use 'uncategorized' for NULL."),
     skip: int = Query(0, ge=0),
     limit: int = Query(200, ge=1, le=2000),
     db: Session = Depends(get_db),
@@ -115,6 +118,13 @@ def list_picklist_skus(
             models.PicklistSku.pick_sku.ilike(s) |
             models.PicklistSku.customer_description.ilike(s)
         )
+    if category:
+        if category == "uncategorized":
+            q = q.filter(models.PicklistSku.category.is_(None))
+        elif category in models.PICKLIST_CATEGORIES:
+            q = q.filter(models.PicklistSku.category == category)
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid category. Must be one of {list(models.PICKLIST_CATEGORIES)} or 'uncategorized'.")
     total = q.count()
     items = q.order_by(models.PicklistSku.customer_description).offset(skip).limit(limit).all()
     return {"total": total, "items": [_to_dict(i) for i in items]}

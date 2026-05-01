@@ -3,6 +3,8 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 import { picklistSkusApi } from '../api'
 
+const PICKLIST_CATEGORIES = ['Basic', 'Tropical', 'Exotic']
+
 const EDITABLE_FIELDS = [
   { key: 'type',                 label: 'Pick Type',         type: 'text',   width: 140 },
   { key: 'weight_lb',            label: 'Weight (lb)',       type: 'number', width: 90 },
@@ -12,7 +14,7 @@ const EDITABLE_FIELDS = [
   { key: 'pactor_multiplier',    label: 'Pactor Mult.',      type: 'number', width: 90 },
   { key: 'pactor',               label: 'Pactor',            type: 'number', width: 80 },
   { key: 'temperature',          label: 'Temperature',       type: 'text',   width: 120 },
-  { key: 'category',             label: 'Category',          type: 'text',   width: 110 },
+  { key: 'category',             label: 'Category',          type: 'select', width: 110, options: PICKLIST_CATEGORIES },
   { key: 'status',               label: 'Status',            type: 'text',   width: 100 },
   { key: 'cc_item_id',           label: 'CC Item ID',        type: 'text',   width: 100 },
   { key: 'days_til_expiration',  label: 'Days til Expiry',   type: 'number', width: 110 },
@@ -63,13 +65,24 @@ function EditableRow({ item, onSave, prefixCells = null, fields = EDITABLE_FIELD
         {prefixCells}
         {fields.map(f => (
           <td key={f.key}>
-            <input
-              type={f.type === 'number' ? 'number' : 'text'}
-              value={draft[f.key] ?? ''}
-              onChange={e => setDraft(d => ({ ...d, [f.key]: e.target.value }))}
-              style={{ width: f.width - 16, fontSize: 12, padding: '2px 4px', border: '1px solid #93c5fd', borderRadius: 3 }}
-              step={f.type === 'number' ? 'any' : undefined}
-            />
+            {f.type === 'select' ? (
+              <select
+                value={draft[f.key] ?? ''}
+                onChange={e => setDraft(d => ({ ...d, [f.key]: e.target.value }))}
+                style={{ width: f.width - 16, fontSize: 12, padding: '2px 4px', border: '1px solid #93c5fd', borderRadius: 3 }}
+              >
+                <option value="">—</option>
+                {f.options.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+              </select>
+            ) : (
+              <input
+                type={f.type === 'number' ? 'number' : 'text'}
+                value={draft[f.key] ?? ''}
+                onChange={e => setDraft(d => ({ ...d, [f.key]: e.target.value }))}
+                style={{ width: f.width - 16, fontSize: 12, padding: '2px 4px', border: '1px solid #93c5fd', borderRadius: 3 }}
+                step={f.type === 'number' ? 'any' : undefined}
+              />
+            )}
           </td>
         ))}
         <td style={{ whiteSpace: 'nowrap' }}>
@@ -115,13 +128,19 @@ export default function PicklistSkus() {
   const filter = urlParams.get('filter') || ''
   const isMissingCogs = filter === 'missing-cogs'
   const [search, setSearch] = useState(urlParams.get('search') || '')
+  const [categoryFilter, setCategoryFilter] = useState(urlParams.get('category') || '')
   const [page, setPage] = useState(0)
   const limit = 200
   const [syncResult, setSyncResult] = useState(null)
 
   const { data = { total: 0, items: [] }, isLoading } = useQuery({
-    queryKey: ['picklist-skus', search, page],
-    queryFn: () => picklistSkusApi.list({ search: search || undefined, skip: page * limit, limit }),
+    queryKey: ['picklist-skus', search, categoryFilter, page],
+    queryFn: () => picklistSkusApi.list({
+      search: search || undefined,
+      category: categoryFilter || undefined,
+      skip: page * limit,
+      limit,
+    }),
     enabled: !isMissingCogs,
   })
 
@@ -188,12 +207,24 @@ export default function PicklistSkus() {
 
       <div className="toolbar">
         {!isMissingCogs && (
-          <input
-            placeholder="Search SKU or description..."
-            value={search}
-            onChange={e => { setSearch(e.target.value); setPage(0) }}
-            style={{ minWidth: 240 }}
-          />
+          <>
+            <input
+              placeholder="Search SKU or description..."
+              value={search}
+              onChange={e => { setSearch(e.target.value); setPage(0) }}
+              style={{ minWidth: 240 }}
+            />
+            <select
+              value={categoryFilter}
+              onChange={e => { setCategoryFilter(e.target.value); setPage(0) }}
+              style={{ fontSize: 13, padding: '4px 6px' }}
+              title="Filter by category"
+            >
+              <option value="">All categories</option>
+              {PICKLIST_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+              <option value="uncategorized">Uncategorized</option>
+            </select>
+          </>
         )}
         <button
           className="btn btn-primary"

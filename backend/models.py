@@ -2,6 +2,8 @@ from sqlalchemy import Column, Integer, String, Float, Boolean, Date, DateTime, 
 from sqlalchemy.sql import func
 from database import Base
 
+PICKLIST_CATEGORIES = ("Basic", "Tropical", "Exotic")
+
 class PicklistSku(Base):
     __tablename__ = "picklist_skus"
     id = Column(Integer, primary_key=True, index=True)
@@ -12,7 +14,7 @@ class PicklistSku(Base):
     pactor = Column(Float, nullable=True)
     temperature = Column(String, nullable=True)
     type = Column(String, nullable=True)
-    category = Column(String, nullable=True)  # 'fruit' | 'packaging' | other
+    category = Column(String, nullable=True)  # one of PICKLIST_CATEGORIES, or NULL = uncategorized
     status = Column(String, nullable=True)
     cc_item_id = Column(String, nullable=True)
     notes = Column(Text, nullable=True)
