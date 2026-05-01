@@ -24,6 +24,25 @@ function fmtNum(v, digits = 1) {
   return n.toFixed(digits)
 }
 
+// "Converted Order" amount: case-aware purchase quantity for a row.
+// - case_weight_lbs > 0 → ceil(purchase_weight / case_weight) "cases"
+// - otherwise           → purchase_weight "lbs"
+// - missing purchase_weight → ''
+// Used both by the column cell and by the vendor-popover copy-paste text.
+function fmtConvertedOrder(row) {
+  const w = row?.purchase_weight_lbs
+  if (w == null || w === '') return ''
+  const wn = Number(w)
+  if (Number.isNaN(wn)) return ''
+  const cw = Number(row.case_weight_lbs)
+  if (cw > 0) {
+    const cases = Math.ceil(wn / cw)
+    return `${cases} case${cases === 1 ? '' : 's'}`
+  }
+  const text = Number.isInteger(wn) ? String(wn) : wn.toFixed(1)
+  return `${text} lbs`
+}
+
 function fmtPeriodLabel(p) {
   if (!p) return ''
   const start = p.start_datetime ? new Date(p.start_datetime).toLocaleDateString() : ''
@@ -514,18 +533,9 @@ export default function PurchasePlanning() {
       },
     },
     {
-      colId: 'quantity',
-      editable: true,
-      editorType: 'number',
-      getValue: (row) => row.quantity == null ? '' : String(row.quantity),
-      getDisplay: (row) => numStr(row.quantity),
-      parseValue: (str) => {
-        const t = String(str ?? '').trim()
-        if (t === '') return { quantity: null }
-        const n = Number(t)
-        if (Number.isNaN(n)) return null
-        return { quantity: n }
-      },
+      colId: 'converted_order',
+      editable: false,
+      getValue: (row) => fmtConvertedOrder(row),
     },
     {
       colId: 'shipping_status',
@@ -746,11 +756,11 @@ export default function PurchasePlanning() {
       enableColumnFilter: false,
     },
     {
-      id: 'quantity',
-      header: 'Qty (cases / lb / pieces)',
-      accessorKey: 'quantity',
-      cell: ({ row }) => fmtNum(row.original.quantity),
-      sortingFn: 'basic',
+      id: 'converted_order',
+      header: 'Converted Order',
+      accessorFn: (row) => fmtConvertedOrder(row),
+      cell: ({ row }) => fmtConvertedOrder(row.original) || '—',
+      enableSorting: false,
       enableColumnFilter: false,
     },
     {
@@ -1486,7 +1496,6 @@ export default function PurchasePlanning() {
           vendor={vendors.find((v) => v.id === vendorInfo.vendorId)}
           items={items.filter((it) => it.vendor_id === vendorInfo.vendorId)}
           onClose={() => setVendorInfo(null)}
-          period={period}
         />
       )}
     </div>
@@ -1498,34 +1507,24 @@ export default function PurchasePlanning() {
 // contact + address and a copy-paste-ready summary of every planned product
 // type for this vendor in the current period.
 
-function fmtPurchaseAmount(item) {
-  // Prefer the "rounded up to whole case" helper when available, so the line
-  // matches the actual amount they'll buy. Fall back to the raw weight.
-  const lbs = item.purchase_weight_helper_lbs ?? item.purchase_weight_lbs
-  if (lbs == null || lbs === '') return 'TBD lbs'
-  const n = Number(lbs)
-  if (Number.isNaN(n)) return 'TBD lbs'
-  // Drop the decimal when it's already a whole number — looks cleaner in a
-  // copy-pasted message than "100.0 lbs".
-  const text = Number.isInteger(n) ? String(n) : n.toFixed(1)
-  return `${text} lbs`
-}
-
 function buildPlannedItemsText(items) {
-  // One line per row: "<amount> <product_type>" — with the substitute noted
-  // in parentheses when set, so a recipient sees both options together.
+  // One line per row: "<converted-order> <product_type>".
+  // - When sub_product_type is set, that substitute IS what we're ordering
+  //   from this vendor, so use it and hide the base product type.
+  // - Amount uses the same case-vs-lbs rule as the on-screen Converted
+  //   Order column, so the copy-pasted message matches the table.
   // Format is intentionally plain so it can be pasted into email, SMS, or
   // WhatsApp without losing structure.
   return items
     .map((it) => {
-      const amount = fmtPurchaseAmount(it)
-      const sub = it.sub_product_type ? ` (or ${it.sub_product_type})` : ''
-      return `${amount} ${it.product_type}${sub}`
+      const amount = fmtConvertedOrder(it) || 'TBD'
+      const name = it.sub_product_type || it.product_type
+      return `${amount} ${name}`
     })
     .join('\n')
 }
 
-function VendorInfoPopover({ vendor, items, anchorRect, onClose, period }) {
+function VendorInfoPopover({ vendor, items, anchorRect, onClose }) {
   const [copied, setCopied] = useState(false)
   useEffect(() => {
     function onKey(e) {
@@ -1556,11 +1555,10 @@ function VendorInfoPopover({ vendor, items, anchorRect, onClose, period }) {
   if (left + PANEL_W > vw - margin) left = vw - PANEL_W - margin
   if (left < margin) left = margin
 
-  const itemsText = buildPlannedItemsText(items)
-  const headerText = period?.name
-    ? `${vendor.name} — ${period.name}`
-    : vendor.name
-  const fullCopyText = `${headerText}\n\n${itemsText}`
+  // Body of the copy/paste textarea is just the items list — vendor name and
+  // period are already visible to the user in the popover header and the
+  // page itself, so including them in the pasted message is just noise.
+  const fullCopyText = buildPlannedItemsText(items)
 
   async function handleCopy() {
     try {
