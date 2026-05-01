@@ -220,6 +220,14 @@ const cellDisplayStyle = {
   userSelect: 'none',
 }
 
+// Frozen left columns: stay pinned during horizontal scroll. Each entry's
+// `left` is the cumulative width of the columns before it.
+const STICKY_COLS = {
+  vendor:       { left: 0,   width: 200 },
+  product_type: { left: 200, width: 220 },
+}
+const STICKY_LEFT_TOTAL = 200 + 220
+
 // ── Column filter input (per-column) ───────────────────────────────────────
 function ColumnFilter({ column }) {
   const value = column.getFilterValue() ?? ''
@@ -1094,8 +1102,23 @@ export default function PurchasePlanning() {
                     const canSort = header.column.getCanSort()
                     const canFilter = header.column.getCanFilter()
                     const canGroup = header.column.getCanGroup()
+                    const sticky = STICKY_COLS[header.column.id]
+                    const thStyle = {
+                      verticalAlign: 'top',
+                      ...(sticky && {
+                        position: 'sticky',
+                        left: sticky.left,
+                        // thead is already sticky-top; combining left+top
+                        // lets the corner cells stay pinned during scroll
+                        // in either direction.
+                        zIndex: 3,
+                        background: '#f8f8f8',
+                        width: sticky.width,
+                        minWidth: sticky.width,
+                      }),
+                    }
                     return (
-                      <th key={header.id} style={{ verticalAlign: 'top' }}>
+                      <th key={header.id} style={thStyle}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                           {canGroup && (
                             <button
@@ -1180,15 +1203,28 @@ export default function PurchasePlanning() {
                           && selection.anchor.rowIdx === rIdx && selection.anchor.colIdx === colIdx
                         const isEditing = isEditable && editing
                           && editing.rowIdx === rIdx && editing.colIdx === colIdx
+                        // Sticky-left styling for the frozen first columns.
+                        // Sticky cells need an opaque background or the cells
+                        // they overlap during horizontal scroll bleed through.
+                        const sticky = STICKY_COLS[colId]
+                        const stickyStyle = sticky ? {
+                          position: 'sticky',
+                          left: sticky.left,
+                          zIndex: 1,
+                          width: sticky.width,
+                          minWidth: sticky.width,
+                        } : {}
+                        const rangeBg = inRange && !isAnchor ? '#dbeafe' : null
                         const tdStyle = {
                           padding: 0,
-                          background: inRange && !isAnchor ? '#dbeafe' : 'transparent',
+                          background: rangeBg ?? (sticky ? '#fff' : 'transparent'),
                           boxShadow: isAnchor
                             ? 'inset 0 0 0 2px #1d4ed8'
                             : (inRange ? 'inset 0 0 0 1px #93c5fd' : 'none'),
-                          position: 'relative',
+                          position: sticky ? 'sticky' : 'relative',
                           height: 28,
                           verticalAlign: 'middle',
+                          ...stickyStyle,
                         }
                         // Non-selectable (e.g. the actions column): no selection visuals.
                         if (!isSelectable) {
