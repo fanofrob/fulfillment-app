@@ -1094,7 +1094,11 @@ export default function PurchasePlanning() {
           }}
         >
           <table className="data-table" style={{ minWidth: 1600 }}>
-            <thead>
+            {/* The global CSS sets thead { z-index: 1 }, but the body's
+                sticky-left cells are also at z:1 — so they paint over the
+                header (later in document order wins). Bump thead higher so
+                rows scroll under the header instead of through it. */}
+            <thead style={{ zIndex: 4 }}>
               {table.getHeaderGroups().map((hg) => (
                 <tr key={hg.id}>
                   {hg.headers.map((header) => {
