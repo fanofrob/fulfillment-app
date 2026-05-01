@@ -219,15 +219,6 @@ def get_sku_mappings(warehouse: str, search: str = None, skip: int = 0, limit: i
     return all_rows[skip: skip + limit]
 
 
-def get_sku_mappings_both(search: str = None, skip: int = 0, limit: int = 50, errors_only: bool = False):
-    """Return mappings from both warehouses, interleaved by shopify_sku."""
-    walnut = get_sku_mappings("walnut", search=search, skip=0, limit=10000, errors_only=errors_only)
-    northlake = get_sku_mappings("northlake", search=search, skip=0, limit=10000, errors_only=errors_only)
-    combined = walnut + northlake
-    combined.sort(key=lambda r: (r["shopify_sku"], r["warehouse"]))
-    return combined[skip: skip + limit]
-
-
 # ── Period-Specific SKU Mappings ──────────────────────────────────────────────
 
 def get_period_sku_mappings(tab_name: str, search: str = None, skip: int = 0, limit: int = 50):
@@ -691,11 +682,9 @@ def get_no_bundle_skus() -> set:
 
 def _get_bundle_mapping_lookup_base(warehouse: str) -> dict:
     """
-    Base Shopify SKU → pick SKU lookup before helper indirection.
-    Reads from the bundle_mappings DB table (canonical source). Falls back to
-    Google Sheets only when the DB has no active rows for the warehouse — i.e.
-    the brief window between deploying DB-backed mappings and running the
-    first /api/sku-mappings/refresh.
+    Base Shopify SKU → pick SKU lookup before helper indirection. Reads from the
+    bundle_mappings DB table (canonical source as of phase 2). Returns an empty
+    dict when no active rows exist for the warehouse.
     """
     from database import SessionLocal
     import models
@@ -706,28 +695,13 @@ def _get_bundle_mapping_lookup_base(warehouse: str) -> dict:
             models.BundleMapping.warehouse == warehouse,
             models.BundleMapping.is_active == True,
         ).all()
-        if rows:
-            for r in rows:
-                if r.shopify_sku not in result:
-                    result[r.shopify_sku] = []
-                result[r.shopify_sku].append({
-                    "pick_sku": r.pick_sku,
-                    "mix_quantity": r.mix_quantity or 1.0,
-                })
-            return result
-
-    # DB empty for this warehouse — read directly from sheets as a transitional fallback.
-    sheet_rows = get_sku_mappings(warehouse, skip=0, limit=100000)
-    for r in sheet_rows:
-        sku = r.get("shopify_sku")
-        if not sku:
-            continue
-        if sku not in result:
-            result[sku] = []
-        result[sku].append({
-            "pick_sku": r["pick_sku"],
-            "mix_quantity": r.get("mix_quantity") or 1.0,
-        })
+        for r in rows:
+            if r.shopify_sku not in result:
+                result[r.shopify_sku] = []
+            result[r.shopify_sku].append({
+                "pick_sku": r.pick_sku,
+                "mix_quantity": r.mix_quantity or 1.0,
+            })
     return result
 
 
