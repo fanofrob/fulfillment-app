@@ -861,6 +861,10 @@ class PurchasePlanLine(Base):
     # set can be expanded without a migration; UI restricts it to a known list.
     shipping_status       = Column(String, nullable=True)
     notes                 = Column(Text, nullable=True)
+    # When set, this plan row is the source of truth for a PO line. Edits to
+    # the plan row mirror to that line; vendor change clears the link and the
+    # old PO line is deleted (caller is expected to re-link to a new PO).
+    purchase_order_line_id = Column(Integer, ForeignKey("purchase_order_lines.id"), nullable=True, unique=True, index=True)
     created_at            = Column(DateTime(timezone=True), server_default=func.now())
     updated_at            = Column(DateTime(timezone=True), onupdate=func.now())
 

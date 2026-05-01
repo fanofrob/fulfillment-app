@@ -1,5 +1,6 @@
-import React, { useState, useMemo } from 'react'
+import React, { useState, useMemo, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useSearchParams } from 'react-router-dom'
 import { purchaseOrdersApi, vendorsApi, projectionPeriodsApi, receivingApi } from '../api'
 
 const PO_STATUSES = ['draft', 'placed', 'in_transit', 'partially_received', 'delivered', 'imported', 'reconciled']
@@ -39,6 +40,7 @@ const EMPTY_LINE = {
 
 export default function PurchaseOrders() {
   const qc = useQueryClient()
+  const [urlParams, setUrlParams] = useSearchParams()
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [showDetailModal, setShowDetailModal] = useState(null)
   const [showLineModal, setShowLineModal] = useState(false)
@@ -130,6 +132,33 @@ export default function PurchaseOrders() {
   function refreshDetail(poId) {
     purchaseOrdersApi.get(poId).then(po => { setShowDetailModal(po); qc.invalidateQueries(['purchase-orders']) })
   }
+
+  // Deep-link: ?po=N opens that PO's detail modal on mount. Used by the
+  // "Open PO" link from the Purchase Planning page.
+  useEffect(() => {
+    const poId = urlParams.get('po')
+    if (!poId) return
+    if (showDetailModal && String(showDetailModal.id) === String(poId)) return
+    purchaseOrdersApi.get(Number(poId)).then(po => {
+      setShowDetailModal(po)
+      loadReceivingRecords(po.id)
+    }).catch(() => {
+      // PO doesn't exist (e.g. deleted) — clear the param so we don't loop.
+      const np = new URLSearchParams(urlParams)
+      np.delete('po')
+      setUrlParams(np, { replace: true })
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlParams.get('po')])
+
+  // Keep the URL ?po=N in sync when the modal opens/closes via in-page UI.
+  useEffect(() => {
+    const np = new URLSearchParams(urlParams)
+    if (showDetailModal) np.set('po', String(showDetailModal.id))
+    else np.delete('po')
+    if (np.toString() !== urlParams.toString()) setUrlParams(np, { replace: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showDetailModal?.id])
 
   function closeCreateModal() {
     setShowCreateModal(false)
@@ -481,6 +510,11 @@ export default function PurchaseOrders() {
                         <td style={{ padding: '6px 8px', fontWeight: 500 }}>
                           {line.product_type}
                           {line.overage_flag && <span style={{ color: '#f59e0b', marginLeft: 6, fontSize: 11 }}>OVERAGE</span>}
+                          {line.purchase_plan_line_id && (
+                            <span title="This line is managed by a Purchase Planning row. Edit there." style={{ color: '#3b82f6', marginLeft: 6, fontSize: 11 }}>
+                              ⌁ from planning
+                            </span>
+                          )}
                         </td>
                         <td style={{ padding: '6px 8px' }}>{line.quantity_cases}</td>
                         <td style={{ padding: '6px 8px' }}>{line.case_weight_lbs ?? '—'} lbs</td>
@@ -505,7 +539,7 @@ export default function PurchaseOrders() {
                           {canReceive && (
                             <button className="btn btn-xs btn-primary" onClick={() => openReceiveForm(line)}>Receive</button>
                           )}
-                          {showDetailModal.status === 'draft' && (
+                          {showDetailModal.status === 'draft' && !line.purchase_plan_line_id && (
                             <button className="btn btn-xs btn-danger" onClick={() => deleteLineMut.mutate({ poId: showDetailModal.id, lineId: line.id })}>Del</button>
                           )}
                         </td>

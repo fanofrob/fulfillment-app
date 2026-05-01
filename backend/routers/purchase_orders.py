@@ -70,6 +70,14 @@ def _build_po_response(db: Session, po: models.PurchaseOrder) -> schemas.Purchas
     lines_db = db.query(models.PurchaseOrderLine).filter(
         models.PurchaseOrderLine.purchase_order_id == po.id
     ).all()
+    line_ids = [l.id for l in lines_db]
+    plan_link_by_line = {}
+    if line_ids:
+        plan_rows = db.query(
+            models.PurchasePlanLine.purchase_order_line_id,
+            models.PurchasePlanLine.id,
+        ).filter(models.PurchasePlanLine.purchase_order_line_id.in_(line_ids)).all()
+        plan_link_by_line = {line_id: plan_id for line_id, plan_id in plan_rows}
 
     lines_resp = []
     for line in lines_db:
@@ -82,6 +90,7 @@ def _build_po_response(db: Session, po: models.PurchaseOrder) -> schemas.Purchas
         total_effective = sum(a.effective_lbs for a in allocations) if allocations else 0
         if total_effective > 0 and line.total_weight_lbs:
             lr.overage_flag = line.total_weight_lbs > total_effective * 1.1
+        lr.purchase_plan_line_id = plan_link_by_line.get(line.id)
         lines_resp.append(lr)
 
     resp = schemas.PurchaseOrderResponse.model_validate(po)
@@ -206,10 +215,16 @@ def delete_purchase_order(po_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "Purchase order not found")
     if po.status != "draft":
         raise HTTPException(400, "Only draft POs can be deleted")
-    # Delete allocations, lines, then PO
+    # Delete allocations, lines, then PO. Clear plan-row links for any of the
+    # lines we're about to delete so plan rows fall back to "unbound" cleanly.
     lines = db.query(models.PurchaseOrderLine).filter(
         models.PurchaseOrderLine.purchase_order_id == po_id
     ).all()
+    line_ids = [l.id for l in lines]
+    if line_ids:
+        db.query(models.PurchasePlanLine).filter(
+            models.PurchasePlanLine.purchase_order_line_id.in_(line_ids)
+        ).update({models.PurchasePlanLine.purchase_order_line_id: None}, synchronize_session=False)
     for line in lines:
         db.query(models.PurchaseOrderPeriodAllocation).filter(
             models.PurchaseOrderPeriodAllocation.po_line_id == line.id
@@ -300,6 +315,10 @@ def delete_po_line(po_id: int, line_id: int, db: Session = Depends(get_db)):
     ).first()
     if not line:
         raise HTTPException(404, "PO line not found")
+    # Clear any plan-row link before delete so the plan row falls back to "unbound".
+    db.query(models.PurchasePlanLine).filter(
+        models.PurchasePlanLine.purchase_order_line_id == line_id
+    ).update({models.PurchasePlanLine.purchase_order_line_id: None}, synchronize_session=False)
     db.query(models.PurchaseOrderPeriodAllocation).filter(
         models.PurchaseOrderPeriodAllocation.po_line_id == line.id
     ).delete()

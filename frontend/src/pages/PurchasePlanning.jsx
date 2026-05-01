@@ -9,11 +9,12 @@ import {
   getExpandedRowModel,
   flexRender,
 } from '@tanstack/react-table'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams, useNavigate } from 'react-router-dom'
 import {
   purchasePlanningApi,
   projectionPeriodsApi,
   vendorsApi,
+  purchaseOrdersApi,
 } from '../api'
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -118,6 +119,10 @@ function CellEditor({
   vendors,
   productTypes,
   baseProductType,
+  // PO-editor only:
+  eligiblePos,
+  eligiblePosLoading,
+  noVendor,
   onCommit,   // (advanceDir: 'down' | 'up' | 'right' | 'left' | null) => void; reads draft via ref
   onCancel,
 }) {
@@ -249,6 +254,44 @@ function CellEditor({
     )
   }
 
+  if (editorType === 'po') {
+    // PO link selector. Option values are sentinels handled by the page's
+    // commit handler (not parseValue): "" → unlink, "new" → create new PO,
+    // "<id>" → link to existing PO. eligiblePos is fetched lazily for the
+    // row's vendor before this mounts; if it's still loading we show a
+    // disabled placeholder.
+    return (
+      <select
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value)
+          setTimeout(() => commitNow('down'), 0)
+        }}
+        onBlur={() => commitNow(null)}
+        onKeyDown={onKey}
+        disabled={noVendor || eligiblePosLoading}
+        style={editorBaseStyle}
+      >
+        {noVendor ? (
+          <option value="">— set a vendor first —</option>
+        ) : eligiblePosLoading ? (
+          <option value="">loading…</option>
+        ) : (
+          <>
+            <option value="">— (unlink)</option>
+            <option value="new">+ New PO</option>
+            {(eligiblePos || []).map((p) => (
+              <option key={p.id} value={String(p.id)}>
+                {p.po_number} [{p.status}]
+              </option>
+            ))}
+          </>
+        )}
+      </select>
+    )
+  }
+
   // number
   return (
     <input
@@ -305,6 +348,141 @@ function ColumnFilter({ column }) {
     />
   )
 }
+
+// ── PO cell chip ──────────────────────────────────────────────────────────
+// Rendered inside the PO # cell when the row is bound to a PO. Two pieces:
+// the PO label + status badge, and a small "↗" button that navigates to the
+// PO detail modal. Hovering anywhere on the chip pops up a summary panel
+// (vendor / dates / lines / subtotal) — fetched lazily and cached.
+const PO_STATUS_COLORS = {
+  draft: '#e5e7eb', placed: '#bfdbfe', in_transit: '#c4b5fd',
+  partially_received: '#fde68a', delivered: '#bbf7d0',
+  imported: '#6ee7b7', reconciled: '#9ca3af',
+}
+
+function PoCellChip({ poId, poNumber, poStatus }) {
+  const navigate = useNavigate()
+  const [hover, setHover] = useState(false)
+  const [anchorRect, setAnchorRect] = useState(null)
+  const wrapRef = useRef(null)
+  const timerRef = useRef(null)
+
+  function showSoon(e) {
+    if (timerRef.current) clearTimeout(timerRef.current)
+    const rect = wrapRef.current?.getBoundingClientRect()
+    timerRef.current = setTimeout(() => {
+      setAnchorRect(rect ? { top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right } : null)
+      setHover(true)
+    }, 200)
+  }
+  function hideSoon() {
+    if (timerRef.current) clearTimeout(timerRef.current)
+    timerRef.current = setTimeout(() => setHover(false), 100)
+  }
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current) }, [])
+
+  return (
+    <span
+      ref={wrapRef}
+      style={poChipWrapStyle}
+      onMouseEnter={showSoon}
+      onMouseLeave={hideSoon}
+    >
+      <span style={poChipLabelStyle}>{poNumber}</span>
+      <span style={{ ...poStatusBadgeStyle, background: PO_STATUS_COLORS[poStatus] || '#e5e7eb' }}>
+        {poStatus}
+      </span>
+      <button
+        type="button"
+        title={`Open ${poNumber}`}
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation()
+          navigate(`/purchase-orders?po=${poId}`)
+        }}
+        style={poOpenIconStyle}
+      >↗</button>
+      {hover && anchorRect && <PoSummaryPopover poId={poId} anchorRect={anchorRect} />}
+    </span>
+  )
+}
+
+function PoSummaryPopover({ poId, anchorRect }) {
+  const { data: po, isLoading } = useQuery({
+    queryKey: ['po-summary', poId],
+    queryFn: () => purchaseOrdersApi.get(poId),
+    staleTime: 30_000,
+  })
+
+  const PANEL_W = 280
+  const margin = 8
+  const vw = typeof window !== 'undefined' ? window.innerWidth : 1200
+  let top = (anchorRect?.bottom ?? 100) + margin
+  let left = (anchorRect?.left ?? 100)
+  if (left + PANEL_W > vw - margin) left = vw - PANEL_W - margin
+  if (left < margin) left = margin
+
+  return (
+    <div
+      style={{
+        ...popoverPanelStyle,
+        top, left, width: PANEL_W,
+        // No backdrop — popover sits inline under the chip and dismisses on mouseleave.
+        pointerEvents: 'none',
+      }}
+    >
+      <div style={{ padding: 10, fontSize: 12, lineHeight: 1.5 }}>
+        {isLoading || !po ? (
+          <span style={{ color: '#9ca3af' }}>Loading…</span>
+        ) : (
+          <>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>{po.po_number}</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '2px 8px', color: '#374151' }}>
+              <span style={{ color: '#6b7280' }}>Vendor</span><span>{po.vendor_name || '—'}</span>
+              <span style={{ color: '#6b7280' }}>Status</span><span style={{ textTransform: 'capitalize' }}>{po.status?.replace(/_/g, ' ')}</span>
+              <span style={{ color: '#6b7280' }}>Order date</span><span>{po.order_date ? new Date(po.order_date).toLocaleDateString() : '—'}</span>
+              <span style={{ color: '#6b7280' }}>Expected</span><span>{po.expected_delivery_date ? new Date(po.expected_delivery_date).toLocaleDateString() : '—'}</span>
+              <span style={{ color: '#6b7280' }}>Lines</span><span>{po.lines?.length ?? 0}</span>
+              <span style={{ color: '#6b7280' }}>Subtotal</span><span>{po.subtotal != null ? `$${Number(po.subtotal).toFixed(2)}` : '—'}</span>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const poChipWrapStyle = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 4,
+  padding: '2px 4px',
+  fontSize: 12,
+  cursor: 'cell',
+  userSelect: 'none',
+  whiteSpace: 'nowrap',
+}
+const poChipLabelStyle = {
+  fontVariantNumeric: 'tabular-nums',
+}
+const poStatusBadgeStyle = {
+  fontSize: 10,
+  padding: '1px 5px',
+  borderRadius: 4,
+  textTransform: 'capitalize',
+  color: '#1f2937',
+}
+const poOpenIconStyle = {
+  marginLeft: 2,
+  padding: '0 4px',
+  background: 'transparent',
+  border: 'none',
+  color: '#3b82f6',
+  cursor: 'pointer',
+  fontSize: 13,
+  lineHeight: 1,
+}
+
 
 // ── Page ───────────────────────────────────────────────────────────────────
 export default function PurchasePlanning() {
@@ -403,6 +581,18 @@ export default function PurchasePlanning() {
       qc.invalidateQueries({ queryKey: ['purchase-planning', periodId] })
     },
     onError: (err) => setActionMsg(`Seed failed: ${err?.response?.data?.detail || err.message}`),
+  })
+  // Wires the PO # column to the backend. Action shape mirrors the API:
+  //   { id, body: { action: 'unlink' } | { action: 'create' } | { action: 'link', purchase_order_id }
+  const setPoMut = useMutation({
+    mutationFn: ({ id, body }) => purchasePlanningApi.setPo(id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['purchase-planning', periodId] })
+      // The eligible-PO list could shift (a "create" added one, an "unlink"
+      // may have deleted an empty PO); refresh both sides.
+      qc.invalidateQueries({ queryKey: ['eligible-pos'] })
+    },
+    onError: (err) => setActionMsg(`Could not update PO: ${err?.response?.data?.detail || err.message}`),
   })
 
   function handleUpdate(id, patch) {
@@ -536,6 +726,19 @@ export default function PurchasePlanning() {
       colId: 'converted_order',
       editable: false,
       getValue: (row) => fmtConvertedOrder(row),
+    },
+    {
+      // PO link cell. Editor commits go through a custom path in the cell
+      // render (it calls setPoMut, not updateMut), so parseValue is unused
+      // here — we treat copy/paste as a no-op for this column.
+      colId: 'purchase_order',
+      editable: true,
+      editorType: 'po',
+      getValue: (row) => row.purchase_order_id != null ? String(row.purchase_order_id) : '',
+      getDisplay: (row) => row.purchase_order_number
+        ? `${row.purchase_order_number} [${row.purchase_order_status || '?'}]`
+        : '—',
+      parseValue: () => null,
     },
     {
       colId: 'shipping_status',
@@ -764,6 +967,15 @@ export default function PurchasePlanning() {
       enableColumnFilter: false,
     },
     {
+      id: 'purchase_order',
+      header: 'PO #',
+      accessorKey: 'purchase_order_number',
+      cell: ({ row }) => row.original.purchase_order_number
+        ? `${row.original.purchase_order_number} [${row.original.purchase_order_status || '?'}]`
+        : '—',
+      filterFn: 'includesString',
+    },
+    {
       id: 'shipping_status',
       header: 'Shipping Status',
       accessorKey: 'shipping_status',
@@ -796,6 +1008,18 @@ export default function PurchasePlanning() {
     [table.getRowModel().rows],
   )
   dataRowsRef.current = dataRows
+
+  // Eligible PO list for the row currently being edited. Lazy: only fetched
+  // when a PO-cell editor is open, keyed by vendor so each vendor caches
+  // independently.
+  const editingRow = editing ? dataRows[editing.rowIdx]?.original ?? null : null
+  const editingColId = editing ? gridColumnMeta[editing.colIdx]?.colId : null
+  const editingPoCellVendorId = editingColId === 'purchase_order' ? (editingRow?.vendor_id ?? null) : null
+  const { data: eligiblePos = [], isLoading: eligiblePosLoading } = useQuery({
+    queryKey: ['eligible-pos', editingPoCellVendorId],
+    queryFn: () => purchasePlanningApi.eligiblePos(editingPoCellVendorId),
+    enabled: editingPoCellVendorId != null,
+  })
 
   // Clear selection when the underlying view changes — indices would otherwise
   // point at the wrong cells.
@@ -1346,7 +1570,16 @@ export default function PurchasePlanning() {
                         // colIdx === undefined for non-selectable cols (just 'actions').
                         const isSelectable = colIdx !== undefined
                         const colMeta = isSelectable ? gridColumnMeta[colIdx] : null
-                        const isEditable = !!colMeta?.editable
+                        // Mirror lock: when the row is bound to a PO past
+                        // in_transit, fields that the PO depends on become
+                        // read-only. Status / notes stay editable since they
+                        // don't propagate to the PO line.
+                        const lockedByPo = !!row.original.locked_by_po
+                        const lockedColIds = new Set([
+                          'vendor', 'product_type', 'sub_product_type',
+                          'purchase_weight_lbs', 'case_weight_lbs', 'purchase_order',
+                        ])
+                        const isEditable = !!colMeta?.editable && !(lockedByPo && lockedColIds.has(colId))
                         const inRange = isSelectable && selBox != null
                           && rIdx >= selBox.rs && rIdx <= selBox.re
                           && colIdx >= selBox.cs && colIdx <= selBox.ce
@@ -1439,15 +1672,38 @@ export default function PurchasePlanning() {
                                 vendors={vendors}
                                 productTypes={productTypes}
                                 baseProductType={row.original.product_type}
+                                eligiblePos={eligiblePos}
+                                eligiblePosLoading={eligiblePosLoading}
+                                noVendor={colId === 'purchase_order' && row.original.vendor_id == null}
                                 onCommit={(dir, draftValue) => {
-                                  const update = colMeta.parseValue(draftValue)
-                                  if (update) {
-                                    updateMut.mutate({ id: row.original.id, data: update })
+                                  if (colId === 'purchase_order') {
+                                    // Custom commit: route to setPoMut. Sentinels:
+                                    //   ""    → unlink, "new" → create, "<id>" → link.
+                                    const v = String(draftValue ?? '')
+                                    const current = row.original.purchase_order_id
+                                    if (v === '' && current != null) {
+                                      setPoMut.mutate({ id: row.original.id, body: { action: 'unlink' } })
+                                    } else if (v === 'new') {
+                                      setPoMut.mutate({ id: row.original.id, body: { action: 'create' } })
+                                    } else if (v && Number(v) !== current) {
+                                      setPoMut.mutate({ id: row.original.id, body: { action: 'link', purchase_order_id: Number(v) } })
+                                    }
+                                  } else {
+                                    const update = colMeta.parseValue(draftValue)
+                                    if (update) {
+                                      updateMut.mutate({ id: row.original.id, data: update })
+                                    }
                                   }
                                   setEditing(null)
                                   if (dir) moveAnchor(rIdx, colIdx, dir, dataRows.length)
                                 }}
                                 onCancel={() => setEditing(null)}
+                              />
+                            ) : colId === 'purchase_order' && row.original.purchase_order_id ? (
+                              <PoCellChip
+                                poId={row.original.purchase_order_id}
+                                poNumber={row.original.purchase_order_number}
+                                poStatus={row.original.purchase_order_status}
                               />
                             ) : colId === 'vendor' && row.original.vendor_id ? (
                               // Vendor cell: name + ⓘ icon that opens the

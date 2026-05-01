@@ -1023,6 +1023,9 @@ class POLineResponse(POLineBase):
     purchase_order_id: int
     allocations: List[POPeriodAllocationResponse] = []
     overage_flag: bool = False  # True if rounded-up order >10% over projection gap
+    # When set, this line is bound to a Purchase Planning row that is the
+    # editor of record. Frontend uses this to render the line read-only.
+    purchase_plan_line_id: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

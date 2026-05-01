@@ -178,13 +178,14 @@ def _migrate_db():
                             f"USING NULLIF({col_name}, '')::json"
                         ))
                         conn.commit()
-    # Add sub_product_type / shipping_status to purchase_plan_lines if missing
+    # Add sub_product_type / shipping_status / purchase_order_line_id to purchase_plan_lines if missing
     if "purchase_plan_lines" in insp.get_table_names():
         cols = {c["name"] for c in insp.get_columns("purchase_plan_lines")}
         with engine.connect() as conn:
             for col_name, col_type in [
-                ("sub_product_type", "TEXT"),
-                ("shipping_status",  "TEXT"),
+                ("sub_product_type",        "TEXT"),
+                ("shipping_status",         "TEXT"),
+                ("purchase_order_line_id",  "INTEGER"),
             ]:
                 if col_name not in cols:
                     conn.execute(text(f"ALTER TABLE purchase_plan_lines ADD COLUMN {col_name} {col_type}"))
