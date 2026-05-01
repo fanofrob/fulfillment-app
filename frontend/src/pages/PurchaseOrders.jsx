@@ -265,16 +265,20 @@ export default function PurchaseOrders() {
       quality_rating: '',
       quality_notes: '',
     })
-    receivingApi.getSkusForProductType(line.product_type)
+    receivingApi.getSkusForProductType(line.product_type, line.id)
       .then(skus => {
         setAvailableSkus(skus)
-        // Default to the first SKU with on-hand > 0 (the API returns them
-        // sorted stocked-first). If nothing is stocked, fall back to the
-        // first SKU in the list so the dropdown isn't left blank.
-        const stocked = skus.find(s => (s.total_on_hand ?? 0) > 0)
-        const fallback = stocked || skus[0]
-        if (fallback) {
-          setReceivingForm(f => ({ ...f, confirmed_pick_sku: fallback.pick_sku }))
+        // Default selection priority:
+        //   1) Suggested SKU with inventory on hand
+        //   2) Suggested SKU even if zero on hand
+        //   3) Any SKU with on hand > 0 (last resort — flagged as "not in suggestions")
+        const suggested = skus.filter(s => s.match_reason)
+        const stockedSuggested = suggested.find(s => (s.total_on_hand ?? 0) > 0)
+        const anySuggested = suggested[0]
+        const stockedAny = skus.find(s => (s.total_on_hand ?? 0) > 0)
+        const pick = stockedSuggested || anySuggested || stockedAny
+        if (pick) {
+          setReceivingForm(f => ({ ...f, confirmed_pick_sku: pick.pick_sku }))
         }
       })
       .catch(() => setAvailableSkus([]))
@@ -617,16 +621,57 @@ export default function PurchaseOrders() {
                                 onChange={e => setReceivingForm({ ...receivingForm, harvest_date: e.target.value })} />
                             </div>
                             <div className="form-group" style={{ margin: 0 }}>
-                              <label style={{ fontSize: 11 }}>Confirmed SKU</label>
+                              <label style={{ fontSize: 11 }}>
+                                Confirmed SKU
+                                {(() => {
+                                  // Yellow flag if the selected SKU isn't in the suggested set.
+                                  // The user can still pick anything, but this surfaces the
+                                  // off-list choice so it's deliberate, not an accident.
+                                  const sel = availableSkus.find(s => s.pick_sku === receivingForm.confirmed_pick_sku)
+                                  if (!sel || sel.match_reason) return null
+                                  return (
+                                    <span title="This SKU is outside the suggested matches for this product type" style={{ color: '#b45309', marginLeft: 6, fontSize: 11 }}>
+                                      ⚠ Not in suggestions
+                                    </span>
+                                  )
+                                })()}
+                              </label>
                               <select value={receivingForm.confirmed_pick_sku}
                                 onChange={e => setReceivingForm({ ...receivingForm, confirmed_pick_sku: e.target.value })}>
                                 {availableSkus.length === 0 && <option value="">No SKUs found</option>}
-                                {availableSkus.map(s => (
-                                  <option key={s.pick_sku} value={s.pick_sku}>
-                                    {s.pick_sku} ({s.weight_lb ? `${s.weight_lb} lb/pc` : 'no weight'})
-                                    {s.total_on_hand > 0 ? ` · ${s.total_on_hand} on hand` : ''}
-                                  </option>
-                                ))}
+                                {(() => {
+                                  // Render two groups: Suggested (any match_reason set) and Other.
+                                  // Each option renders the SKU, weight, on-hand qty, and — for
+                                  // suggested items — a short tag explaining why it's suggested.
+                                  const fmtOpt = (s) => {
+                                    const w = s.weight_lb ? `${s.weight_lb} lb/pc` : 'no weight'
+                                    const oh = s.total_on_hand > 0 ? ` · ${s.total_on_hand} on hand` : ''
+                                    const tag = s.match_reason && s.match_reason !== 'exact'
+                                      ? ` · ${s.match_reason}`
+                                      : ''
+                                    return `${s.pick_sku} (${w})${oh}${tag}`
+                                  }
+                                  const suggested = availableSkus.filter(s => s.match_reason)
+                                  const others = availableSkus.filter(s => !s.match_reason)
+                                  return (
+                                    <>
+                                      {suggested.length > 0 && (
+                                        <optgroup label="Suggested">
+                                          {suggested.map(s => (
+                                            <option key={s.pick_sku} value={s.pick_sku}>{fmtOpt(s)}</option>
+                                          ))}
+                                        </optgroup>
+                                      )}
+                                      {others.length > 0 && (
+                                        <optgroup label="──────────  Other  ──────────">
+                                          {others.map(s => (
+                                            <option key={s.pick_sku} value={s.pick_sku}>{fmtOpt(s)}</option>
+                                          ))}
+                                        </optgroup>
+                                      )}
+                                    </>
+                                  )
+                                })()}
                               </select>
                             </div>
                           </div>

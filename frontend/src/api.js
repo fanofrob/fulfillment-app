@@ -474,7 +474,12 @@ export const receivingApi = {
   receive: (poId, lineId, data) => api.post(`/receiving/po/${poId}/lines/${lineId}/receive`, data).then(r => r.data),
   update: (recordId, data) => api.put(`/receiving/${recordId}`, data).then(r => r.data),
   delete: (recordId) => api.delete(`/receiving/${recordId}`).then(r => r.data),
-  getSkusForProductType: (productType) => api.get(`/receiving/skus-for-product-type/${encodeURIComponent(productType)}`).then(r => r.data),
+  // poLineId is optional — when provided the backend uses the linked plan
+  // row's base + sub product types as additional suggestion candidates.
+  getSkusForProductType: (productType, poLineId) =>
+    api.get(`/receiving/skus-for-product-type/${encodeURIComponent(productType)}`, {
+      params: poLineId ? { po_line_id: poLineId } : {},
+    }).then(r => r.data),
   pushToInventory: (recordId, data) => api.post(`/receiving/${recordId}/push-to-inventory`, data || {}).then(r => r.data),
   pushAll: (poId, data) => api.post(`/receiving/po/${poId}/push-all`, data || {}).then(r => r.data),
 }

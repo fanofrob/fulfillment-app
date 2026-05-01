@@ -1132,3 +1132,13 @@ class SkuForProductTypeResponse(BaseModel):
     # Sum of on_hand_qty across warehouses — frontend uses this to default
     # the receiving form's SKU to one that's actually stocked.
     total_on_hand: float = 0.0
+    # The SKU's own product type (from sku_mappings, falling back to
+    # InventoryItem.name). Used for grouping/sorting in the receiving form.
+    product_type: Optional[str] = None
+    # Why this SKU was suggested:
+    #   "exact"  — same product type as the line being received
+    #   "sub"    — matches the linked plan row's sub_product_type
+    #   "base"   — matches the linked plan row's base product_type
+    #   "family" — fuzzy match (same first word, e.g. "Apple, ...")
+    #   None     — not a suggestion (just listed for completeness)
+    match_reason: Optional[str] = None

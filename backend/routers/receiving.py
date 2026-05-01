@@ -4,7 +4,7 @@ Receiving router — PO receiving, SKU confirmation, and inventory push.
 from datetime import date, timedelta
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func as sqlfunc
 from sqlalchemy.orm import Session
 
@@ -263,83 +263,158 @@ def delete_receiving_record(record_id: int, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+def _product_type_family(pt: Optional[str]) -> Optional[str]:
+    """Extract the family token used for fuzzy matching.
+
+    "Fruit: Apple, Cosmic Crisp" → "apple"
+    "Fruit: Apple, Honeycrisp"  → "apple"
+    "Vegetable: Tomato, Roma"   → "tomato"
+
+    The family is the first comma-separated word after the category prefix.
+    """
+    if not pt:
+        return None
+    body = pt.split(":", 1)[-1].strip()
+    head = body.split(",", 1)[0].strip().lower()
+    return head or None
+
+
+def _strip_category_prefix(pt: Optional[str]) -> Optional[str]:
+    """Drop the leading "Fruit: "/"Vegetable: " category from a product type.
+    Used to match against InventoryItem.name (which doesn't carry the prefix)."""
+    if not pt:
+        return None
+    return pt.split(":", 1)[1].strip() if ":" in pt else pt.strip()
+
+
 @router.get("/skus-for-product-type/{product_type}", response_model=List[schemas.SkuForProductTypeResponse])
-def get_skus_for_product_type(product_type: str, db: Session = Depends(get_db)):
+def get_skus_for_product_type(
+    product_type: str,
+    po_line_id: Optional[int] = Query(None, description="When provided, the linked plan row's base + sub product types are added to the suggestion candidates."),
+    db: Session = Depends(get_db),
+):
     """
-    Return pick SKUs that match a product type, sorted by stocked-first so
-    the receiving form can default to one with inventory on hand.
+    Return pick SKUs for the receiving form's Confirmed SKU dropdown,
+    annotated with a `match_reason` so the frontend can render a
+    "Suggested" group above the divider and "Other" below.
 
-    Two sources are unioned (some product types have one but not the other):
-      1) sku_mappings rows whose product_type matches
-      2) inventory_items whose `name` matches the product type after stripping
-         the category prefix (e.g. "Fruit: Apple, Cosmic Crisp" → "Apple, Cosmic Crisp")
+    Suggestion candidates (in priority order):
+      - "exact"  — the line's product_type itself
+      - "sub"    — the linked plan row's sub_product_type (substitute)
+      - "base"   — the linked plan row's base product_type (when ordering a sub)
+      - "family" — same first word (e.g. another "Apple, ..." for an Apple line)
+
+    Everything else is returned unannotated so the user can still pick a
+    completely different SKU if they have to — but the UI flags that case
+    so it's a deliberate choice.
     """
-    # 1) From sku_mappings (Shopify SKU → pick SKU map)
-    mapping_pick_skus = {
-        row[0] for row in db.query(models.SkuMapping.pick_sku)
-        .filter(
-            models.SkuMapping.product_type == product_type,
-            models.SkuMapping.is_active == True,
-            models.SkuMapping.pick_sku.isnot(None),
-        )
-        .distinct()
-        .all()
-    }
+    # ── Determine candidate product types from the linked plan row ──────────
+    base_pt: Optional[str] = None
+    sub_pt: Optional[str] = None
+    if po_line_id:
+        plan = db.query(models.PurchasePlanLine).filter(
+            models.PurchasePlanLine.purchase_order_line_id == po_line_id
+        ).first()
+        if plan:
+            base_pt = plan.product_type
+            sub_pt = plan.sub_product_type
 
-    # 2) From inventory by name. The PO product_type is "Fruit: Apple, Cosmic Crisp"
-    # while InventoryItem.name is "Apple, Cosmic Crisp" — strip the leading
-    # "Category: " and match case-insensitively. Aggregate qty across warehouses.
-    stripped_name = product_type.split(":", 1)[1].strip() if ":" in product_type else product_type.strip()
-    inventory_rows = (
-        db.query(
-            models.InventoryItem.pick_sku,
-            sqlfunc.sum(models.InventoryItem.on_hand_qty).label("total_qty"),
-        )
-        .filter(sqlfunc.lower(models.InventoryItem.name) == stripped_name.lower())
-        .group_by(models.InventoryItem.pick_sku)
-        .all()
-    )
-    inventory_qty_by_sku = {r[0]: float(r[1] or 0) for r in inventory_rows}
+    # Priority order matters: a SKU matching multiple categories is labelled
+    # by the highest-priority match.
+    exact_pts = {product_type} if product_type else set()
+    sub_pts = {sub_pt} if sub_pt and sub_pt != product_type else set()
+    base_pts = {base_pt} if base_pt and base_pt not in exact_pts and base_pt not in sub_pts else set()
+    family_words = {_product_type_family(pt) for pt in (product_type, base_pt, sub_pt)}
+    family_words.discard(None)
 
-    pick_skus = list(mapping_pick_skus | set(inventory_qty_by_sku.keys()))
-    if not pick_skus:
+    # ── Build a (pick_sku → product_type) lookup from sku_mappings ─────────
+    # A SKU can appear under multiple Shopify variants but they all share the
+    # same product_type, so first-seen wins.
+    pt_by_sku: dict[str, str] = {}
+    for sku, pt in db.query(
+        models.SkuMapping.pick_sku, models.SkuMapping.product_type
+    ).filter(
+        models.SkuMapping.is_active == True,
+        models.SkuMapping.pick_sku.isnot(None),
+        models.SkuMapping.product_type.isnot(None),
+    ).distinct().all():
+        pt_by_sku.setdefault(sku, pt)
+
+    # ── Inventory: aggregate on_hand_qty + name across warehouses ──────────
+    inv_qty_by_sku: dict[str, float] = {}
+    inv_name_by_sku: dict[str, str] = {}
+    for sku, qty, name in db.query(
+        models.InventoryItem.pick_sku,
+        sqlfunc.sum(models.InventoryItem.on_hand_qty),
+        sqlfunc.max(models.InventoryItem.name),
+    ).group_by(models.InventoryItem.pick_sku).all():
+        inv_qty_by_sku[sku] = float(qty or 0)
+        if name:
+            inv_name_by_sku[sku] = name
+
+    # SKUs that appear in inventory but not in sku_mappings: synthesize a
+    # product_type from InventoryItem.name. We don't know the category prefix
+    # (Fruit/Vegetable/...) so we infer it from any of our candidate product
+    # types — this only matters for matching anyway, not for display.
+    candidate_prefix = ""
+    for pt in (product_type, base_pt, sub_pt):
+        if pt and ":" in pt:
+            candidate_prefix = pt.split(":", 1)[0].strip() + ": "
+            break
+    for sku, name in inv_name_by_sku.items():
+        if sku not in pt_by_sku:
+            pt_by_sku[sku] = f"{candidate_prefix}{name}" if candidate_prefix else name
+
+    # ── PicklistSku is the canonical SKU list (weights, shelf life, etc.) ──
+    pick_rows = db.query(models.PicklistSku).all()
+    pick_info_by_sku = {p.pick_sku: p for p in pick_rows}
+    # Union of all known SKUs across the three sources.
+    all_skus = set(pt_by_sku) | set(inv_qty_by_sku) | set(pick_info_by_sku)
+    if not all_skus:
         return []
 
-    sku_info = (
-        db.query(models.PicklistSku)
-        .filter(models.PicklistSku.pick_sku.in_(pick_skus))
-        .all()
-    )
-    sku_map = {s.pick_sku: s for s in sku_info}
+    # ── Classify each SKU ──────────────────────────────────────────────────
+    def classify(pt: Optional[str]) -> Optional[str]:
+        if not pt:
+            return None
+        if pt in exact_pts:
+            return "exact"
+        if pt in sub_pts:
+            return "sub"
+        if pt in base_pts:
+            return "base"
+        if _product_type_family(pt) in family_words:
+            return "family"
+        return None
 
-    # If a pick_sku appears in mappings but not in inventory_items at all, look
-    # up its on-hand across all warehouses (sum) so the frontend default works.
-    missing = [ps for ps in pick_skus if ps not in inventory_qty_by_sku]
-    if missing:
-        extra_inv = (
-            db.query(
-                models.InventoryItem.pick_sku,
-                sqlfunc.sum(models.InventoryItem.on_hand_qty).label("total_qty"),
-            )
-            .filter(models.InventoryItem.pick_sku.in_(missing))
-            .group_by(models.InventoryItem.pick_sku)
-            .all()
-        )
-        for sku, qty in extra_inv:
-            inventory_qty_by_sku[sku] = float(qty or 0)
+    # Priority for sorting suggestions
+    reason_rank = {"exact": 0, "sub": 1, "base": 2, "family": 3}
 
-    result = []
-    for ps in pick_skus:
-        info = sku_map.get(ps)
-        result.append(schemas.SkuForProductTypeResponse(
+    items: list[schemas.SkuForProductTypeResponse] = []
+    for ps in all_skus:
+        pt = pt_by_sku.get(ps)
+        info = pick_info_by_sku.get(ps)
+        items.append(schemas.SkuForProductTypeResponse(
             pick_sku=ps,
             weight_lb=info.weight_lb if info else None,
             days_til_expiration=info.days_til_expiration if info else None,
-            total_on_hand=inventory_qty_by_sku.get(ps, 0.0),
+            total_on_hand=inv_qty_by_sku.get(ps, 0.0),
+            product_type=pt,
+            match_reason=classify(pt),
         ))
-    # Stocked SKUs first (descending by on-hand), then alphabetical
-    result.sort(key=lambda r: (-r.total_on_hand, r.pick_sku))
-    return result
+
+    # Sort: suggested before others; within suggested, by reason priority then
+    # stocked-first; within others, stocked-first then alphabetical.
+    def sort_key(r: schemas.SkuForProductTypeResponse) -> tuple:
+        is_suggested = r.match_reason is not None
+        return (
+            0 if is_suggested else 1,
+            reason_rank.get(r.match_reason, 99),
+            -r.total_on_hand,
+            r.pick_sku,
+        )
+    items.sort(key=sort_key)
+    return items
 
 
 @router.post("/{record_id}/push-to-inventory", response_model=schemas.InventoryPushResponse)
