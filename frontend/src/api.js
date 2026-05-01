@@ -163,6 +163,7 @@ export const shipstationApi = {
 
 export const picklistSkusApi = {
   list: (params) => api.get('/picklist-skus/', { params }).then(r => r.data),
+  create: (data) => api.post('/picklist-skus/', data).then(r => r.data),
   sync: () => api.post('/picklist-skus/sync').then(r => r.data),
   update: (id, data) => api.put(`/picklist-skus/${id}`, data).then(r => r.data),
   missingCogs: () => api.get('/picklist-skus/missing-cogs').then(r => r.data),

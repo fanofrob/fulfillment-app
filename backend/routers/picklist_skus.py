@@ -33,6 +33,24 @@ class PicklistSkuUpdate(BaseModel):
     case_weight_lb: Optional[float] = None
 
 
+class PicklistSkuCreate(BaseModel):
+    pick_sku: str
+    customer_description: Optional[str] = None
+    weight_lb: Optional[float] = None
+    pactor_multiplier: Optional[float] = None
+    pactor: Optional[float] = None
+    temperature: Optional[str] = None
+    type: Optional[str] = None
+    category: Optional[PicklistCategory] = None
+    status: Optional[str] = None
+    cc_item_id: Optional[str] = None
+    notes: Optional[str] = None
+    days_til_expiration: Optional[float] = None
+    cost_per_lb: Optional[float] = None
+    cost_per_case: Optional[float] = None
+    case_weight_lb: Optional[float] = None
+
+
 def _to_dict(item: models.PicklistSku) -> dict:
     return {
         "id": item.id,
@@ -57,6 +75,18 @@ def _to_dict(item: models.PicklistSku) -> dict:
 
 
 ACTIVE_STATUSES = ['not_processed', 'staged', 'partially_fulfilled', 'needs_plan', 'plan_mismatch', 'no_box_rule']
+
+
+@router.post("/")
+def create_picklist_sku(data: PicklistSkuCreate, db: Session = Depends(get_db)):
+    existing = db.query(models.PicklistSku).filter_by(pick_sku=data.pick_sku).first()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"SKU '{data.pick_sku}' already exists")
+    item = models.PicklistSku(**data.model_dump())
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return _to_dict(item)
 
 
 @router.get("/missing-cogs")
