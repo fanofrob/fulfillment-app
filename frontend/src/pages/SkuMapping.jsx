@@ -5,6 +5,21 @@ import { skuMappingApi } from '../api'
 const ERROR_LABELS = {
   missing_pick_sku: 'No pick SKU',
   invalid_mix_qty:  'Invalid mix qty',
+  missing_weight: 'No bundle weight',
+  under_weight: 'Under weight',
+  over_weight: 'Over weight',
+  multi_same_product_type: 'Multi: dup type',
+  single_product_type_mismatch: 'Type not in subs',
+}
+
+const ERROR_KEYS = Object.keys(ERROR_LABELS)
+
+function autoMixQuantity(shopifyWeight, pickWeightLb) {
+  if (!shopifyWeight || !pickWeightLb || pickWeightLb <= 0) return null
+  const qty = shopifyWeight / pickWeightLb
+  if (!Number.isFinite(qty) || qty <= 0) return null
+  const frac = qty - Math.floor(qty)
+  return frac <= 0.05 ? Math.floor(qty) : Math.ceil(qty)
 }
 
 function fmtNum(v, digits = 2) {
@@ -229,14 +244,27 @@ function PickChip({ line, group, onSave, onDelete }) {
 }
 
 function NewPickForm({ group, onCreate, onCancel }) {
-  const [draft, setDraft] = useState({ pick_sku: '', mix_quantity: '1', pick_weight_lb: '' })
+  const [draft, setDraft] = useState({ pick_sku: '', mix_quantity: '', pick_weight_lb: '' })
+  const [qtyTouched, setQtyTouched] = useState(false)
+
+  // Auto-suggest mix_quantity when this would be the only pick line in the bundle
+  // (kind=single semantics). Skip if user has already typed a qty manually.
+  const isFirstPick = (group.pick_lines || []).length === 0
+  const shopifyWeight = group.rule?.weight_lb ?? group.summary?.shopify_weight ?? null
+  const autoQty = isFirstPick && !qtyTouched
+    ? autoMixQuantity(shopifyWeight, draft.pick_weight_lb === '' ? null : Number(draft.pick_weight_lb))
+    : null
+  const effectiveQty = qtyTouched ? draft.mix_quantity : (autoQty != null ? String(autoQty) : draft.mix_quantity)
 
   function save() {
+    const qtyToSend = qtyTouched
+      ? draft.mix_quantity
+      : (autoQty != null ? String(autoQty) : draft.mix_quantity)
     onCreate({
       warehouse: group.warehouse,
       shopify_sku: group.shopify_sku,
       pick_sku: draft.pick_sku.trim() || null,
-      mix_quantity: draft.mix_quantity === '' ? null : Number(draft.mix_quantity),
+      mix_quantity: qtyToSend === '' ? null : Number(qtyToSend),
       pick_weight_lb: draft.pick_weight_lb === '' ? null : Number(draft.pick_weight_lb),
       is_active: true,
     }, onCancel)
@@ -252,9 +280,13 @@ function NewPickForm({ group, onCreate, onCancel }) {
         style={{ width: 130, fontSize: 11, padding: '1px 4px', border: '1px solid #d1d5db', borderRadius: 3, fontFamily: 'monospace' }}
       />
       <span>×</span>
-      <input type="number" step="any" value={draft.mix_quantity} placeholder="qty"
-        onChange={e => setDraft(d => ({ ...d, mix_quantity: e.target.value }))}
-        style={{ width: 50, fontSize: 11, padding: '1px 4px', border: '1px solid #d1d5db', borderRadius: 3 }}
+      <input
+        type="number" step="any"
+        value={effectiveQty}
+        placeholder={autoQty != null ? `auto ${autoQty}` : 'qty'}
+        title={autoQty != null && !qtyTouched ? `Auto from ${shopifyWeight} lb / ${draft.pick_weight_lb} lb` : undefined}
+        onChange={e => { setQtyTouched(true); setDraft(d => ({ ...d, mix_quantity: e.target.value })) }}
+        style={{ width: 50, fontSize: 11, padding: '1px 4px', border: '1px solid #d1d5db', borderRadius: 3, background: autoQty != null && !qtyTouched ? '#ecfdf5' : 'white' }}
       />
       <input type="number" step="any" value={draft.pick_weight_lb} placeholder="wt"
         onChange={e => setDraft(d => ({ ...d, pick_weight_lb: e.target.value }))}
@@ -362,6 +394,19 @@ export default function SkuMapping() {
     retry: false,
   })
 
+  // Global error counts across the full catalog (independent of pagination)
+  const { data: errorPopulation = [] } = useQuery({
+    queryKey: ['sku-mappings-grouped', 'error-summary'],
+    queryFn: () => skuMappingApi.listGrouped({ errors_only: true, limit: 2000 }),
+    retry: false,
+  })
+
+  const errorCounts = errorPopulation.reduce((acc, g) => {
+    for (const e of (g.errors || [])) acc[e] = (acc[e] || 0) + 1
+    return acc
+  }, {})
+  const totalErroringSkus = errorPopulation.length
+
   const refreshMut = useMutation({
     mutationFn: skuMappingApi.refresh,
     onSuccess: () => qc.invalidateQueries({ queryKey: ['sku-mappings-grouped'] }),
@@ -435,6 +480,23 @@ export default function SkuMapping() {
           {errorsOnly && data.length > 0 && (
             <div style={{ marginBottom: 12, padding: '8px 14px', background: '#fef2f2', border: '1px solid #fca5a5', borderRadius: 6, fontSize: 13, color: '#c0392b' }}>
               ⚠ {data.length} Shopify SKU{data.length !== 1 ? 's' : ''} with mapping errors.
+            </div>
+          )}
+
+          {totalErroringSkus > 0 && (
+            <div style={{ marginBottom: 12, padding: '10px 14px', background: '#fff8f8', border: '1px solid #fecaca', borderRadius: 6 }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 13, fontWeight: 600, color: '#991b1b' }}>
+                  {totalErroringSkus} SKU{totalErroringSkus !== 1 ? 's' : ''} with warnings
+                </span>
+                <span style={{ fontSize: 11, color: '#9ca3af' }}>by type:</span>
+                {ERROR_KEYS.filter(k => errorCounts[k]).map(k => (
+                  <span key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, color: '#7f1d1d' }}>
+                    <span style={{ background: '#fca5a5', color: '#7f1d1d', borderRadius: 4, padding: '0 6px', fontWeight: 600 }}>{errorCounts[k]}</span>
+                    {ERROR_LABELS[k]}
+                  </span>
+                ))}
+              </div>
             </div>
           )}
 

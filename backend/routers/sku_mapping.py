@@ -39,6 +39,42 @@ def _row_errors(r) -> list[str]:
     return errors
 
 
+def _group_errors(lines, rule, total_pick_weight, shopify_weight) -> list[str]:
+    """
+    Group-level warnings about a (warehouse, canonical_sku) bundle as a whole.
+    Always warnings — never blocks save. Phase 6.
+    """
+    errors: list[str] = []
+    has_any_pick = any(line.pick_sku for line in lines)
+
+    if has_any_pick and (shopify_weight is None or shopify_weight <= 0):
+        errors.append("missing_weight")
+    elif shopify_weight is not None and shopify_weight > 0:
+        diff = total_pick_weight - shopify_weight
+        over_threshold = max(0.20 * shopify_weight, 1.0)
+        under_threshold = max(0.05 * shopify_weight, 1.0)
+        if diff > over_threshold:
+            errors.append("over_weight")
+        elif -diff > under_threshold:
+            errors.append("under_weight")
+
+    if rule and rule.kind:
+        product_types = [line.product_type for line in lines if line.product_type]
+        if rule.kind == "multi":
+            seen: set[str] = set()
+            for pt in product_types:
+                if pt in seen:
+                    errors.append("multi_same_product_type")
+                    break
+                seen.add(pt)
+        elif rule.kind == "single":
+            allowed = set(rule.single_substitute_product_types or [])
+            if allowed and any(pt not in allowed for pt in product_types):
+                errors.append("single_product_type_mismatch")
+
+    return errors
+
+
 def _to_dict(r: models.BundleMapping) -> dict:
     return {
         "id": r.id,
@@ -73,8 +109,6 @@ def list_sku_mappings(
     """
     List bundle mappings from the bundle_mappings DB table. Returns a list (not paginated envelope)
     to match the legacy sheets-backed contract that the SKU Mapping page already consumes.
-
-    Falls back to live sheets read when the DB is empty (transitional state before first refresh).
     """
     q = db.query(models.BundleMapping)
     if warehouse:
@@ -87,24 +121,6 @@ def list_sku_mappings(
         ))
 
     rows = q.order_by(models.BundleMapping.shopify_sku, models.BundleMapping.warehouse).all()
-
-    if not rows:
-        # When DB has no bundle_mappings rows at all, fall back to sheets so the page still
-        # renders before the first refresh runs. Once any rows exist this fallback stops
-        # triggering — empty filters then mean "DB has data, just none matching".
-        if db.query(models.BundleMapping).count() == 0 and sheets_service.is_configured():
-            try:
-                if warehouse:
-                    return sheets_service.get_sku_mappings(
-                        warehouse, search=shopify_sku, skip=skip, limit=limit, errors_only=errors_only,
-                    )
-                return sheets_service.get_sku_mappings_both(
-                    search=shopify_sku, skip=skip, limit=limit, errors_only=errors_only,
-                )
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-        return []
-
     items = [_to_dict(r) for r in rows]
     if errors_only:
         items = [i for i in items if i["errors"]]
@@ -117,7 +133,7 @@ def list_grouped_sku_mappings(
     search: Optional[str] = Query(None),
     errors_only: bool = Query(False),
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
     db: Session = Depends(get_db),
 ):
     """
@@ -212,6 +228,8 @@ def list_grouped_sku_mappings(
             weight_diff = round(total_pick_weight - shopify_weight, 4)
             weight_diff_pct = round((total_pick_weight - shopify_weight) / shopify_weight, 4)
 
+        agg_errors.update(_group_errors(lines, rule, total_pick_weight, shopify_weight))
+
         result.append({
             "shopify_sku": sku,
             "warehouse": wh,
@@ -231,6 +249,73 @@ def list_grouped_sku_mappings(
     if errors_only:
         result = [r for r in result if r["errors"]]
     return result[skip:skip + limit]
+
+
+@router.get("/staged-errors")
+def staged_skus_with_errors(db: Session = Depends(get_db)):
+    """
+    Phase 6 dashboard query: canonical Shopify SKUs that appear in any staged order
+    AND have mapping errors. Shows what's blocking clean fulfillment right now.
+
+    Each row: {shopify_sku, warehouse, errors[], order_count, total_pick_weight,
+    shopify_weight, weight_diff_pct}. Sorted by order_count desc.
+    """
+    from routers.shopify_sku_rules import _resolve_canonical
+
+    # Pull staged-order line items: (shopify_sku, assigned_warehouse, order_id)
+    rows = (
+        db.query(
+            models.ShopifyLineItem.shopify_sku,
+            models.ShopifyOrder.assigned_warehouse,
+            models.ShopifyLineItem.shopify_order_id,
+        )
+        .join(
+            models.ShopifyOrder,
+            models.ShopifyLineItem.shopify_order_id == models.ShopifyOrder.shopify_order_id,
+        )
+        .filter(
+            models.ShopifyOrder.app_status == "staged",
+            models.ShopifyLineItem.shopify_sku.isnot(None),
+        )
+        .all()
+    )
+
+    if not rows:
+        return []
+
+    # Map (warehouse, canonical_sku) -> set(order_ids) for the affected-order count
+    canonical_map: dict[tuple[str, str], set[str]] = {}
+    for shopify_sku, warehouse, order_id in rows:
+        canonical = _resolve_canonical(db, shopify_sku)
+        canonical_map.setdefault((warehouse, canonical), set()).add(order_id)
+
+    # Reuse the grouped endpoint's logic to get error data for everything that erred.
+    groups = list_grouped_sku_mappings(
+        warehouse=None,
+        search=None,
+        errors_only=True,
+        skip=0,
+        limit=2000,
+        db=db,
+    )
+
+    out: list[dict] = []
+    for g in groups:
+        key = (g["warehouse"], g["shopify_sku"])
+        if key not in canonical_map:
+            continue
+        out.append({
+            "shopify_sku": g["shopify_sku"],
+            "warehouse": g["warehouse"],
+            "errors": g["errors"],
+            "order_count": len(canonical_map[key]),
+            "total_pick_weight": g["summary"]["total_pick_weight"],
+            "shopify_weight": g["summary"]["shopify_weight"],
+            "weight_diff_pct": g["summary"]["weight_diff_pct"],
+        })
+
+    out.sort(key=lambda x: (-x["order_count"], x["shopify_sku"]))
+    return out
 
 
 @router.post("/refresh")

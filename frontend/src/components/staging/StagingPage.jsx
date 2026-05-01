@@ -2,8 +2,9 @@ import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   ordersApi, inventoryApi, productsApi, fulfillmentApi, rulesApi, shipstationApi,
-  projectionConfirmedOrdersApi, confirmedDemandConfigsApi,
+  projectionConfirmedOrdersApi, confirmedDemandConfigsApi, skuMappingApi,
 } from '../../api'
+import { Link } from 'react-router-dom'
 import InventoryDashboard from '../../pages/InventoryDashboard'
 import OrderDetailPanel from '../../pages/OrderDetailPanel'
 
@@ -140,6 +141,74 @@ function getOrderPriorityTier(order, priorityTagSets) {
 
 function hasPlanIssue(order) {
   return !order.has_plan || order.plan_box_unmatched || order.has_plan_mismatch || order.ss_duplicate
+}
+
+const STAGED_ERROR_LABELS = {
+  missing_pick_sku: 'No pick SKU',
+  invalid_mix_qty: 'Invalid mix qty',
+  missing_weight: 'No bundle weight',
+  under_weight: 'Under weight',
+  over_weight: 'Over weight',
+  multi_same_product_type: 'Multi: dup type',
+  single_product_type_mismatch: 'Type not in subs',
+}
+
+function StagedSkuErrorsPanel() {
+  const { data: rows = [], isLoading } = useQuery({
+    queryKey: ['sku-mappings-staged-errors'],
+    queryFn: () => skuMappingApi.stagedErrors(),
+    staleTime: 30000,
+    retry: false,
+  })
+
+  if (isLoading || rows.length === 0) return null
+
+  const totalOrders = rows.reduce((sum, r) => sum + (r.order_count || 0), 0)
+
+  return (
+    <div style={{ marginBottom: 12, padding: '10px 14px', background: '#fff8f8', border: '1px solid #fecaca', borderRadius: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+        <span style={{ fontSize: 13, fontWeight: 600, color: '#991b1b' }}>
+          ⚠ {rows.length} staged SKU{rows.length !== 1 ? 's' : ''} with mapping warnings
+        </span>
+        <span style={{ fontSize: 11, color: '#6b7280' }}>
+          (across {totalOrders} order{totalOrders !== 1 ? 's' : ''})
+        </span>
+        <Link
+          to="/sku-mapping?errors_only=1"
+          style={{ marginLeft: 'auto', fontSize: 12, color: '#1d4ed8', textDecoration: 'none' }}
+        >Open SKU Mapping →</Link>
+      </div>
+      <div style={{ maxHeight: 180, overflowY: 'auto', fontSize: 12 }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ color: '#6b7280', textAlign: 'left', borderBottom: '1px solid #fecaca' }}>
+              <th style={{ padding: '4px 6px', fontWeight: 500 }}>Shopify SKU</th>
+              <th style={{ padding: '4px 6px', fontWeight: 500 }}>Wh</th>
+              <th style={{ padding: '4px 6px', fontWeight: 500, textAlign: 'right' }}>Orders</th>
+              <th style={{ padding: '4px 6px', fontWeight: 500 }}>Warnings</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <tr key={`${r.warehouse}-${r.shopify_sku}`} style={{ borderBottom: '1px solid #fee2e2' }}>
+                <td style={{ padding: '4px 6px', fontFamily: 'monospace', color: '#16a34a' }}>{r.shopify_sku}</td>
+                <td style={{ padding: '4px 6px', color: '#6b7280' }}>{r.warehouse}</td>
+                <td style={{ padding: '4px 6px', textAlign: 'right', fontWeight: 600 }}>{r.order_count}</td>
+                <td style={{ padding: '4px 6px' }}>
+                  {(r.errors || []).map(e => (
+                    <span key={e} style={{ display: 'inline-block', background: '#fca5a5', color: '#7f1d1d', borderRadius: 4, padding: '0 6px', fontSize: 11, marginRight: 4 }}>
+                      {STAGED_ERROR_LABELS[e] || e}
+                    </span>
+                  ))}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
 }
 
 function StagedOrdersTab({ mode = 'operations', periodId = null }) {
@@ -500,6 +569,8 @@ function StagedOrdersTab({ mode = 'operations', periodId = null }) {
           <div className="stat-label">Inv. OK</div>
         </div>
       </div>
+
+      {!isCD && <StagedSkuErrorsPanel />}
 
       {/* Recompute + Bulk Unstage Issues — operations only */}
       {!isCD && (

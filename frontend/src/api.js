@@ -11,6 +11,7 @@ const api = axios.create({ baseURL: API_BASE })
 export const skuMappingApi = {
   list: (params) => api.get('/sku-mappings/', { params }).then(r => r.data),
   listGrouped: (params) => api.get('/sku-mappings/grouped', { params }).then(r => r.data),
+  stagedErrors: () => api.get('/sku-mappings/staged-errors').then(r => r.data),
   refresh: () => api.post('/sku-mappings/refresh').then(r => r.data),
   create: (data) => api.post('/sku-mappings/', data).then(r => r.data),
   update: (id, data) => api.put(`/sku-mappings/${id}`, data).then(r => r.data),
