@@ -79,6 +79,13 @@ class POLinkBody(BaseModel):
     purchase_order_id: Optional[int] = None
 
 
+class BulkPOLinkBody(BaseModel):
+    """Bulk version of POLinkBody — only supports link / create (not unlink)."""
+    ids: list[int] = Field(..., min_length=1)
+    action: str = Field(..., pattern="^(link|create)$")
+    purchase_order_id: Optional[int] = None
+
+
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 def _purchase_weight_helper(purchase_weight: Optional[float], case_weight: Optional[float]) -> Optional[float]:
@@ -624,6 +631,98 @@ def set_plan_line_po(line_id: int, body: POLinkBody, db: Session = Depends(get_d
     db.commit()
     db.refresh(plan)
     return _return_plan_row(db, plan)
+
+
+@router.post("/bulk-set-po")
+def bulk_set_plan_line_po(body: BulkPOLinkBody, db: Session = Depends(get_db)):
+    """
+    Attach many plan rows to a single PO in one shot. All rows must share one
+    vendor and have a product type set. Validation runs before any mutation —
+    if anything fails, no rows change.
+      - action=link: attach all rows to the given existing PO (must match vendor)
+      - action=create: create one new draft PO for the shared vendor and attach
+        all rows to it
+    Returns the updated rows.
+    """
+    plans = (
+        db.query(models.PurchasePlanLine)
+        .filter(models.PurchasePlanLine.id.in_(body.ids))
+        .all()
+    )
+    found_ids = {p.id for p in plans}
+    missing = [i for i in body.ids if i not in found_ids]
+    if missing:
+        raise HTTPException(404, f"Plan lines not found: {missing}")
+
+    vendor_ids = {p.vendor_id for p in plans}
+    if None in vendor_ids:
+        raise HTTPException(400, "Set a vendor on every selected row before attaching a PO")
+    if len(vendor_ids) > 1:
+        raise HTTPException(400, "All selected rows must share the same vendor")
+    vendor_id = next(iter(vendor_ids))
+
+    missing_pt = [p.id for p in plans if not _po_line_product_type(p)]
+    if missing_pt:
+        raise HTTPException(400, f"Set a product type on every selected row before attaching a PO (missing on: {missing_pt})")
+
+    period_ids = {p.projection_period_id for p in plans}
+
+    if body.action == "create":
+        po = models.PurchaseOrder(
+            po_number=_next_po_number(db),
+            vendor_id=vendor_id,
+            status="draft",
+            order_date=date.today(),
+            notes="Created from purchase planning",
+        )
+        db.add(po)
+        db.flush()
+    else:  # link
+        if not body.purchase_order_id:
+            raise HTTPException(400, "purchase_order_id is required for action=link")
+        po = db.query(models.PurchaseOrder).filter_by(id=body.purchase_order_id).first()
+        if not po:
+            raise HTTPException(404, "Purchase order not found")
+        if po.vendor_id != vendor_id:
+            raise HTTPException(
+                400,
+                "PO vendor does not match the selected rows' vendor — pick a PO for the same vendor or create a new one."
+            )
+        if po.status not in _PO_LINKABLE_STATUSES:
+            raise HTTPException(
+                400,
+                f"PO {po.po_number} is in '{po.status}' — only {sorted(_PO_LINKABLE_STATUSES)} accept new lines."
+            )
+
+    for plan in plans:
+        if plan.purchase_order_line_id:
+            _delete_linked_po_line(db, plan)
+        _create_po_line_from_plan(db, plan, po)
+
+    db.commit()
+    for p in plans:
+        db.refresh(p)
+
+    metrics_by_period = {pid: _projection_metrics_for_period(db, pid) for pid in period_ids}
+    purchases_by_period: dict[int, dict] = {}
+    for pid in period_ids:
+        period_lines = db.query(models.PurchasePlanLine).filter_by(projection_period_id=pid).all()
+        purchases_by_period[pid] = _purchases_by_combo(period_lines)
+    info_map = _po_info_map(db, plans)
+
+    return {
+        "items": [
+            _serialize_line(
+                p,
+                metrics_by_period[p.projection_period_id],
+                purchases_by_period[p.projection_period_id],
+                info_map.get(p.id),
+            )
+            for p in plans
+        ],
+        "purchase_order_id": po.id,
+        "po_number": po.po_number,
+    }
 
 
 def _return_plan_row(db: Session, plan: models.PurchasePlanLine) -> dict:

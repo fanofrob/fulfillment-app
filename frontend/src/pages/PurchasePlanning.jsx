@@ -517,6 +517,8 @@ export default function PurchasePlanning() {
   // Vendor info popover: which vendor's details are open. null = closed.
   // { vendorId, anchorRect } — anchorRect positions the panel near its icon.
   const [vendorInfo, setVendorInfo] = useState(null)
+  // Bulk PO assign popover.
+  const [bulkPoOpen, setBulkPoOpen] = useState(false)
 
   // ── Data ────────────────────────────────────────────────────────────────
   const { data: periods = [] } = useQuery({
@@ -597,6 +599,17 @@ export default function PurchasePlanning() {
       qc.invalidateQueries({ queryKey: ['eligible-pos'] })
     },
     onError: (err) => setActionMsg(`Could not update PO: ${err?.response?.data?.detail || err.message}`),
+  })
+  const bulkSetPoMut = useMutation({
+    mutationFn: (body) => purchasePlanningApi.bulkSetPo(body),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ['purchase-planning', periodId] })
+      qc.invalidateQueries({ queryKey: ['eligible-pos'] })
+      setBulkPoOpen(false)
+      const n = res?.items?.length || 0
+      setActionMsg(`Linked ${n} row${n === 1 ? '' : 's'} to ${res?.po_number || 'PO'}.`)
+    },
+    onError: (err) => setActionMsg(`Could not link rows: ${err?.response?.data?.detail || err.message}`),
   })
 
   function handleUpdate(id, patch) {
@@ -1381,21 +1394,53 @@ export default function PurchasePlanning() {
             onClick={() => { setColumnFilters([]); setSorting([]) }}
           >Clear filters & sort</button>
         )}
-        {selectedIds.size > 0 && (
-          <button
-            className="btn btn-secondary"
-            style={{ color: '#dc2626', borderColor: '#fecaca' }}
-            onClick={() => {
-              const ids = Array.from(selectedIds)
-              if (window.confirm(`Delete ${ids.length} selected row${ids.length === 1 ? '' : 's'}?`)) {
-                bulkDeleteMut.mutate(ids)
-              }
-            }}
-            disabled={bulkDeleteMut.isPending}
-          >
-            {bulkDeleteMut.isPending ? 'Deleting…' : `Delete ${selectedIds.size} selected`}
-          </button>
-        )}
+        {selectedIds.size > 0 && (() => {
+          const selectedRows = items.filter((r) => selectedIds.has(r.id))
+          const vendorIdSet = new Set(selectedRows.map((r) => r.vendor_id))
+          const hasNoVendor = vendorIdSet.has(null) || vendorIdSet.has(undefined)
+          const sharedVendorId = !hasNoVendor && vendorIdSet.size === 1 ? selectedRows[0].vendor_id : null
+          const sharedVendorName = sharedVendorId
+            ? (vendors.find((v) => v.id === sharedVendorId)?.name || '—')
+            : null
+          const cannotAssignReason = hasNoVendor
+            ? 'Every selected row needs a vendor before linking to a PO'
+            : (vendorIdSet.size > 1 ? 'Selected rows have different vendors — pick rows from one vendor' : null)
+          return (
+            <>
+              <button
+                className="btn btn-primary"
+                onClick={() => setBulkPoOpen(true)}
+                disabled={!!cannotAssignReason || bulkSetPoMut.isPending}
+                title={cannotAssignReason || ''}
+              >
+                {bulkSetPoMut.isPending ? 'Assigning…' : `Assign ${selectedIds.size} to PO…`}
+              </button>
+              <button
+                className="btn btn-secondary"
+                style={{ color: '#dc2626', borderColor: '#fecaca' }}
+                onClick={() => {
+                  const ids = Array.from(selectedIds)
+                  if (window.confirm(`Delete ${ids.length} selected row${ids.length === 1 ? '' : 's'}?`)) {
+                    bulkDeleteMut.mutate(ids)
+                  }
+                }}
+                disabled={bulkDeleteMut.isPending}
+              >
+                {bulkDeleteMut.isPending ? 'Deleting…' : `Delete ${selectedIds.size} selected`}
+              </button>
+              {bulkPoOpen && sharedVendorId && (
+                <BulkPoAssignPopover
+                  vendorId={sharedVendorId}
+                  vendorName={sharedVendorName}
+                  count={selectedIds.size}
+                  onClose={() => setBulkPoOpen(false)}
+                  onSubmit={(body) => bulkSetPoMut.mutate({ ids: Array.from(selectedIds), ...body })}
+                  busy={bulkSetPoMut.isPending}
+                />
+              )}
+            </>
+          )
+        })()}
         <span style={{ marginLeft: 'auto', fontSize: 12, color: '#6b7280' }}>
           {items.length} row{items.length === 1 ? '' : 's'}
           {' · '}
@@ -1437,6 +1482,9 @@ export default function PurchasePlanning() {
             // <thead> has something to stick within. 75vh leaves the page
             // header / toolbar / tip visible; the table scrolls beneath.
             maxHeight: 'calc(100vh - 220px)',
+            // Reserve space below the last row so the horizontal scrollbar
+            // (overlay-style on macOS) doesn't paint over it.
+            paddingBottom: 16,
           }}
         >
           <table className="data-table" style={{ minWidth: 1780 }}>
@@ -1787,6 +1835,103 @@ function buildPlannedItemsText(items) {
   return rows
     .map((r) => `${r.amount.padEnd(colWidth)}${r.name}`)
     .join('\n')
+}
+
+function BulkPoAssignPopover({ vendorId, vendorName, count, onClose, onSubmit, busy }) {
+  const [mode, setMode] = useState('create')  // 'create' | 'link'
+  const [selectedPoId, setSelectedPoId] = useState(null)
+  const { data: pos = [], isLoading } = useQuery({
+    queryKey: ['eligible-pos', vendorId],
+    queryFn: () => purchasePlanningApi.eligiblePos(vendorId),
+    enabled: vendorId != null,
+  })
+  useEffect(() => {
+    function onKey(e) { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
+  useEffect(() => {
+    if (mode === 'link' && selectedPoId == null && pos.length > 0) {
+      setSelectedPoId(pos[0].id)
+    }
+  }, [mode, pos, selectedPoId])
+
+  const canSubmit = !busy && (mode === 'create' || (mode === 'link' && selectedPoId != null))
+
+  function submit() {
+    if (mode === 'create') onSubmit({ action: 'create' })
+    else onSubmit({ action: 'link', purchase_order_id: Number(selectedPoId) })
+  }
+
+  return (
+    <div style={popoverBackdropStyle} onMouseDown={onClose}>
+      <div
+        style={{
+          ...popoverPanelStyle,
+          top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+          width: 420, maxHeight: '80vh',
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div style={popoverHeaderStyle}>
+          <strong style={{ fontSize: 14 }}>Assign {count} row{count === 1 ? '' : 's'} to PO</strong>
+          <button
+            onClick={onClose}
+            style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: '#6b7280' }}
+            aria-label="Close"
+          >×</button>
+        </div>
+        <div style={popoverBodyStyle}>
+          <div style={{ marginBottom: 12, color: '#374151' }}>
+            Vendor: <strong>{vendorName || '—'}</strong>
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, cursor: 'pointer' }}>
+            <input type="radio" name="bulk-po-mode" checked={mode === 'create'} onChange={() => setMode('create')} />
+            <span>Create a new PO for {vendorName || 'this vendor'}</span>
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, cursor: 'pointer' }}>
+            <input
+              type="radio" name="bulk-po-mode"
+              checked={mode === 'link'} onChange={() => setMode('link')}
+              disabled={!isLoading && pos.length === 0}
+            />
+            <span>Add to existing PO</span>
+          </label>
+          {mode === 'link' && (
+            <div style={{ marginLeft: 22, marginBottom: 8 }}>
+              {isLoading ? (
+                <span style={{ color: '#6b7280' }}>Loading…</span>
+              ) : pos.length === 0 ? (
+                <span style={{ color: '#6b7280' }}>No open POs for this vendor.</span>
+              ) : (
+                <select
+                  value={selectedPoId ?? ''}
+                  onChange={(e) => setSelectedPoId(Number(e.target.value))}
+                  style={{ width: '100%', padding: '4px 6px' }}
+                >
+                  {pos.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.po_number} — {p.status}
+                      {p.order_date ? ` · ordered ${p.order_date}` : ''}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+          )}
+          <div style={{ fontSize: 11, color: '#6b7280', marginTop: 8 }}>
+            Each row's product type, weight, and case-weight come along. If a row was already linked to a different PO, that link is replaced.
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, padding: '8px 12px', borderTop: '1px solid #e5e7eb', background: '#f9fafb' }}>
+          <button className="btn btn-secondary" onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="btn btn-primary" onClick={submit} disabled={!canSubmit} style={{ marginLeft: 'auto' }}>
+            {busy ? 'Assigning…' : mode === 'create' ? 'Create PO & assign' : 'Assign to selected PO'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 function VendorInfoPopover({ vendor, items, anchorRect, onClose }) {

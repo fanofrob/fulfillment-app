@@ -465,6 +465,8 @@ export const purchasePlanningApi = {
     api.post('/purchase-planning/seed', null, { params: { projection_period_id: projectionPeriodId } }).then(r => r.data),
   // PO linkage: action ∈ {"link" + purchase_order_id, "create", "unlink"}
   setPo: (id, body) => api.put(`/purchase-planning/${id}/po`, body).then(r => r.data),
+  // Bulk PO linkage: body { ids, action: "link"|"create", purchase_order_id? }
+  bulkSetPo: (body) => api.post('/purchase-planning/bulk-set-po', body).then(r => r.data),
   eligiblePos: (vendorId) =>
     api.get('/purchase-planning/eligible-pos', { params: { vendor_id: vendorId } }).then(r => r.data),
 }
