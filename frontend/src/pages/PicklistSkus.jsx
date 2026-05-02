@@ -256,8 +256,7 @@ export default function PicklistSkus() {
   const isMissingCogs = filter === 'missing-cogs'
   const [search, setSearch] = useState(urlParams.get('search') || '')
   const [categoryFilter, setCategoryFilter] = useState(urlParams.get('category') || '')
-  const [page, setPage] = useState(0)
-  const limit = 200
+  const limit = 2000
   const [syncResult, setSyncResult] = useState(null)
 
   // ── Spreadsheet state ──────────────────────────────────────────────────────
@@ -303,11 +302,11 @@ export default function PicklistSkus() {
   })
 
   const { data = { total: 0, items: [] }, isLoading } = useQuery({
-    queryKey: ['picklist-skus', search, categoryFilter, page],
+    queryKey: ['picklist-skus', search, categoryFilter],
     queryFn: () => picklistSkusApi.list({
       search: search || undefined,
       category: categoryFilter || undefined,
-      skip: page * limit,
+      skip: 0,
       limit,
     }),
     enabled: !isMissingCogs,
@@ -396,7 +395,7 @@ export default function PicklistSkus() {
   useEffect(() => {
     setSelection({ anchor: null, focus: null })
     setEditing(null)
-  }, [sorting, columnFilters, search, categoryFilter, page, isMissingCogs])
+  }, [sorting, columnFilters, search, categoryFilter, isMissingCogs])
 
   // ── Mouse drag: end on window mouseup ─────────────────────────────────────
   useEffect(() => {
@@ -865,7 +864,6 @@ export default function PicklistSkus() {
 
   // ── Derived ────────────────────────────────────────────────────────────────
   const { total } = isMissingCogs ? { total: missingCogsData.length } : data
-  const totalPages = isMissingCogs ? 1 : Math.ceil((total || 0) / limit)
   const selBox = selectionBox(selection)
   const headerGroups = table.getHeaderGroups()
   const isFiltered = columnFilters.length > 0 || sorting.length > 0
@@ -945,12 +943,12 @@ export default function PicklistSkus() {
             <input
               placeholder="Search SKU or description…"
               value={search}
-              onChange={e => { setSearch(e.target.value); setPage(0) }}
+              onChange={e => setSearch(e.target.value)}
               style={{ minWidth: 240 }}
             />
             <select
               value={categoryFilter}
-              onChange={e => { setCategoryFilter(e.target.value); setPage(0) }}
+              onChange={e => setCategoryFilter(e.target.value)}
               style={{ fontSize: 13, padding: '4px 6px' }}
             >
               <option value="">All categories</option>
@@ -1217,14 +1215,6 @@ export default function PicklistSkus() {
         </div>
       )}
 
-      {/* Pagination */}
-      {totalPages > 1 && (
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 16, fontSize: 13 }}>
-          <button className="btn btn-secondary" onClick={() => setPage(p => p - 1)} disabled={page === 0}>← Prev</button>
-          <span>Page {page + 1} of {totalPages}</span>
-          <button className="btn btn-secondary" onClick={() => setPage(p => p + 1)} disabled={page >= totalPages - 1}>Next →</button>
-        </div>
-      )}
     </div>
   )
 }
