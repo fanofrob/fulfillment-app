@@ -268,6 +268,13 @@ export default function PicklistSkus() {
   const draggingRef = useRef(false)
   // kept current so the keyboard handler (useEffect closure) always sees fresh rows
   const dataRowsRef = useRef([])
+  const activeColsRef = useRef([])
+  // Optimistic bag of pending paste/clear patches, applied before the next render.
+  // Without this, two synchronous applyPatchToDirty calls (one per cell pasted)
+  // would each functional-update from the same prior dirtyRows state, and the
+  // second would overwrite the first inside React's batch.
+  const pendingDirtyRef = useRef(null)
+  const [clipboardMsg, setClipboardMsg] = useState(null)
 
   // ── Dirty state ────────────────────────────────────────────────────────────
   const [dirtyRows, setDirtyRows] = useState({})
@@ -286,6 +293,7 @@ export default function PicklistSkus() {
   const hasDirty = Object.keys(dirtyRows).length > 0
   const dirtyCount = Object.keys(dirtyRows).length
   const activeCols = isMissingCogs ? MISSING_COGS_COLS : GRID_COLS
+  activeColsRef.current = activeCols
 
   // ── Queries ────────────────────────────────────────────────────────────────
   const { data: productTypes = [] } = useQuery({
@@ -397,7 +405,10 @@ export default function PicklistSkus() {
     return () => window.removeEventListener('mouseup', onMouseUp)
   }, [])
 
-  // ── Keyboard navigation ────────────────────────────────────────────────────
+  // ── Keyboard + clipboard handlers ──────────────────────────────────────────
+  // Structured to mirror PurchasePlanning: cmd-shortcut handlers run AFTER the
+  // active-cell navigation block, both branches use refs so the effect doesn't
+  // need to re-bind on every render.
   useEffect(() => {
     function isInputEl(el) {
       if (!el) return false
@@ -405,9 +416,32 @@ export default function PicklistSkus() {
         el.tagName === 'SELECT' || el.isContentEditable
     }
 
+    function onCopy(e) {
+      if (isInputEl(document.activeElement)) return
+      const box = selectionBox(selection)
+      if (!box) return
+      const tsv = selectionToTSVFromBox(box)
+      if (!tsv) return
+      e.clipboardData.setData('text/plain', tsv)
+      e.preventDefault()
+      flashClipboardMsg(`Copied ${(box.re - box.rs + 1)} × ${(box.ce - box.cs + 1)} cells`)
+    }
+
+    function onPaste(e) {
+      if (!selection.anchor) return
+      const text = e.clipboardData?.getData('text/plain') ?? ''
+      if (!text) return
+      const matrix = parseTSV(text)
+      const isMulti = matrix.length > 1 || (matrix[0]?.length ?? 0) > 1
+      if (!isMulti && isInputEl(document.activeElement)) return
+      e.preventDefault()
+      const n = distributeToCells(matrix, selection.anchor)
+      flashClipboardMsg(`Pasted ${n} row${n === 1 ? '' : 's'}`)
+    }
+
     async function onKeyDown(e) {
       const rows = dataRowsRef.current
-      const cols = activeCols
+      const cols = activeColsRef.current
 
       if (isInputEl(document.activeElement)) return
 
@@ -417,101 +451,115 @@ export default function PicklistSkus() {
         return
       }
 
+      const cmd = e.metaKey || e.ctrlKey
       const anc = selection.anchor
-      if (!anc || editing) return
 
-      // Backspace / Delete: clear all editable cells in the selection
-      if (!e.metaKey && !e.ctrlKey && (e.key === 'Backspace' || e.key === 'Delete')) {
-        e.preventDefault()
-        clearSelectionCells()
-        return
-      }
-
-      // Cmd/Ctrl+C/V/X clipboard shortcuts. The native copy/paste events only
-      // fire when the browser sees a selection or focused input, so the
-      // spreadsheet (no DOM focus, internal-state selection) relies on this.
-      if (e.metaKey || e.ctrlKey) {
-        const k = e.key.toLowerCase()
-        if (k === 'c') {
+      // Active-cell navigation when we have an anchor and are not editing.
+      if (!editing && anc) {
+        const arrowDir = { ArrowUp:'up', ArrowDown:'down', ArrowLeft:'left', ArrowRight:'right' }[e.key]
+        if (arrowDir) {
           e.preventDefault()
-          const tsv = selectionToTSV()
-          if (tsv) { try { await navigator.clipboard.writeText(tsv) } catch {} }
+          if (e.shiftKey) {
+            setSelection(prev => {
+              const foc = prev.focus || prev.anchor
+              if (!foc) return prev
+              let nr = foc.rowIdx, nc = foc.colIdx
+              if (arrowDir === 'up')    nr = Math.max(0, nr - 1)
+              if (arrowDir === 'down')  nr = Math.min(rows.length - 1, nr + 1)
+              if (arrowDir === 'left')  nc = Math.max(0, nc - 1)
+              if (arrowDir === 'right') nc = Math.min(cols.length - 1, nc + 1)
+              return { anchor: prev.anchor, focus: { rowIdx: nr, colIdx: nc } }
+            })
+          } else {
+            let nr = anc.rowIdx, nc = anc.colIdx
+            if (arrowDir === 'up')    nr = Math.max(0, nr - 1)
+            if (arrowDir === 'down')  nr = Math.min(rows.length - 1, nr + 1)
+            if (arrowDir === 'left')  nc = Math.max(0, nc - 1)
+            if (arrowDir === 'right') nc = Math.min(cols.length - 1, nc + 1)
+            setSelection({ anchor: { rowIdx: nr, colIdx: nc }, focus: { rowIdx: nr, colIdx: nc } })
+          }
           return
         }
-        if (k === 'v') {
+        if (e.key === 'Tab') {
           e.preventDefault()
-          try {
-            const text = await navigator.clipboard.readText()
-            const matrix = parseTSV(text)
-            if (matrix.length) distributeToCells(matrix, selection.anchor)
-          } catch {}
+          let nc = e.shiftKey ? Math.max(0, anc.colIdx - 1) : Math.min(cols.length - 1, anc.colIdx + 1)
+          setSelection({ anchor: { rowIdx: anc.rowIdx, colIdx: nc }, focus: { rowIdx: anc.rowIdx, colIdx: nc } })
           return
         }
-        if (k === 'x') {
+        if (e.key === 'Enter' || e.key === 'F2') {
           e.preventDefault()
-          const tsv = selectionToTSV()
-          if (tsv) { try { await navigator.clipboard.writeText(tsv) } catch {} }
-          clearSelectionCells()
+          const col = cols[anc.colIdx]
+          const item = rows[anc.rowIdx]?.original
+          if (col?.editable && item) {
+            setEditing({ rowIdx: anc.rowIdx, colIdx: anc.colIdx, initialValue: String(item[col.key] ?? '') })
+          }
+          return
+        }
+        if (!cmd && (e.key === 'Backspace' || e.key === 'Delete')) {
+          e.preventDefault()
+          const n = clearSelectionCellsForBox(selectionBox(selection))
+          if (n) flashClipboardMsg(`Cleared ${n} row${n === 1 ? '' : 's'}`)
+          return
+        }
+        if (!cmd && e.key.length === 1) {
+          const col = cols[anc.colIdx]
+          if (col?.editable) {
+            e.preventDefault()
+            setEditing({ rowIdx: anc.rowIdx, colIdx: anc.colIdx, initialValue: e.key })
+          }
           return
         }
       }
 
-      const arrowMap = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right' }
-      const dir = arrowMap[e.key]
-      if (dir) {
+      // Cmd-shortcut handlers — run regardless of whether we have an anchor
+      // (paste needs an anchor; copy/cut need a selection).
+      if (!cmd) return
+      const k = e.key.toLowerCase()
+      if (k === 'c') {
+        const box = selectionBox(selection)
+        if (!box) return
         e.preventDefault()
-        if (e.shiftKey) {
-          setSelection(prev => {
-            const foc = prev.focus || prev.anchor
-            if (!foc) return prev
-            let nr = foc.rowIdx, nc = foc.colIdx
-            if (dir === 'up')    nr = Math.max(0, nr - 1)
-            if (dir === 'down')  nr = Math.min(rows.length - 1, nr + 1)
-            if (dir === 'left')  nc = Math.max(0, nc - 1)
-            if (dir === 'right') nc = Math.min(cols.length - 1, nc + 1)
-            return { anchor: prev.anchor, focus: { rowIdx: nr, colIdx: nc } }
-          })
-        } else {
-          let nr = anc.rowIdx, nc = anc.colIdx
-          if (dir === 'up')    nr = Math.max(0, nr - 1)
-          if (dir === 'down')  nr = Math.min(rows.length - 1, nr + 1)
-          if (dir === 'left')  nc = Math.max(0, nc - 1)
-          if (dir === 'right') nc = Math.min(cols.length - 1, nc + 1)
-          setSelection({ anchor: { rowIdx: nr, colIdx: nc }, focus: { rowIdx: nr, colIdx: nc } })
+        const tsv = selectionToTSVFromBox(box)
+        if (tsv) {
+          try { await navigator.clipboard.writeText(tsv) } catch {}
+          flashClipboardMsg(`Copied ${(box.re - box.rs + 1)} × ${(box.ce - box.cs + 1)} cells`)
         }
         return
       }
-
-      if (e.key === 'Tab') {
+      if (k === 'v' && selection.anchor) {
         e.preventDefault()
-        let nr = anc.rowIdx, nc = anc.colIdx
-        nc = e.shiftKey ? Math.max(0, nc - 1) : Math.min(cols.length - 1, nc + 1)
-        setSelection({ anchor: { rowIdx: nr, colIdx: nc }, focus: { rowIdx: nr, colIdx: nc } })
+        try {
+          const text = await navigator.clipboard.readText()
+          const matrix = parseTSV(text)
+          if (matrix.length) {
+            const n = distributeToCells(matrix, selection.anchor)
+            flashClipboardMsg(`Pasted ${n} row${n === 1 ? '' : 's'}`)
+          }
+        } catch {}
         return
       }
-
-      if (e.key === 'Enter' || e.key === 'F2') {
+      if (k === 'x') {
+        const box = selectionBox(selection)
+        if (!box) return
         e.preventDefault()
-        const col = cols[anc.colIdx]
-        const item = rows[anc.rowIdx]?.original
-        if (col?.editable && item) {
-          setEditing({ rowIdx: anc.rowIdx, colIdx: anc.colIdx, initialValue: String(item[col.key] ?? '') })
-        }
+        const tsv = selectionToTSVFromBox(box)
+        if (tsv) { try { await navigator.clipboard.writeText(tsv) } catch {} }
+        const n = clearSelectionCellsForBox(box)
+        flashClipboardMsg(`Cut ${n} row${n === 1 ? '' : 's'}`)
         return
-      }
-
-      // Type-to-edit: printable char replaces cell content and opens editor
-      if (!e.metaKey && !e.ctrlKey && e.key.length === 1) {
-        const col = cols[anc.colIdx]
-        if (col?.editable) {
-          setEditing({ rowIdx: anc.rowIdx, colIdx: anc.colIdx, initialValue: e.key })
-        }
       }
     }
 
+    document.addEventListener('copy', onCopy)
+    document.addEventListener('paste', onPaste)
     document.addEventListener('keydown', onKeyDown)
-    return () => document.removeEventListener('keydown', onKeyDown)
-  }, [selection, editing, activeCols])
+    return () => {
+      document.removeEventListener('copy', onCopy)
+      document.removeEventListener('paste', onPaste)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selection, editing])
 
   // ── Mutations ──────────────────────────────────────────────────────────────
   const syncMut = useMutation({
@@ -630,19 +678,20 @@ export default function PicklistSkus() {
   }
 
   // ── Apply a typed patch (key→value map) into dirtyRows for one item ────────
-  // Mirrors commitEdit's auto-compute and server-comparison behavior so paste
-  // and clear behave consistently with single-cell edits.
+  // Routes through pendingDirtyRef so a synchronous batch (paste of N cells)
+  // accumulates before React renders, instead of each setState clobbering the
+  // last. Also handles auto-compute and server-comparison.
   function applyPatchToDirty(itemId, rawPatch) {
     setDirtyRows(prev => {
+      const base = pendingDirtyRef.current ?? prev
       const serverItem = serverItems.find(r => r.id === itemId)
-      const existing = prev[itemId] || {}
+      const existing = base[itemId] || {}
       const merged = { ...existing }
       for (const [k, v] of Object.entries(rawPatch)) {
         const serverVal = serverItem?.[k] ?? null
         if (v === serverVal) delete merged[k]
         else merged[k] = v
       }
-      // Auto-compute pactor when weight or multiplier change
       if ('pactor_multiplier' in rawPatch || 'weight_lb' in rawPatch) {
         const mult = ('pactor_multiplier' in merged) ? merged.pactor_multiplier
                    : (serverItem?.pactor_multiplier ?? null)
@@ -654,8 +703,6 @@ export default function PicklistSkus() {
           else delete merged.pactor
         }
       }
-      // Auto-compute cost_per_lb if cost_per_case or case_weight_lb change
-      // (and cost_per_lb wasn't explicitly set in this patch).
       if (!('cost_per_lb' in rawPatch) &&
           ('cost_per_case' in rawPatch || 'case_weight_lb' in rawPatch)) {
         const cpc = ('cost_per_case' in merged) ? merged.cost_per_case
@@ -668,21 +715,26 @@ export default function PicklistSkus() {
           merged.cost_per_lb = cpc / cwl
         }
       }
-      if (Object.keys(merged).length === 0) {
-        const next = { ...prev }
-        delete next[itemId]
-        return next
-      }
-      return { ...prev, [itemId]: merged }
+      const next = { ...base }
+      if (Object.keys(merged).length === 0) delete next[itemId]
+      else next[itemId] = merged
+      pendingDirtyRef.current = next
+      // Schedule the bag clear after React commits.
+      queueMicrotask(() => { pendingDirtyRef.current = null })
+      return next
     })
   }
 
   // ── Clipboard: selection → TSV, TSV → distribute, clear range ──────────────
-  function selectionToTSV() {
-    const box = selectionBox(selection)
+  function flashClipboardMsg(text) {
+    setClipboardMsg(text)
+    setTimeout(() => setClipboardMsg(null), 2000)
+  }
+
+  function selectionToTSVFromBox(box) {
     if (!box) return ''
     const rows = dataRowsRef.current
-    const cols = activeCols
+    const cols = activeColsRef.current
     const out = []
     for (let r = box.rs; r <= box.re; r++) {
       if (r >= rows.length) continue
@@ -700,9 +752,9 @@ export default function PicklistSkus() {
   }
 
   function distributeToCells(matrix, anchor) {
-    if (!matrix.length) return
+    if (!matrix.length) return 0
     const rows = dataRowsRef.current
-    const cols = activeCols
+    const cols = activeColsRef.current
     const patchesByRow = new Map()
     for (let i = 0; i < matrix.length; i++) {
       const r = anchor.rowIdx + i
@@ -724,13 +776,14 @@ export default function PicklistSkus() {
     const widest = matrix.reduce((m, r) => Math.max(m, r.length), 0)
     const lastCol = Math.min(anchor.colIdx + widest - 1, cols.length - 1)
     setSelection({ anchor, focus: { rowIdx: lastRow, colIdx: lastCol } })
+    return patchesByRow.size
   }
 
-  function clearSelectionCells() {
-    const box = selectionBox(selection)
-    if (!box) return
+  function clearSelectionCellsForBox(box) {
+    if (!box) return 0
     const rows = dataRowsRef.current
-    const cols = activeCols
+    const cols = activeColsRef.current
+    let touched = 0
     for (let r = box.rs; r <= box.re; r++) {
       const item = rows[r]?.original
       if (!item) continue
@@ -740,45 +793,13 @@ export default function PicklistSkus() {
         if (!col?.editable) continue
         patch[col.key] = null
       }
-      if (Object.keys(patch).length) applyPatchToDirty(item.id, patch)
+      if (Object.keys(patch).length) {
+        applyPatchToDirty(item.id, patch)
+        touched++
+      }
     }
+    return touched
   }
-
-  // ── Document copy/paste handlers ───────────────────────────────────────────
-  useEffect(() => {
-    function isInputEl(el) {
-      if (!el) return false
-      return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' ||
-        el.tagName === 'SELECT' || el.isContentEditable
-    }
-    function onCopy(e) {
-      // If a real input has focus (e.g. filter box), let it copy its own text.
-      if (isInputEl(document.activeElement)) return
-      if (!selection.anchor || !selection.focus) return
-      const tsv = selectionToTSV()
-      if (!tsv) return
-      e.clipboardData.setData('text/plain', tsv)
-      e.preventDefault()
-    }
-    function onPaste(e) {
-      if (!selection.anchor) return
-      const text = e.clipboardData?.getData('text/plain') ?? ''
-      if (!text) return
-      const matrix = parseTSV(text)
-      const isMulti = matrix.length > 1 || (matrix[0]?.length ?? 0) > 1
-      // Single-value paste into a focused input: let native handle it so the
-      // user can paste mid-text. Only intercept multi-cell pastes.
-      if (!isMulti && isInputEl(document.activeElement)) return
-      e.preventDefault()
-      distributeToCells(matrix, selection.anchor)
-    }
-    document.addEventListener('copy', onCopy)
-    document.addEventListener('paste', onPaste)
-    return () => {
-      document.removeEventListener('copy', onCopy)
-      document.removeEventListener('paste', onPaste)
-    }
-  }, [selection, activeCols, serverItems])
 
   // ── Cell mouse handlers ────────────────────────────────────────────────────
   function handleCellMouseDown(e, rIdx, colIdx) {
@@ -951,6 +972,7 @@ export default function PicklistSkus() {
         </button>
 
         {saveMsg && <span style={{ fontSize: 12, color: saveMsgIsErr ? '#dc2626' : '#16a34a' }}>{saveMsg}</span>}
+        {clipboardMsg && <span style={{ fontSize: 12, color: '#2563eb', fontWeight: 500 }}>{clipboardMsg}</span>}
         {syncResult && !syncMut.isPending && (
           <span style={{ fontSize: 12, color: '#16a34a' }}>
             Synced: {syncResult.created} created, {syncResult.updated} updated ({syncResult.total} total)
