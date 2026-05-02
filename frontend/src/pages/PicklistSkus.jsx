@@ -751,31 +751,56 @@ export default function PicklistSkus() {
     return buildTSV(out)
   }
 
-  function distributeToCells(matrix, anchor) {
+  function distributeToCells(matrix, pasteAnchor) {
     if (!matrix.length) return 0
     const rows = dataRowsRef.current
     const cols = activeColsRef.current
+    const matH = matrix.length
+    const matW = matrix.reduce((m, r) => Math.max(m, r.length), 0)
+    if (matW === 0) return 0
+
+    // Excel-like fill: when there's a multi-cell selection box larger than the
+    // clipboard, tile the matrix to fill the box (1×1 → fill all selected; an
+    // N×M block tiles when its dims evenly divide the selection's dims).
+    const box = selectionBox(selection)
+    let startRow = pasteAnchor.rowIdx
+    let startCol = pasteAnchor.colIdx
+    let targetRows = matH
+    let targetCols = matW
+    if (box) {
+      const selH = box.re - box.rs + 1
+      const selW = box.ce - box.cs + 1
+      const fitsRows = selH >= matH && selH % matH === 0
+      const fitsCols = selW >= matW && selW % matW === 0
+      if (fitsRows && fitsCols && (selH > matH || selW > matW)) {
+        startRow = box.rs
+        startCol = box.cs
+        targetRows = selH
+        targetCols = selW
+      }
+    }
+
     const patchesByRow = new Map()
-    for (let i = 0; i < matrix.length; i++) {
-      const r = anchor.rowIdx + i
+    for (let i = 0; i < targetRows; i++) {
+      const r = startRow + i
       if (r >= rows.length) break
       const item = rows[r]?.original
       if (!item) continue
       const patch = patchesByRow.get(item.id) || {}
-      for (let j = 0; j < matrix[i].length; j++) {
-        const c = anchor.colIdx + j
+      const srcRow = matrix[i % matH]
+      for (let j = 0; j < targetCols; j++) {
+        const c = startCol + j
         if (c >= cols.length) break
         const col = cols[c]
         if (!col.editable) continue
-        patch[col.key] = parseValue(col, matrix[i][j])
+        patch[col.key] = parseValue(col, srcRow[j % matW])
       }
       if (Object.keys(patch).length) patchesByRow.set(item.id, patch)
     }
     for (const [id, patch] of patchesByRow) applyPatchToDirty(id, patch)
-    const lastRow = Math.min(anchor.rowIdx + matrix.length - 1, rows.length - 1)
-    const widest = matrix.reduce((m, r) => Math.max(m, r.length), 0)
-    const lastCol = Math.min(anchor.colIdx + widest - 1, cols.length - 1)
-    setSelection({ anchor, focus: { rowIdx: lastRow, colIdx: lastCol } })
+    const lastRow = Math.min(startRow + targetRows - 1, rows.length - 1)
+    const lastCol = Math.min(startCol + targetCols - 1, cols.length - 1)
+    setSelection({ anchor: { rowIdx: startRow, colIdx: startCol }, focus: { rowIdx: lastRow, colIdx: lastCol } })
     return patchesByRow.size
   }
 
