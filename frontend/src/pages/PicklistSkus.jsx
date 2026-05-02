@@ -48,6 +48,22 @@ function selectionBox(sel) {
   }
 }
 
+function cellsEqual(a, b) {
+  if (!a || !b) return false
+  return a.rowIdx === b.rowIdx && a.colIdx === b.colIdx
+}
+
+function parseTSV(text) {
+  const normalized = String(text ?? '').replace(/\r\n?/g, '\n')
+  const lines = normalized.split('\n')
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+  return lines.map((l) => l.split('\t'))
+}
+
+function buildTSV(rows) {
+  return rows.map((cells) => cells.join('\t')).join('\n')
+}
+
 function fmtPactor(val) {
   const n = Number(val)
   return Number.isInteger(n) ? String(n) : n.toFixed(1)
@@ -389,7 +405,7 @@ export default function PicklistSkus() {
         el.tagName === 'SELECT' || el.isContentEditable
     }
 
-    function onKeyDown(e) {
+    async function onKeyDown(e) {
       const rows = dataRowsRef.current
       const cols = activeCols
 
@@ -403,6 +419,41 @@ export default function PicklistSkus() {
 
       const anc = selection.anchor
       if (!anc || editing) return
+
+      // Backspace / Delete: clear all editable cells in the selection
+      if (!e.metaKey && !e.ctrlKey && (e.key === 'Backspace' || e.key === 'Delete')) {
+        e.preventDefault()
+        clearSelectionCells()
+        return
+      }
+
+      // Cmd/Ctrl+C/V/X clipboard shortcuts (fallback when no input is focused
+      // and the document copy/paste events don't fire on their own).
+      if (e.metaKey || e.ctrlKey) {
+        const k = e.key.toLowerCase()
+        if (k === 'c' && selection.focus && !cellsEqual(selection.anchor, selection.focus)) {
+          e.preventDefault()
+          const tsv = selectionToTSV()
+          if (tsv) { try { await navigator.clipboard.writeText(tsv) } catch {} }
+          return
+        }
+        if (k === 'v') {
+          e.preventDefault()
+          try {
+            const text = await navigator.clipboard.readText()
+            const matrix = parseTSV(text)
+            if (matrix.length) distributeToCells(matrix, selection.anchor)
+          } catch {}
+          return
+        }
+        if (k === 'x' && selection.focus && !cellsEqual(selection.anchor, selection.focus)) {
+          e.preventDefault()
+          const tsv = selectionToTSV()
+          if (tsv) { try { await navigator.clipboard.writeText(tsv) } catch {} }
+          clearSelectionCells()
+          return
+        }
+      }
 
       const arrowMap = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right' }
       const dir = arrowMap[e.key]
@@ -576,6 +627,156 @@ export default function PicklistSkus() {
       setSelection({ anchor: { rowIdx: nr, colIdx: nc }, focus: { rowIdx: nr, colIdx: nc } })
     }
   }
+
+  // ── Apply a typed patch (key→value map) into dirtyRows for one item ────────
+  // Mirrors commitEdit's auto-compute and server-comparison behavior so paste
+  // and clear behave consistently with single-cell edits.
+  function applyPatchToDirty(itemId, rawPatch) {
+    setDirtyRows(prev => {
+      const serverItem = serverItems.find(r => r.id === itemId)
+      const existing = prev[itemId] || {}
+      const merged = { ...existing }
+      for (const [k, v] of Object.entries(rawPatch)) {
+        const serverVal = serverItem?.[k] ?? null
+        if (v === serverVal) delete merged[k]
+        else merged[k] = v
+      }
+      // Auto-compute pactor when weight or multiplier change
+      if ('pactor_multiplier' in rawPatch || 'weight_lb' in rawPatch) {
+        const mult = ('pactor_multiplier' in merged) ? merged.pactor_multiplier
+                   : (serverItem?.pactor_multiplier ?? null)
+        const wt = ('weight_lb' in merged) ? merged.weight_lb
+                : (serverItem?.weight_lb ?? null)
+        if (mult != null && wt != null) {
+          const computed = mult * wt
+          if (computed !== (serverItem?.pactor ?? null)) merged.pactor = computed
+          else delete merged.pactor
+        }
+      }
+      // Auto-compute cost_per_lb if cost_per_case or case_weight_lb change
+      // (and cost_per_lb wasn't explicitly set in this patch).
+      if (!('cost_per_lb' in rawPatch) &&
+          ('cost_per_case' in rawPatch || 'case_weight_lb' in rawPatch)) {
+        const cpc = ('cost_per_case' in merged) ? merged.cost_per_case
+                  : (serverItem?.cost_per_case ?? null)
+        const cwl = ('case_weight_lb' in merged) ? merged.case_weight_lb
+                  : (serverItem?.case_weight_lb ?? null)
+        const existingCpl = ('cost_per_lb' in merged) ? merged.cost_per_lb
+                          : (serverItem?.cost_per_lb ?? null)
+        if (cpc != null && cwl != null && cwl !== 0 && existingCpl == null) {
+          merged.cost_per_lb = cpc / cwl
+        }
+      }
+      if (Object.keys(merged).length === 0) {
+        const next = { ...prev }
+        delete next[itemId]
+        return next
+      }
+      return { ...prev, [itemId]: merged }
+    })
+  }
+
+  // ── Clipboard: selection → TSV, TSV → distribute, clear range ──────────────
+  function selectionToTSV() {
+    const box = selectionBox(selection)
+    if (!box) return ''
+    const rows = dataRowsRef.current
+    const cols = activeCols
+    const out = []
+    for (let r = box.rs; r <= box.re; r++) {
+      if (r >= rows.length) continue
+      const item = rows[r]?.original
+      if (!item) continue
+      const cells = []
+      for (let c = box.cs; c <= box.ce; c++) {
+        if (c >= cols.length) continue
+        const v = item[cols[c].key]
+        cells.push(v == null ? '' : String(v))
+      }
+      out.push(cells)
+    }
+    return buildTSV(out)
+  }
+
+  function distributeToCells(matrix, anchor) {
+    if (!matrix.length) return
+    const rows = dataRowsRef.current
+    const cols = activeCols
+    const patchesByRow = new Map()
+    for (let i = 0; i < matrix.length; i++) {
+      const r = anchor.rowIdx + i
+      if (r >= rows.length) break
+      const item = rows[r]?.original
+      if (!item) continue
+      const patch = patchesByRow.get(item.id) || {}
+      for (let j = 0; j < matrix[i].length; j++) {
+        const c = anchor.colIdx + j
+        if (c >= cols.length) break
+        const col = cols[c]
+        if (!col.editable) continue
+        patch[col.key] = parseValue(col, matrix[i][j])
+      }
+      if (Object.keys(patch).length) patchesByRow.set(item.id, patch)
+    }
+    for (const [id, patch] of patchesByRow) applyPatchToDirty(id, patch)
+    const lastRow = Math.min(anchor.rowIdx + matrix.length - 1, rows.length - 1)
+    const widest = matrix.reduce((m, r) => Math.max(m, r.length), 0)
+    const lastCol = Math.min(anchor.colIdx + widest - 1, cols.length - 1)
+    setSelection({ anchor, focus: { rowIdx: lastRow, colIdx: lastCol } })
+  }
+
+  function clearSelectionCells() {
+    const box = selectionBox(selection)
+    if (!box) return
+    const rows = dataRowsRef.current
+    const cols = activeCols
+    for (let r = box.rs; r <= box.re; r++) {
+      const item = rows[r]?.original
+      if (!item) continue
+      const patch = {}
+      for (let c = box.cs; c <= box.ce; c++) {
+        const col = cols[c]
+        if (!col?.editable) continue
+        patch[col.key] = null
+      }
+      if (Object.keys(patch).length) applyPatchToDirty(item.id, patch)
+    }
+  }
+
+  // ── Document copy/paste handlers ───────────────────────────────────────────
+  useEffect(() => {
+    function isInputEl(el) {
+      if (!el) return false
+      return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' ||
+        el.tagName === 'SELECT' || el.isContentEditable
+    }
+    function onCopy(e) {
+      if (!selection.anchor || !selection.focus) return
+      if (cellsEqual(selection.anchor, selection.focus)) return
+      const tsv = selectionToTSV()
+      if (!tsv) return
+      e.clipboardData.setData('text/plain', tsv)
+      e.preventDefault()
+    }
+    function onPaste(e) {
+      if (!selection.anchor) return
+      const text = e.clipboardData?.getData('text/plain') ?? ''
+      if (!text) return
+      const matrix = parseTSV(text)
+      const isMulti = matrix.length > 1 || (matrix[0]?.length ?? 0) > 1
+      // Single-value paste into a focused input: let native handle it so the
+      // user can paste mid-text. Only intercept multi-cell pastes.
+      if (!isMulti && isInputEl(document.activeElement)) return
+      e.preventDefault()
+      distributeToCells(matrix, selection.anchor)
+    }
+    document.addEventListener('copy', onCopy)
+    document.addEventListener('paste', onPaste)
+    return () => {
+      document.removeEventListener('copy', onCopy)
+      document.removeEventListener('paste', onPaste)
+    }
+  }, [selection, activeCols, serverItems])
 
   // ── Cell mouse handlers ────────────────────────────────────────────────────
   function handleCellMouseDown(e, rIdx, colIdx) {
