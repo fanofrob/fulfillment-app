@@ -427,11 +427,12 @@ export default function PicklistSkus() {
         return
       }
 
-      // Cmd/Ctrl+C/V/X clipboard shortcuts (fallback when no input is focused
-      // and the document copy/paste events don't fire on their own).
+      // Cmd/Ctrl+C/V/X clipboard shortcuts. The native copy/paste events only
+      // fire when the browser sees a selection or focused input, so the
+      // spreadsheet (no DOM focus, internal-state selection) relies on this.
       if (e.metaKey || e.ctrlKey) {
         const k = e.key.toLowerCase()
-        if (k === 'c' && selection.focus && !cellsEqual(selection.anchor, selection.focus)) {
+        if (k === 'c') {
           e.preventDefault()
           const tsv = selectionToTSV()
           if (tsv) { try { await navigator.clipboard.writeText(tsv) } catch {} }
@@ -446,7 +447,7 @@ export default function PicklistSkus() {
           } catch {}
           return
         }
-        if (k === 'x' && selection.focus && !cellsEqual(selection.anchor, selection.focus)) {
+        if (k === 'x') {
           e.preventDefault()
           const tsv = selectionToTSV()
           if (tsv) { try { await navigator.clipboard.writeText(tsv) } catch {} }
@@ -751,8 +752,9 @@ export default function PicklistSkus() {
         el.tagName === 'SELECT' || el.isContentEditable
     }
     function onCopy(e) {
+      // If a real input has focus (e.g. filter box), let it copy its own text.
+      if (isInputEl(document.activeElement)) return
       if (!selection.anchor || !selection.focus) return
-      if (cellsEqual(selection.anchor, selection.focus)) return
       const tsv = selectionToTSV()
       if (!tsv) return
       e.clipboardData.setData('text/plain', tsv)
