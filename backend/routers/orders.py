@@ -1734,7 +1734,7 @@ def _check_already_in_shipstation(order, db: Session) -> Optional[str]:
     ).filter(
         models.FulfillmentPlan.shopify_order_id == order.shopify_order_id,
         models.FulfillmentPlan.status != "cancelled",
-        models.FulfillmentBox.status != "cancelled",
+        models.FulfillmentBox.status.in_(["pending", "packed"]),
         models.FulfillmentBox.shipstation_order_id.isnot(None),
     ).first()
     if pushed:
