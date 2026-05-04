@@ -1073,6 +1073,10 @@ def pull_orders(body: schemas.PullOrdersRequest, db: Session = Depends(get_db)):
                 models.FulfillmentPlan.id.in_(plan_ids)
             ).delete(synchronize_session=False)
 
+        db.query(models.ProjectionPeriodConfirmedOrder).filter(
+            models.ProjectionPeriodConfirmedOrder.shopify_order_id == stale.shopify_order_id
+        ).delete(synchronize_session=False)
+
         db.query(models.ShopifyLineItem).filter(
             models.ShopifyLineItem.shopify_order_id == stale.shopify_order_id
         ).delete(synchronize_session=False)
