@@ -157,14 +157,20 @@ def generate_projection(
         oh_lbs = on_hand.get(pt, 0.0) * inv_factor
         eoh_lbs = expected_on_hand.get(pt, 0.0) * inv_factor
         on_order = on_order_map.get(pt, 0.0)
-        gap = padded_lbs - oh_lbs - eoh_lbs - on_order
+        # For Period 2+, expected_on_hand already represents the inventory
+        # remaining AFTER the prior period's projected consumption — that's the
+        # right starting point for THIS period. Subtracting both oh_lbs and
+        # eoh_lbs would double-count. Period 1 has no prior period, so
+        # expected_on_hand is empty and current on_hand is what's available.
+        inventory_lbs = eoh_lbs if period.previous_period_id else oh_lbs
+        gap = padded_lbs - inventory_lbs - on_order
 
         cw = case_weight_map.get(pt)
         gap_cases = math.ceil(gap / cw) if cw and cw > 0 and gap > 0 else None
 
         if gap > 0:
             gap_status = "short"
-        elif oh_lbs > 0 and gap < -(oh_lbs * 0.5):
+        elif inventory_lbs > 0 and gap < -(inventory_lbs * 0.5):
             gap_status = "long"
         else:
             gap_status = "ok"
