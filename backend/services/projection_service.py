@@ -114,7 +114,7 @@ def generate_projection(
     on_hand = _calc_on_hand(db, weight_map, sku_lookup, warehouse)
 
     # ── Step 7: Expected on-hand (Period 2+) ─────────────────────────────────
-    expected_on_hand = _calc_expected_on_hand(db, period)
+    expected_on_hand = _calc_expected_on_hand(db, period, on_hand)
 
     # ── Step 8: Assemble product types, padding & gap ────────────────────────
     on_order_map = _calc_on_order(db, period_id)
@@ -853,37 +853,75 @@ def _calc_on_order(db: Session, period_id: int) -> dict[str, float]:
     return {pt: lbs or 0.0 for pt, lbs in results}
 
 
-def _calc_expected_on_hand(db: Session, period: models.ProjectionPeriod) -> dict[str, float]:
+def _apply_spoilage(
+    on_hand: dict[str, float],
+    spoilage_overrides: dict[str, float],
+) -> dict[str, float]:
+    """Apply per-PT spoilage % to an inventory dict, floored at 0."""
+    result = {}
+    for pt, lbs in on_hand.items():
+        spoilage_pct = spoilage_overrides.get(pt, 0.0)
+        if spoilage_pct > 0:
+            lbs *= (1 - spoilage_pct / 100.0)
+        result[pt] = max(0.0, lbs)
+    return result
+
+
+def _calc_expected_on_hand(
+    db: Session,
+    period: models.ProjectionPeriod,
+    current_on_hand: dict[str, float],
+) -> dict[str, float]:
     """
-    For Period 2+, calculate expected remaining inventory after the preceding period.
-    expected = prev_on_hand - prev_padded_demand, adjusted for spoilage, floored at 0.
+    For Period 2+, expected inventory available at the start of THIS period.
+
+    Uses live current_on_hand rather than the prior projection's stored
+    on_hand_lbs (which is a stale snapshot — misses receipts that arrived
+    after the prior projection was generated).
+
+      - Prior period already ended → current_on_hand IS post-prev-period
+        reality; pass it through (with spoilage).
+      - Prior period still active/future → subtract prior period's padded
+        demand from current_on_hand (what will be consumed before this
+        period starts).
     """
     if not period.previous_period_id:
         return {}
 
-    # Find the latest "current" projection for the previous period
+    spoilage_overrides = period.spoilage_adjustments or {}
+
+    prev_period = db.query(models.ProjectionPeriod).filter(
+        models.ProjectionPeriod.id == period.previous_period_id
+    ).first()
+    if not prev_period:
+        return _apply_spoilage(current_on_hand, spoilage_overrides)
+
+    now = datetime.now(timezone.utc)
+    prev_end = _ensure_utc(prev_period.fulfillment_end or prev_period.end_datetime)
+    prior_ended = prev_end is not None and prev_end < now
+
+    if prior_ended:
+        return _apply_spoilage(current_on_hand, spoilage_overrides)
+
     prev_projection = db.query(models.Projection).filter(
         models.Projection.period_id == period.previous_period_id,
         models.Projection.status == "current",
     ).order_by(models.Projection.generated_at.desc()).first()
 
-    if not prev_projection:
-        return {}
+    prev_demand: dict[str, float] = {}
+    if prev_projection:
+        prev_lines = db.query(models.ProjectionLine).filter(
+            models.ProjectionLine.projection_id == prev_projection.id
+        ).all()
+        prev_demand = {l.product_type: (l.padded_demand_lbs or 0.0) for l in prev_lines}
 
-    prev_lines = db.query(models.ProjectionLine).filter(
-        models.ProjectionLine.projection_id == prev_projection.id
-    ).all()
-
-    spoilage_overrides = period.spoilage_adjustments or {}
     result = {}
-
-    for line in prev_lines:
-        remaining = line.on_hand_lbs - line.padded_demand_lbs
-        # Apply spoilage
-        spoilage_pct = spoilage_overrides.get(line.product_type, 0.0)
+    for pt in set(current_on_hand) | set(prev_demand):
+        remaining = current_on_hand.get(pt, 0.0) - prev_demand.get(pt, 0.0)
+        spoilage_pct = spoilage_overrides.get(pt, 0.0)
         if spoilage_pct > 0:
             remaining *= (1 - spoilage_pct / 100.0)
-        result[line.product_type] = max(0.0, remaining)
+        result[pt] = max(0.0, remaining)
 
     return result
 
