@@ -20,6 +20,7 @@ import PurchaseOrders from './pages/PurchaseOrders'
 import PurchasePlanning from './pages/PurchasePlanning'
 import StagingDashboard from './pages/StagingDashboard'
 import IssueSkuDetail from './pages/IssueSkuDetail'
+import UnmappedSkus from './pages/UnmappedSkus'
 import InventoryCount from './pages/InventoryCount'
 import './App.css'
 
@@ -41,6 +42,7 @@ export default function App() {
           <li><NavLink to="/inventory">Inventory</NavLink></li>
           <li><NavLink to="/inventory-count">Inventory Count</NavLink></li>
           <li><NavLink to="/orders">Orders</NavLink></li>
+          <li><NavLink to="/unmapped-skus">Unmapped SKUs</NavLink></li>
           <li><NavLink to="/staging-dashboard">Staging Dashboard</NavLink></li>
           <li><NavLink to="/demand-dashboard">Demand Dashboard</NavLink></li>
         </ul>
@@ -78,6 +80,7 @@ export default function App() {
           <Route path="/orders" element={<Orders />} />
           <Route path="/staging-dashboard" element={<StagingDashboard />} />
           <Route path="/staging-dashboard/issue/:pickSku" element={<IssueSkuDetail />} />
+          <Route path="/unmapped-skus" element={<UnmappedSkus />} />
           <Route path="/demand-dashboard" element={<DemandDashboard />} />
           <Route path="/projection-dashboard" element={<ProjectionDashboard />} />
           <Route path="/projection-periods" element={<ProjectionPeriods />} />

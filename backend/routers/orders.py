@@ -107,6 +107,20 @@ def _build_order_response(
     )
 
 
+def _check_unmapped_skus(order_id: str, db: Session) -> bool:
+    """
+    Returns True if the order has any line item with sku_mapped=False
+    and a positive fulfillable_quantity. Such an order can't be picked
+    correctly and must be blocked from staging until the SKU is mapped.
+    """
+    return db.query(models.ShopifyLineItem).filter(
+        models.ShopifyLineItem.shopify_order_id == order_id,
+        models.ShopifyLineItem.sku_mapped == False,
+        models.ShopifyLineItem.fulfillable_quantity > 0,
+        or_(models.ShopifyLineItem.app_line_status.notin_(["short_ship", "removed"]), models.ShopifyLineItem.app_line_status.is_(None)),
+    ).first() is not None
+
+
 def _check_plan_mismatch(
     order_id: str,
     db: Session,
@@ -117,6 +131,8 @@ def _check_plan_mismatch(
     Returns True if the plan's box quantities don't match the order's line items.
     Catches both under-coverage (items missing from boxes) and over-coverage
     (boxes have SKUs or quantities exceeding what the order now requires).
+    Also returns True if the order has any unmapped SKU — those orders can't be
+    picked correctly and must surface in the Plan Mismatch filter.
     Note: requires_shipping is intentionally excluded — items with a mapped pick_sku
     must be packed regardless of Shopify's requires_shipping flag (e.g. promo items).
 
@@ -125,6 +141,9 @@ def _check_plan_mismatch(
     pick_skus + SkuMapping. This keeps the mismatch check consistent with a
     plan that was built against the same override (e.g. Confirmed Orders).
     """
+    if not mapping_tab and _check_unmapped_skus(order_id, db):
+        return True
+
     needed: dict[str, float] = {}
 
     if mapping_tab:
@@ -420,6 +439,25 @@ def list_orders(
                         mismatch_order_ids.add(oid)
                         break
 
+        # Unmapped SKUs: any order with an unmapped, fulfillable line item is a
+        # plan mismatch — it can't be picked correctly, so surface it in the
+        # Plan Mismatch sidebar/filter alongside under/over-coverage.
+        # (Skipped under mapping_tab override — the override path resolves SKUs
+        # against a different sheet tab and isn't comparable to stored sku_mapped.)
+        if not mapping_tab:
+            unmapped_order_ids = {
+                row[0] for row in db.query(models.ShopifyLineItem.shopify_order_id)
+                .filter(
+                    models.ShopifyLineItem.shopify_order_id.in_(order_ids),
+                    models.ShopifyLineItem.sku_mapped == False,
+                    models.ShopifyLineItem.fulfillable_quantity > 0,
+                    or_(models.ShopifyLineItem.app_line_status.notin_(["short_ship", "removed"]), models.ShopifyLineItem.app_line_status.is_(None)),
+                )
+                .distinct()
+                .all()
+            }
+            mismatch_order_ids |= unmapped_order_ids
+
         # Don't surface plan/box issues for orders already in ShipStation —
         # the plan is locked once pushed, so any mismatch with refreshed
         # Shopify line items isn't actionable from the Orders page.
@@ -439,6 +477,91 @@ def list_orders(
         )
         for o in orders
     ]
+
+
+# ── Unmapped SKUs dashboard ───────────────────────────────────────────────────
+
+@router.get("/unmapped-skus")
+def list_unmapped_skus(db: Session = Depends(get_db)):
+    """
+    Return open (non-fulfilled, non-cancelled, non-archived) orders with at
+    least one unmapped, fulfillable line item — grouped by Shopify SKU.
+
+    Used by the Unmapped SKUs dashboard so the user can see exactly which
+    SKUs need a mapping and which orders are blocked by each.
+    """
+    rows = (
+        db.query(
+            models.ShopifyLineItem.shopify_sku,
+            models.ShopifyLineItem.product_title,
+            models.ShopifyLineItem.variant_title,
+            models.ShopifyLineItem.shopify_order_id,
+            models.ShopifyLineItem.fulfillable_quantity,
+            models.ShopifyOrder.shopify_order_number,
+            models.ShopifyOrder.customer_name,
+            models.ShopifyOrder.assigned_warehouse,
+            models.ShopifyOrder.app_status,
+            models.ShopifyOrder.created_at_shopify,
+            models.ShopifyOrder.tags,
+            models.ShopifyOrder.total_price,
+        )
+        .join(models.ShopifyOrder, models.ShopifyOrder.shopify_order_id == models.ShopifyLineItem.shopify_order_id)
+        .filter(
+            models.ShopifyLineItem.sku_mapped == False,
+            models.ShopifyLineItem.fulfillable_quantity > 0,
+            or_(models.ShopifyLineItem.app_line_status.notin_(["short_ship", "removed"]), models.ShopifyLineItem.app_line_status.is_(None)),
+            models.ShopifyOrder.app_status.notin_(["fulfilled", "in_shipstation_shipped"]),
+        )
+        .order_by(models.ShopifyOrder.created_at_shopify.desc())
+        .all()
+    )
+
+    groups: dict = {}
+    seen_orders: set = set()
+    for r in rows:
+        sku = r.shopify_sku or "(no SKU)"
+        title_parts = [r.product_title, r.variant_title]
+        title = " — ".join(p for p in title_parts if p) or None
+        g = groups.setdefault(sku, {
+            "shopify_sku": sku,
+            "sample_title": title,
+            "warehouses": set(),
+            "orders": [],
+            "_seen_order_ids": set(),
+        })
+        if r.assigned_warehouse:
+            g["warehouses"].add(r.assigned_warehouse)
+        if r.shopify_order_id not in g["_seen_order_ids"]:
+            g["_seen_order_ids"].add(r.shopify_order_id)
+            g["orders"].append({
+                "shopify_order_id": r.shopify_order_id,
+                "shopify_order_number": r.shopify_order_number,
+                "customer_name": r.customer_name,
+                "warehouse": r.assigned_warehouse,
+                "app_status": r.app_status,
+                "order_date": r.created_at_shopify.isoformat() if r.created_at_shopify else None,
+                "total_price": r.total_price,
+                "tags": r.tags,
+                "fulfillable_quantity": r.fulfillable_quantity,
+            })
+        seen_orders.add(r.shopify_order_id)
+
+    out_groups = []
+    for sku, g in groups.items():
+        out_groups.append({
+            "shopify_sku": g["shopify_sku"],
+            "sample_title": g["sample_title"],
+            "warehouses": sorted(g["warehouses"]),
+            "order_count": len(g["orders"]),
+            "orders": g["orders"],
+        })
+    out_groups.sort(key=lambda g: (-g["order_count"], g["shopify_sku"]))
+
+    return {
+        "total_skus": len(out_groups),
+        "total_orders": len(seen_orders),
+        "groups": out_groups,
+    }
 
 
 # ── Archived orders ───────────────────────────────────────────────────────────
@@ -1686,6 +1809,11 @@ def _check_plan_issues(order, db: Session) -> Optional[str]:
     Check if an order has plan/box issues that should block staging.
     Returns None if no issues, or an error message string if blocked.
     """
+    # Unmapped SKUs: surface a specific error before the generic mismatch check
+    # so the user knows to fix the SKU mapping (not the plan).
+    if _check_unmapped_skus(order.shopify_order_id, db):
+        return "Order has unmapped SKU(s) — add them to SKU Mapping before staging"
+
     # Check has_plan: order must have at least one non-cancelled fulfillment plan
     has_plan = db.query(models.FulfillmentPlan).filter(
         models.FulfillmentPlan.shopify_order_id == order.shopify_order_id,

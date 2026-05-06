@@ -1149,9 +1149,27 @@ export default function OrdersPage({
   const errorAlerts = useMemo(() => {
     const alerts = []
     let cogsCount = 0
+    let unmappedOrders = 0
+    const unmappedSkuSet = new Set()
     for (const o of allOrders) {
       if (o.app_status === 'fulfilled') continue
       if (allMarginsMap[o.shopify_order_id]?.missing_cost_skus?.length > 0) cogsCount++
+      const unmappedLis = (o.line_items || []).filter(
+        li => !li.sku_mapped && (li.fulfillable_quantity || 0) > 0 && li.app_line_status !== 'short_ship' && li.app_line_status !== 'removed'
+      )
+      if (unmappedLis.length > 0) {
+        unmappedOrders++
+        for (const li of unmappedLis) if (li.shopify_sku) unmappedSkuSet.add(li.shopify_sku)
+      }
+    }
+    if (unmappedOrders > 0) {
+      alerts.push({
+        key: 'unmapped_skus',
+        label: `${unmappedOrders} order${unmappedOrders === 1 ? '' : 's'} blocked by ${unmappedSkuSet.size} unmapped SKU${unmappedSkuSet.size === 1 ? '' : 's'} — cannot stage until mapped`,
+        actionLabel: 'View dashboard →',
+        onAction: () => navigate('/unmapped-skus'),
+        onView: () => setStatusFilter('plan_mismatch'),
+      })
     }
     if (cogsCount > 0) {
       alerts.push({
