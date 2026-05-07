@@ -56,7 +56,22 @@ function csvEscape(val) {
   return s
 }
 
-async function printWeeklyReport(warehouse) {
+// Report-mode helpers shared by print + count-sheet flows.
+// 'inventory' = recount (set on-hand); 'discard' = deduction (subtract from on-hand).
+function reportTitle(mode, warehouseLabel, dateStr) {
+  const kind = mode === 'discard' ? 'Discard' : 'Inventory'
+  return `Weekly ${kind} Report — ${warehouseLabel} — ${dateStr}`
+}
+
+function reportSubtitle(mode, count) {
+  const sku = `${count} SKU${count !== 1 ? 's' : ''}`
+  if (mode === 'discard') {
+    return `Write the quantity to <strong>deduct</strong> from on-hand for each SKU thrown out &nbsp;·&nbsp; ${sku}`
+  }
+  return `Write the recounted on-hand quantity for each SKU &nbsp;·&nbsp; ${sku}`
+}
+
+async function printWeeklyReport(warehouse, mode = 'inventory') {
   // Open window immediately (synchronous with user gesture) so popup blockers pass.
   const win = window.open('', '_blank')
   if (!win) { alert('Pop-up blocked — please allow pop-ups for this site.'); return }
@@ -74,6 +89,8 @@ async function printWeeklyReport(warehouse) {
   const now = new Date()
   const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
   const warehouseLabel = warehouse.charAt(0).toUpperCase() + warehouse.slice(1)
+  const title = reportTitle(mode, warehouseLabel, dateStr)
+  const isDiscard = mode === 'discard'
 
   const fruit = items.filter(i => i.category?.toLowerCase() === 'fruit')
   const packaging = items.filter(i => i.category?.toLowerCase() === 'packaging')
@@ -82,13 +99,15 @@ async function printWeeklyReport(warehouse) {
     return !cat || (cat !== 'fruit' && cat !== 'packaging')
   })
 
-  function renderSection(title, rows) {
+  const updatedColLabel = isDiscard ? 'Quantity to Discard' : 'Updated Quantity'
+
+  function renderSection(sectionTitle, rows) {
     if (!rows.length) return ''
     return `
-      <h3 style="margin:24px 0 8px;font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:#555;border-bottom:1px solid #ccc;padding-bottom:4px">${title}</h3>
+      <h3 style="margin:24px 0 8px;font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:#555;border-bottom:1px solid #ccc;padding-bottom:4px">${sectionTitle}</h3>
       <table>
         <thead><tr>
-          <th>SKU</th><th style="text-align:right">Available</th><th>Batch</th><th style="width:110px">Updated Quantity</th><th style="width:200px">Notes</th>
+          <th>SKU</th><th style="text-align:right">Available</th><th>Batch</th><th style="width:130px">${updatedColLabel}</th><th style="width:200px">Notes</th>
         </tr></thead>
         <tbody>
           ${rows.map(r => `<tr>
@@ -106,7 +125,7 @@ async function printWeeklyReport(warehouse) {
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Weekly Inventory Report — ${warehouseLabel} — ${dateStr}</title>
+  <title>${title}</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13.2px; color: #111; margin: 32px; }
     h1 { font-size: 19.8px; margin: 0 0 4px; }
@@ -114,12 +133,29 @@ async function printWeeklyReport(warehouse) {
     table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
     th { text-align: left; font-size: 12.1px; font-weight: 600; color: #555; border: 1px solid #ddd; border-bottom: 2px solid #ddd; padding: 4.8px 8px; }
     td { padding: 4.8px 8px; border: 1px solid #eee; }
-    @media print { body { margin: 16px; } }
+    .discard-badge { display: inline-block; background: ${isDiscard ? '#fee2e2' : '#e0f2fe'}; color: ${isDiscard ? '#991b1b' : '#075985'}; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; padding: 2px 8px; border-radius: 4px; margin-right: 8px; vertical-align: middle; }
+    /* Page header repeats on every printed page so multi-page sheets don't lose context. */
+    .page-header { display: none; }
+    @media print {
+      body { margin: 56px 16px 16px; }
+      .page-header {
+        display: block;
+        position: fixed;
+        top: 0; left: 0; right: 0;
+        padding: 6px 16px;
+        border-bottom: 1px solid #999;
+        background: #fff;
+        font-size: 11px;
+        font-weight: 600;
+        color: ${isDiscard ? '#991b1b' : '#111'};
+      }
+    }
   </style>
 </head>
 <body>
-  <h1>Weekly Inventory Report — ${warehouseLabel}</h1>
-  <div class="subtitle">SKUs with inventory &gt; 0 in the last 7 days &nbsp;·&nbsp; Printed ${dateStr} &nbsp;·&nbsp; ${items.length} SKU${items.length !== 1 ? 's' : ''}</div>
+  <div class="page-header">${title}</div>
+  <h1><span class="discard-badge">${isDiscard ? 'DISCARD' : 'INVENTORY'}</span>${title}</h1>
+  <div class="subtitle">${reportSubtitle(mode, items.length)} &nbsp;·&nbsp; Printed ${dateStr}</div>
   ${renderSection('Fruit', fruit)}
   ${renderSection('Packaging', packaging)}
   ${renderSection('Other', other)}
@@ -130,6 +166,37 @@ async function printWeeklyReport(warehouse) {
   win.document.close()
   win.focus()
   win.print()
+}
+
+// CSV count-sheet stub: title metadata in row 1, headers in row 2, one row per SKU
+// with an empty on_hand_qty column for handwritten transcription. The metadata row
+// is what CsvImportModal reads to auto-pick subtract (discard) vs set (inventory).
+async function downloadCountSheet(warehouse, mode = 'inventory') {
+  let items
+  try {
+    items = await inventoryApi.weeklyReport(warehouse)
+  } catch {
+    alert('Failed to load weekly report')
+    return
+  }
+
+  const now = new Date()
+  const isoDate = now.toISOString().slice(0, 10)
+  const longDate = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+  const warehouseLabel = warehouse.charAt(0).toUpperCase() + warehouse.slice(1)
+  const title = reportTitle(mode, warehouseLabel, longDate)
+
+  const headers = ['pick_sku', 'on_hand_qty']
+  const rows = items.map(i => `${csvEscape(i.pick_sku)},`)
+  const csv = [`# ${title}`, headers.join(','), ...rows].join('\n')
+
+  const blob = new Blob([csv], { type: 'text/csv' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${mode === 'discard' ? 'discard' : 'inventory'}-count-${warehouse}-${isoDate}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
 }
 
 function exportCsv(items, warehouse) {
@@ -144,29 +211,53 @@ function exportCsv(items, warehouse) {
   URL.revokeObjectURL(url)
 }
 
+// Reads the first non-blank `# `-prefixed line as a title metadata row, e.g.
+// `# Weekly Discard Report — Walnut — 2026-05-07`. Returns { title, mode } where
+// mode is 'discard' if the title contains "Discard", 'inventory' if it contains
+// "Inventory", or null. Used by CsvImportModal to default Set vs Subtract.
+function parseTitleMeta(line) {
+  if (!line || !line.startsWith('#')) return null
+  const title = line.replace(/^#\s*/, '').trim()
+  if (!title) return null
+  const lower = title.toLowerCase()
+  let mode = null
+  if (/\bdiscard\b/.test(lower)) mode = 'discard'
+  else if (/\binventory\b/.test(lower)) mode = 'inventory'
+  return { title, mode }
+}
+
 function parseCsv(text) {
-  const lines = text.trim().split(/\r?\n/)
-  if (lines.length < 2) return { headers: [], rows: [] }
+  const allLines = text.trim().split(/\r?\n/)
+  let meta = null
+  let i = 0
+  // Skip leading blank lines and consume an optional `#`-prefixed title metadata line.
+  while (i < allLines.length && allLines[i].trim() === '') i++
+  if (i < allLines.length) {
+    const m = parseTitleMeta(allLines[i])
+    if (m) { meta = m; i++ }
+  }
+  const lines = allLines.slice(i)
+  if (lines.length < 2) return { headers: [], rows: [], meta }
   const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''))
   const rows = lines.slice(1).map(line => {
     const values = []
     let cur = ''
     let inQ = false
-    for (let i = 0; i < line.length; i++) {
-      if (line[i] === '"') {
-        if (inQ && line[i + 1] === '"') { cur += '"'; i++ }
+    for (let j = 0; j < line.length; j++) {
+      if (line[j] === '"') {
+        if (inQ && line[j + 1] === '"') { cur += '"'; j++ }
         else inQ = !inQ
-      } else if (line[i] === ',' && !inQ) {
+      } else if (line[j] === ',' && !inQ) {
         values.push(cur.trim())
         cur = ''
       } else {
-        cur += line[i]
+        cur += line[j]
       }
     }
     values.push(cur.trim())
-    return Object.fromEntries(headers.map((h, i) => [h, values[i] ?? '']))
+    return Object.fromEntries(headers.map((h, k) => [h, values[k] ?? '']))
   })
-  return { headers, rows }
+  return { headers, rows, meta }
 }
 
 // ─── CsvImportModal ──────────────────────────────────────────────────────────
@@ -178,6 +269,7 @@ function CsvImportModal({ items, onApply, onClose }) {
   const [applying, setApplying] = useState(false)
   const [result, setResult] = useState(null)  // { ok, errors }
   const [parseError, setParseError] = useState('')
+  const [detectedTitle, setDetectedTitle] = useState(null)  // { title, mode } from CSV's `#` row
   const fileRef = useRef()
 
   const itemMap = useMemo(() => {
@@ -209,10 +301,14 @@ function CsvImportModal({ items, onApply, onClose }) {
     setParseError('')
     setRawRows(null)
     setResult(null)
+    setDetectedTitle(null)
+    // Clear any previously prefilled discard note so switching between files doesn't
+    // leak last run's note into a fresh upload.
+    setNote('')
     const reader = new FileReader()
     reader.onload = (ev) => {
       try {
-        const { headers, rows } = parseCsv(ev.target.result)
+        const { headers, rows, meta } = parseCsv(ev.target.result)
         if (!headers.includes('pick_sku') || !headers.includes('on_hand_qty')) {
           setParseError('CSV must have columns: pick_sku, on_hand_qty')
           return
@@ -226,6 +322,17 @@ function CsvImportModal({ items, onApply, onClose }) {
           parsed.push({ sku, csvVal })
         }
         setRawRows(parsed)
+        if (meta?.mode === 'discard') {
+          setDetectedTitle(meta)
+          setMode('subtract')
+          const today = new Date().toISOString().slice(0, 10)
+          setNote(`Discard ${today}`)
+        } else if (meta?.mode === 'inventory') {
+          setDetectedTitle(meta)
+          setMode('set')
+        } else if (meta?.title) {
+          setDetectedTitle(meta)
+        }
       } catch {
         setParseError('Failed to parse CSV. Check the file format.')
       }
@@ -300,6 +407,25 @@ function CsvImportModal({ items, onApply, onClose }) {
             </div>
 
             {parseError && <div className="error-msg" style={{ marginBottom: 12 }}>{parseError}</div>}
+
+            {detectedTitle && (
+              <div
+                style={{
+                  marginBottom: 12,
+                  padding: '8px 12px',
+                  borderRadius: 6,
+                  fontSize: 12.5,
+                  background: detectedTitle.mode === 'discard' ? '#fef2f2' : detectedTitle.mode === 'inventory' ? '#eff6ff' : '#f3f4f6',
+                  border: `1px solid ${detectedTitle.mode === 'discard' ? '#fecaca' : detectedTitle.mode === 'inventory' ? '#bfdbfe' : '#e5e7eb'}`,
+                  color: detectedTitle.mode === 'discard' ? '#991b1b' : detectedTitle.mode === 'inventory' ? '#1e40af' : '#374151',
+                }}
+              >
+                <strong>Detected:</strong> {detectedTitle.title}
+                {detectedTitle.mode === 'discard' && ' — defaulting to Subtract.'}
+                {detectedTitle.mode === 'inventory' && ' — defaulting to Set.'}
+                {!detectedTitle.mode && ' — pick a mode below.'}
+              </div>
+            )}
 
             {diffs !== null && (
               <>
@@ -1087,6 +1213,7 @@ function InventoryInner({ warehouse, onWarehouseChange }) {
   const [columnFilters, setColumnFilters] = useState([])
   const [shippedFrom, setShippedFrom] = useState('')
   const [shippedTo, setShippedTo] = useState('')
+  const [reportMode, setReportMode] = useState('inventory')  // 'inventory' | 'discard'
   const qc = useQueryClient()
 
   const { data: items = [], isLoading, error } = useQuery({
@@ -1330,12 +1457,52 @@ function InventoryInner({ warehouse, onWarehouseChange }) {
         <span style={{ marginLeft: 'auto', fontSize: 12, color: '#999' }}>
           {table.getFilteredRowModel().rows.length} of {items.length} SKUs
         </span>
-        <button
-          onClick={() => printWeeklyReport(warehouse)}
-          className="btn btn-secondary btn-sm"
-          title="Print SKUs that had inventory > 0 in the last 7 days"
+        <div
+          role="group"
+          aria-label="Weekly report mode"
+          style={{ display: 'inline-flex', border: '1px solid #d1d5db', borderRadius: 6, overflow: 'hidden' }}
         >
-          Print Weekly Report
+          {[['inventory', 'Inventory'], ['discard', 'Discard']].map(([val, label]) => (
+            <button
+              key={val}
+              type="button"
+              onClick={() => setReportMode(val)}
+              title={val === 'discard'
+                ? 'Discard report — handwritten quantities will be subtracted from on-hand on import'
+                : 'Inventory recount — handwritten quantities will set on-hand on import'}
+              style={{
+                padding: '4px 10px',
+                fontSize: 12.5,
+                cursor: 'pointer',
+                border: 'none',
+                background: reportMode === val
+                  ? (val === 'discard' ? '#fee2e2' : '#dbeafe')
+                  : '#fff',
+                color: reportMode === val
+                  ? (val === 'discard' ? '#991b1b' : '#1e40af')
+                  : '#374151',
+                fontWeight: reportMode === val ? 600 : 400,
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={() => printWeeklyReport(warehouse, reportMode)}
+          className="btn btn-secondary btn-sm"
+          title={reportMode === 'discard'
+            ? 'Print a Discard sheet — quantities written here will be deducted on import'
+            : 'Print SKUs that had inventory > 0 in the last 7 days'}
+        >
+          Print {reportMode === 'discard' ? 'Discard' : 'Weekly'} Report
+        </button>
+        <button
+          onClick={() => downloadCountSheet(warehouse, reportMode)}
+          className="btn btn-secondary btn-sm"
+          title="Download a CSV count-sheet stub with the report title baked in — fill in on_hand_qty and re-upload via Import CSV"
+        >
+          ↓ Count Sheet
         </button>
         <button
           onClick={() => exportCsv(items, warehouse)}

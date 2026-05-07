@@ -60,6 +60,11 @@ export default function InventoryCount() {
   const [commitError, setCommitError] = useState(null)
   const [allSkus, setAllSkus] = useState([])   // [{pick_sku, customer_description, weight_lb, case_weight_lb}]
   const [skuMap, setSkuMap] = useState({})     // pick_sku → sku obj
+  // Detected mode lives separately from the user-active mode so we can show "auto-detected"
+  // status while still letting the user override before committing.
+  const [scanMode, setScanMode] = useState('set')          // 'set' | 'subtract' — actually applied
+  const [detectedMode, setDetectedMode] = useState(null)   // 'inventory' | 'discard' | null
+  const [detectedTitle, setDetectedTitle] = useState(null)
   const fileInputRef = useRef(null)
 
   // Load picklist SKUs once
@@ -99,9 +104,16 @@ export default function InventoryCount() {
     setScanning(true)
     setScanError(null)
     setCommitResult(null)
+    setDetectedMode(null)
+    setDetectedTitle(null)
     try {
       const result = await inventoryCountApi.scan(warehouse, files)
       setRows(result.rows.map(r => initRow(r, skuMap)))
+      setDetectedTitle(result.report_title || null)
+      setDetectedMode(result.report_mode || null)
+      // Auto-pick the active mode based on what Claude saw on the printed report.
+      // 'discard' → subtract; 'inventory' or null → set (inventory recount default).
+      setScanMode(result.report_mode === 'discard' ? 'subtract' : 'set')
     } catch (e) {
       setScanError(e?.response?.data?.detail || e.message || 'Scan failed')
     } finally {
@@ -157,10 +169,10 @@ export default function InventoryCount() {
           on_hand_qty: computePieces(r),
           batch: r._batch || null,
         }))
-      const result = await inventoryCountApi.commit({ warehouse, rows: commitRows })
+      const result = await inventoryCountApi.commit({ warehouse, rows: commitRows, mode: scanMode })
       setCommitResult(result)
     } catch (e) {
-      setCommitError(e?.response?.data?.detail || e.message || 'Set inventory failed')
+      setCommitError(e?.response?.data?.detail || e.message || (scanMode === 'subtract' ? 'Discard failed' : 'Set inventory failed'))
     } finally {
       setCommitting(false)
     }
@@ -176,8 +188,10 @@ export default function InventoryCount() {
     <div style={{ padding: 24 }}>
       <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Inventory Count</h1>
       <p style={{ color: '#6b7280', fontSize: 14, marginBottom: 24 }}>
-        Upload photos of your handwritten inventory report. Claude reads the data and converts to pieces.
-        Setting inventory <strong>replaces</strong> the current count — it does not add to it.
+        Upload photos of your handwritten inventory report. Claude reads the data, the title at the top of each
+        page, and converts to pieces. <strong>Inventory</strong> reports <em>set</em> the on-hand count;{' '}
+        <strong>Discard</strong> reports <em>deduct</em> the written quantities from on-hand. The mode is
+        auto-detected from the printed title and can be overridden before committing.
       </p>
 
       {/* ── Setup panel ── */}
@@ -238,20 +252,78 @@ export default function InventoryCount() {
       {/* ── Review table ── */}
       {rows !== null && !scanning && (
         <>
+          {/* Detected mode banner — auto-picks subtract for Discard reports, set for Inventory.
+              User can override before committing. */}
+          {(detectedTitle || detectedMode) && (
+            <div
+              style={{
+                marginBottom: 12,
+                padding: '10px 14px',
+                borderRadius: 6,
+                fontSize: 13,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 12,
+                flexWrap: 'wrap',
+                background: detectedMode === 'discard' ? '#fef2f2' : detectedMode === 'inventory' ? '#eff6ff' : '#f9fafb',
+                border: `1px solid ${detectedMode === 'discard' ? '#fecaca' : detectedMode === 'inventory' ? '#bfdbfe' : '#e5e7eb'}`,
+                color: detectedMode === 'discard' ? '#991b1b' : detectedMode === 'inventory' ? '#1e40af' : '#374151',
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 200 }}>
+                <strong>Detected:</strong>{' '}
+                {detectedTitle
+                  ? detectedTitle
+                  : 'no title found in scan — pick a mode manually below'}
+              </div>
+              <div role="group" aria-label="Apply mode" style={{ display: 'inline-flex', border: '1px solid #d1d5db', borderRadius: 6, overflow: 'hidden', background: '#fff' }}>
+                {[['set', 'Set (Inventory)'], ['subtract', 'Subtract (Discard)']].map(([val, label]) => (
+                  <button
+                    key={val}
+                    type="button"
+                    onClick={() => setScanMode(val)}
+                    style={{
+                      padding: '5px 12px',
+                      fontSize: 12.5,
+                      cursor: 'pointer',
+                      border: 'none',
+                      background: scanMode === val
+                        ? (val === 'subtract' ? '#fee2e2' : '#dbeafe')
+                        : '#fff',
+                      color: scanMode === val
+                        ? (val === 'subtract' ? '#991b1b' : '#1e40af')
+                        : '#374151',
+                      fontWeight: scanMode === val ? 600 : 400,
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
             <div style={{ fontSize: 14, color: '#374151' }}>
               <strong>{rows.length}</strong> rows &nbsp;·&nbsp;
-              <span style={{ color: '#16a34a' }}><strong>{readyCount}</strong> ready to set</span>
+              <span style={{ color: '#16a34a' }}><strong>{readyCount}</strong> ready to {scanMode === 'subtract' ? 'deduct' : 'set'}</span>
               {flaggedCount > 0 && <>&nbsp;·&nbsp;<span style={{ color: '#dc2626' }}><strong>{flaggedCount}</strong> need review</span></>}
             </div>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               {commitResult ? (
                 <div style={{ background: '#f0fdf4', border: '1px solid #86efac', borderRadius: 6, padding: '6px 14px', fontSize: 13, color: '#16a34a', fontWeight: 600 }}>
-                  ✓ Set {commitResult.committed} SKUs ({commitResult.created} new, {commitResult.updated} updated)
+                  ✓ {scanMode === 'subtract' ? 'Deducted' : 'Set'} {commitResult.committed} SKUs ({commitResult.created} new, {commitResult.updated} updated)
                 </div>
               ) : (
-                <button className="btn btn-primary" onClick={commit} disabled={!canCommit} style={{ fontSize: 14 }}>
-                  {committing ? 'Setting...' : `Set Inventory (${readyCount} SKUs)`}
+                <button
+                  className="btn btn-primary"
+                  onClick={commit}
+                  disabled={!canCommit}
+                  style={{ fontSize: 14, background: scanMode === 'subtract' ? '#dc2626' : undefined, borderColor: scanMode === 'subtract' ? '#dc2626' : undefined }}
+                >
+                  {committing
+                    ? (scanMode === 'subtract' ? 'Deducting…' : 'Setting…')
+                    : (scanMode === 'subtract' ? `Deduct from Inventory (${readyCount} SKUs)` : `Set Inventory (${readyCount} SKUs)`)}
                 </button>
               )}
             </div>
@@ -417,8 +489,15 @@ export default function InventoryCount() {
 
           {rows.length > 10 && !commitResult && (
             <div style={{ marginTop: 16, textAlign: 'right' }}>
-              <button className="btn btn-primary" onClick={commit} disabled={!canCommit} style={{ fontSize: 14 }}>
-                {committing ? 'Setting...' : `Set Inventory (${readyCount} SKUs)`}
+              <button
+                className="btn btn-primary"
+                onClick={commit}
+                disabled={!canCommit}
+                style={{ fontSize: 14, background: scanMode === 'subtract' ? '#dc2626' : undefined, borderColor: scanMode === 'subtract' ? '#dc2626' : undefined }}
+              >
+                {committing
+                  ? (scanMode === 'subtract' ? 'Deducting…' : 'Setting…')
+                  : (scanMode === 'subtract' ? `Deduct from Inventory (${readyCount} SKUs)` : `Set Inventory (${readyCount} SKUs)`)}
               </button>
             </div>
           )}

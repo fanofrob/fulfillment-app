@@ -24,12 +24,19 @@ router = APIRouter()
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-SCAN_PROMPT = """You are reading a handwritten weekly inventory report. Extract ALL inventory entries from every row in the table(s) in this image.
+SCAN_PROMPT = """You are reading a handwritten weekly inventory report. Extract ALL inventory entries from every row in the table(s) in this image, AND read the report title.
+
+REPORT TITLE:
+- Look at the page header / running header / H1 at the top of each page.
+- The title looks like one of:
+    "Weekly Inventory Report — Walnut — Thursday, May 7, 2026"
+    "Weekly Discard Report — Walnut — Thursday, May 7, 2026"
+- Return the exact title text in `report_title`. If the image clearly shows multiple titles, return the most prominent one. If you cannot read a title at all, return null.
 
 For each table row:
 - SKU: the printed (not handwritten) text in the leftmost "SKU" column — copy it EXACTLY including underscores and dashes
 - Batch: the handwritten value in the "Batch" column, or null if empty
-- Lbs: the handwritten number in the "Updated Quantity" column
+- Lbs: the handwritten number in the "Updated Quantity" or "Quantity to Discard" column
   - If multiple numbers with cross-outs, take the FINAL (last written) number only
   - If the cell contains a dash "—" or "-", use 0
   - If the cell is blank/empty, use 0
@@ -38,11 +45,24 @@ Also extract any freeform entries written OUTSIDE the table (e.g. "Avocado Gem -
 
 Return ONLY valid JSON with this exact structure, no extra text:
 {
+  "report_title": "Weekly Discard Report — Walnut — Thursday, May 7, 2026",
   "rows": [
     {"sku": "apple_cosmic-01x02", "batch": null, "lbs": 144.0, "is_writein": false},
     {"sku": "Avocado Gem", "batch": null, "lbs": 250.0, "is_writein": true}
   ]
 }"""
+
+
+def _detect_report_mode(title: Optional[str]) -> Optional[str]:
+    """Infer 'inventory' or 'discard' from a scanned title. Returns None if ambiguous."""
+    if not title:
+        return None
+    lower = title.lower()
+    if "discard" in lower:
+        return "discard"
+    if "inventory" in lower:
+        return "inventory"
+    return None
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -64,6 +84,8 @@ class ScannedRow(BaseModel):
 class ScanResponse(BaseModel):
     warehouse: str
     rows: List[ScannedRow]
+    report_title: Optional[str] = None
+    report_mode: Optional[str] = None  # 'inventory' | 'discard' | None (ambiguous / not detected)
 
 
 class CommitRow(BaseModel):
@@ -76,6 +98,7 @@ class CommitRow(BaseModel):
 class CommitRequest(BaseModel):
     warehouse: str
     rows: List[CommitRow]
+    mode: Optional[str] = "set"  # 'set' (inventory recount) | 'subtract' (discard)
 
 
 class CommitResult(BaseModel):
@@ -86,8 +109,8 @@ class CommitResult(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _extract_rows_from_images(image_contents: List[tuple[bytes, str]]) -> List[dict]:
-    """Call Claude vision with all images and return extracted rows."""
+def _extract_rows_from_images(image_contents: List[tuple[bytes, str]]) -> dict:
+    """Call Claude vision with all images. Returns {'rows': [...], 'report_title': str|None}."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     content = []
@@ -111,7 +134,10 @@ def _extract_rows_from_images(image_contents: List[tuple[bytes, str]]) -> List[d
     raw = re.sub(r"\s*```$", "", raw)
 
     data = json.loads(raw)
-    return data.get("rows", [])
+    return {
+        "rows": data.get("rows", []),
+        "report_title": data.get("report_title"),
+    }
 
 
 def _match_sku(extracted_sku: str, sku_lookup: dict) -> Optional[models.PicklistSku]:
@@ -149,9 +175,13 @@ async def scan_images(
 
     # Call Claude
     try:
-        extracted = _extract_rows_from_images(image_contents)
+        scan_result = _extract_rows_from_images(image_contents)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Claude API error: {e}")
+
+    extracted = scan_result["rows"]
+    report_title = scan_result.get("report_title")
+    report_mode = _detect_report_mode(report_title)
 
     # Build PicklistSku lookup
     all_skus = db.query(models.PicklistSku).all()
@@ -200,13 +230,24 @@ async def scan_images(
             flag_reason=flag_reason,
         ))
 
-    return ScanResponse(warehouse=warehouse, rows=rows)
+    return ScanResponse(
+        warehouse=warehouse,
+        rows=rows,
+        report_title=report_title,
+        report_mode=report_mode,
+    )
 
 
 @router.post("/commit", response_model=CommitResult)
 def commit_count(payload: CommitRequest, db: Session = Depends(get_db)):
     now = datetime.now(timezone.utc)
-    note = f"Inventory count {now.strftime('%Y-%m-%d')}"
+    is_discard = (payload.mode or "set") == "subtract"
+    note = (
+        f"Discard {now.strftime('%Y-%m-%d')}"
+        if is_discard
+        else f"Inventory count {now.strftime('%Y-%m-%d')}"
+    )
+    adjustment_type = "discard_count" if is_discard else "inventory_count"
 
     created = 0
     updated = 0
@@ -220,9 +261,17 @@ def commit_count(payload: CommitRequest, db: Session = Depends(get_db)):
             models.InventoryItem.warehouse == payload.warehouse,
         ).first()
 
-        new_qty = row.on_hand_qty
+        # In set (inventory) mode, on_hand_qty IS the new on-hand. In subtract (discard)
+        # mode, on_hand_qty IS the amount to deduct from current on-hand.
+        deduct_qty = row.on_hand_qty if is_discard else None
+        new_qty = row.on_hand_qty if not is_discard else None
 
         if item is None:
+            if is_discard:
+                # Can't discard from a SKU that doesn't exist in inventory yet — skip.
+                # (Otherwise we'd create a row with negative or zero on-hand from nothing.)
+                continue
+
             # Look up name from PicklistSku if not provided
             name = row.name
             if not name:
@@ -247,15 +296,22 @@ def commit_count(payload: CommitRequest, db: Session = Depends(get_db)):
                 pick_sku=row.pick_sku,
                 warehouse=payload.warehouse,
                 delta=new_qty,
-                adjustment_type="inventory_count",
+                adjustment_type=adjustment_type,
                 note=note,
             ))
             created += 1
         else:
             old_qty = item.on_hand_qty
-            delta = new_qty - old_qty
-            item.on_hand_qty = new_qty
-            item.available_qty = new_qty - item.committed_qty
+            if is_discard:
+                # Subtract; never let on_hand go below zero.
+                final_qty = max(0.0, old_qty - (deduct_qty or 0.0))
+                delta = final_qty - old_qty  # negative
+            else:
+                final_qty = new_qty
+                delta = new_qty - old_qty
+
+            item.on_hand_qty = final_qty
+            item.available_qty = final_qty - item.committed_qty
             if row.batch:
                 item.batch_code = row.batch
 
@@ -263,7 +319,7 @@ def commit_count(payload: CommitRequest, db: Session = Depends(get_db)):
                 pick_sku=row.pick_sku,
                 warehouse=payload.warehouse,
                 delta=delta,
-                adjustment_type="inventory_count",
+                adjustment_type=adjustment_type,
                 note=note,
             ))
             updated += 1
