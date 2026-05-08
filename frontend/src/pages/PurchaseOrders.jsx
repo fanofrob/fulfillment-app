@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 import { purchaseOrdersApi, vendorsApi, projectionPeriodsApi, receivingApi } from '../api'
+import { useIsMobile } from '../useIsMobile'
 
 const PO_STATUSES = ['draft', 'placed', 'in_transit', 'partially_received', 'delivered', 'imported', 'reconciled']
 const STATUS_COLORS = {
@@ -72,6 +73,7 @@ async function compressImage(file, maxDim = 1600, quality = 0.82) {
 
 export default function PurchaseOrders() {
   const qc = useQueryClient()
+  const isMobile = useIsMobile()
   const [urlParams, setUrlParams] = useSearchParams()
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [showDetailModal, setShowDetailModal] = useState(null)
@@ -527,8 +529,8 @@ export default function PurchaseOrders() {
 
       {isLoading && <p>Loading...</p>}
 
-      {/* Bulk action toolbar — appears when >=1 POs are selected */}
-      {selectedIds.size > 0 && (
+      {/* Bulk action toolbar — appears when >=1 POs are selected (desktop only) */}
+      {!isMobile && selectedIds.size > 0 && (
         <div style={{
           marginBottom: 12, padding: '8px 12px', background: '#eff6ff', border: '1px solid #bfdbfe',
           borderRadius: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap',
@@ -567,8 +569,33 @@ export default function PurchaseOrders() {
         </div>
       )}
 
-      {/* PO List Table */}
-      {(() => {
+      {/* PO List — table on desktop, cards on mobile */}
+      {isMobile ? (
+        <div>
+          {pos.map(po => (
+            <div key={po.id}
+              className="po-mobile-card"
+              onClick={() => { setShowDetailModal(po); loadReceivingRecords(po.id) }}
+            >
+              <div className="po-mobile-card-row">
+                <span className="po-mobile-card-num">{po.po_number}</span>
+                <span style={{
+                  padding: '2px 10px', borderRadius: 12, fontSize: 11, fontWeight: 500,
+                  background: STATUS_COLORS[po.status] || '#e5e7eb', textTransform: 'capitalize',
+                }}>{po.status.replace(/_/g, ' ')}</span>
+              </div>
+              <div className="po-mobile-card-vendor">{po.vendor_name || '—'}</div>
+              <div className="po-mobile-card-meta">
+                {formatDate(po.order_date)}
+                {po.expected_delivery_date && <> · ETA {formatDate(po.expected_delivery_date)}</>}
+              </div>
+              <div className="po-mobile-card-meta">
+                {po.lines?.length || 0} line{po.lines?.length === 1 ? '' : 's'} · {formatCurrency(po.subtotal)}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (() => {
         const allVisibleSelected = pos.length > 0 && pos.every(p => selectedIds.has(p.id))
         const someVisibleSelected = pos.some(p => selectedIds.has(p.id))
         return (
@@ -727,8 +754,373 @@ export default function PurchaseOrders() {
         </div>
       )}
 
-      {/* PO Detail Modal */}
-      {showDetailModal && (
+      {/* PO Detail — mobile sheet on phones, big modal on desktop */}
+      {showDetailModal && (isMobile ? (
+        <div className="modal-overlay" onClick={() => setShowDetailModal(null)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <div className="po-mobile-back-bar">
+              <button className="po-mobile-back-btn" onClick={() => setShowDetailModal(null)}>← Back to list</button>
+            </div>
+            <div className="po-mobile-detail">
+              {/* Header */}
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                  <h2 style={{ margin: 0, fontSize: 18 }}>{showDetailModal.po_number}</h2>
+                  <span style={{
+                    padding: '4px 10px', borderRadius: 12, fontSize: 12, fontWeight: 600,
+                    background: STATUS_COLORS[showDetailModal.status] || '#e5e7eb', textTransform: 'capitalize', whiteSpace: 'nowrap',
+                  }}>{showDetailModal.status.replace(/_/g, ' ')}</span>
+                </div>
+                <div style={{ fontSize: 13, color: '#6b7280', marginTop: 4 }}>
+                  {showDetailModal.vendor_name} · {formatDate(showDetailModal.order_date)}
+                </div>
+              </div>
+
+              {/* Status transition (compact dropdown) */}
+              {(() => {
+                const choices = allowedTransitions(showDetailModal.status)
+                if (!choices.length) {
+                  if (showDetailModal.status === 'reconciled') {
+                    return <div style={{ fontSize: 12, color: '#6b7280' }}>Status locked — reconciled.</div>
+                  }
+                  return null
+                }
+                return (
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 13, color: '#6b7280' }}>Change status:</span>
+                    <select
+                      value=""
+                      onChange={e => { if (e.target.value) handleStatusChange(showDetailModal, e.target.value) }}
+                      style={{ flex: 1, fontSize: 14, padding: '8px 10px', minWidth: 0 }}
+                    >
+                      <option value="">— pick —</option>
+                      {choices.map(s => (
+                        <option key={s} value={s} style={{ textTransform: 'capitalize' }}>{s.replace(/_/g, ' ')}</option>
+                      ))}
+                    </select>
+                  </div>
+                )
+              })()}
+
+              {/* Invoice & Photos — top-prominent for warehouse use */}
+              <div className="po-mobile-section">
+                <div className="po-mobile-section-title">Invoice & Photos</div>
+                <label className="po-mobile-photo-btn" style={{ cursor: uploadingAttachment ? 'wait' : 'pointer' }}>
+                  {uploadingAttachment ? 'Uploading…' : '📷 Take Photo / Upload'}
+                  <input
+                    type="file" accept="image/*" capture="environment"
+                    style={{ display: 'none' }}
+                    disabled={uploadingAttachment}
+                    onChange={e => {
+                      const f = e.target.files?.[0]
+                      if (f) handleUploadAttachment(showDetailModal.id, f)
+                      e.target.value = ''
+                    }}
+                  />
+                </label>
+                {showDetailModal.attachments?.length > 0 && (
+                  <div className="po-mobile-photo-grid">
+                    {showDetailModal.attachments.map(att => {
+                      const url = purchaseOrdersApi.attachmentDownloadUrl(showDetailModal.id, att.id)
+                      const isImage = (att.content_type || '').startsWith('image/')
+                      return (
+                        <div key={att.id} style={{ position: 'relative' }}>
+                          {isImage ? (
+                            <img
+                              src={url}
+                              alt={att.filename || ''}
+                              onClick={() => setAttachmentPreview({ url, filename: att.filename })}
+                            />
+                          ) : (
+                            <a href={url} target="_blank" rel="noreferrer"
+                              style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', aspectRatio: '1', padding: 8, fontSize: 11, background: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: 6, textDecoration: 'none', color: '#374151', wordBreak: 'break-word' }}>
+                              📎 {att.filename || 'file'}
+                            </a>
+                          )}
+                          <button
+                            onClick={() => { if (confirm('Delete this attachment?')) deleteAttMut.mutate({ poId: showDetailModal.id, attId: att.id }) }}
+                            style={{ position: 'absolute', top: 2, right: 2, background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none', borderRadius: '50%', width: 22, height: 22, cursor: 'pointer', fontSize: 12, lineHeight: 1, padding: 0 }}
+                          >×</button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Order Info compact */}
+              <div className="po-mobile-section">
+                <div className="po-mobile-section-title">Order Info</div>
+                <div style={{ fontSize: 13, lineHeight: 1.8 }}>
+                  <div><span style={{ color: '#6b7280' }}>Expected:</span> {formatDate(showDetailModal.expected_delivery_date)}</div>
+                  <div><span style={{ color: '#6b7280' }}>Actual:</span> {formatDate(showDetailModal.actual_delivery_date)}</div>
+                  <div><span style={{ color: '#6b7280' }}>Subtotal:</span> {formatCurrency(showDetailModal.subtotal)}</div>
+                  {showDetailModal.notes && <div style={{ marginTop: 6, color: '#6b7280', fontStyle: 'italic' }}>{showDetailModal.notes}</div>}
+                </div>
+              </div>
+
+              {/* Pickup & Delivery — single column */}
+              <div className="po-mobile-section">
+                <div className="po-mobile-section-title">Pickup & Delivery</div>
+                <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 10 }}>
+                  Effective: {showDetailModal.effective_pickup_address ? (
+                    <a
+                      href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(showDetailModal.effective_pickup_address)}`}
+                      target="_blank" rel="noreferrer"
+                      style={{ color: '#2563eb' }}
+                    >{showDetailModal.effective_pickup_address}</a>
+                  ) : <em style={{ color: '#9ca3af' }}>No address on file</em>}
+                </div>
+                <div className="po-mobile-receive-form" style={{ display: 'grid', gap: 8 }}>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label>Pickup Date</label>
+                    <input type="date" value={pickupForm.pickup_run_date || ''}
+                      onChange={e => setPickupForm({ ...pickupForm, pickup_run_date: e.target.value })} />
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label>Expected Delivery</label>
+                    <input type="date" value={pickupForm.expected_delivery_date || ''}
+                      onChange={e => setPickupForm({ ...pickupForm, expected_delivery_date: e.target.value })} />
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label>Driver</label>
+                    <input value={pickupForm.driver_name || ''}
+                      onChange={e => setPickupForm({ ...pickupForm, driver_name: e.target.value })}
+                      placeholder="Driver name" />
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label>Delivery Location</label>
+                    <input value={pickupForm.delivery_location || ''}
+                      onChange={e => setPickupForm({ ...pickupForm, delivery_location: e.target.value })}
+                      placeholder="The farm" />
+                  </div>
+                </div>
+                <button className="btn btn-primary" style={{ width: '100%', marginTop: 10 }}
+                  onClick={() => handleSavePickup(showDetailModal.id)}
+                  disabled={updateMut.isPending}>
+                  Save Pickup Details
+                </button>
+              </div>
+
+              {/* Line Items */}
+              <div>
+                <div className="po-mobile-section-title" style={{ paddingLeft: 4, marginBottom: 6 }}>Line Items</div>
+                {showDetailModal.lines?.map(line => {
+                  const lineRecords = getRecordsForLine(line.id)
+                  const recvWt = getReceivedWeight(line.id)
+                  const pct = line.total_weight_lbs ? Math.round((recvWt / line.total_weight_lbs) * 100) : 0
+                  return (
+                    <div key={line.id} className="po-mobile-line">
+                      <div style={{ fontWeight: 600, fontSize: 15 }}>
+                        {line.product_type}
+                        {line.overage_flag && <span style={{ color: '#f59e0b', marginLeft: 6, fontSize: 11 }}>OVERAGE</span>}
+                      </div>
+                      <div className="po-mobile-card-meta" style={{ marginTop: 2 }}>
+                        {line.quantity_cases} cases × {line.case_weight_lbs ?? '—'} lb/case = {line.total_weight_lbs?.toFixed(1) ?? '—'} lbs
+                      </div>
+                      <div className="po-mobile-card-meta">
+                        {formatCurrency(line.unit_price)}/{line.price_unit} · {formatCurrency(line.total_price)}
+                      </div>
+                      {lineRecords.length > 0 && (
+                        <>
+                          <div style={{ marginTop: 8, fontSize: 12, color: pct >= 100 ? '#16a34a' : '#d97706', fontWeight: 600 }}>
+                            Received: {recvWt.toFixed(1)} lbs ({pct}%)
+                          </div>
+                          <div className="po-mobile-line-progress">
+                            <div className="po-mobile-line-progress-fill" style={{ width: `${Math.min(pct, 100)}%`, background: pct >= 100 ? '#16a34a' : '#f59e0b' }} />
+                          </div>
+                        </>
+                      )}
+
+                      {canReceive && receivingLineId !== line.id && (
+                        <button className="btn btn-primary" style={{ width: '100%', marginTop: 10 }}
+                          onClick={() => openReceiveForm(line)}>
+                          Receive This Line
+                        </button>
+                      )}
+
+                      {/* Receive form — single column on mobile */}
+                      {receivingLineId === line.id && (
+                        <div className="po-mobile-receive-form" style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #e5e7eb' }}>
+                          <div className="form-group">
+                            <label>Cases Received</label>
+                            <input type="number" inputMode="decimal" step="0.1" value={receivingForm.received_cases}
+                              onChange={e => {
+                                const cases = e.target.value
+                                const cw = receivingForm.case_weight_lbs
+                                setReceivingForm({
+                                  ...receivingForm,
+                                  received_cases: cases,
+                                  received_weight_lbs: (cases !== '' && cw !== '' && cw != null)
+                                    ? Number(cases) * Number(cw)
+                                    : receivingForm.received_weight_lbs,
+                                })
+                              }} />
+                          </div>
+                          <div className="form-group">
+                            <label>Case Weight (lbs)</label>
+                            <input type="number" inputMode="decimal" step="0.1" value={receivingForm.case_weight_lbs ?? ''}
+                              onChange={e => {
+                                const cw = e.target.value
+                                const cases = receivingForm.received_cases
+                                setReceivingForm({
+                                  ...receivingForm,
+                                  case_weight_lbs: cw,
+                                  received_weight_lbs: (cases !== '' && cw !== '')
+                                    ? Number(cases) * Number(cw)
+                                    : receivingForm.received_weight_lbs,
+                                })
+                              }} />
+                          </div>
+                          <div className="form-group">
+                            <label>Total Weight (lbs)</label>
+                            <input type="number" inputMode="decimal" step="0.1" value={receivingForm.received_weight_lbs}
+                              onChange={e => setReceivingForm({ ...receivingForm, received_weight_lbs: e.target.value })} />
+                          </div>
+                          <div className="form-group">
+                            <label>Harvest Date</label>
+                            <input type="date" value={receivingForm.harvest_date}
+                              onChange={e => setReceivingForm({ ...receivingForm, harvest_date: e.target.value })} />
+                          </div>
+                          <div className="form-group">
+                            <label>Confirmed SKU</label>
+                            <select value={receivingForm.confirmed_pick_sku}
+                              onChange={e => setReceivingForm({ ...receivingForm, confirmed_pick_sku: e.target.value })}>
+                              {availableSkus.length === 0 && <option value="">No SKUs found</option>}
+                              {(() => {
+                                const fmtOpt = (s) => {
+                                  const w = s.weight_lb ? `${s.weight_lb} lb/pc` : 'no weight'
+                                  const oh = s.total_on_hand > 0 ? ` · ${s.total_on_hand} on hand` : ''
+                                  const tag = s.match_reason && s.match_reason !== 'exact'
+                                    ? ` · ${s.match_reason}`
+                                    : ''
+                                  return `${s.pick_sku} (${w})${oh}${tag}`
+                                }
+                                const suggested = availableSkus.filter(s => s.match_reason)
+                                const others = availableSkus.filter(s => !s.match_reason)
+                                return (
+                                  <>
+                                    {suggested.length > 0 && (
+                                      <optgroup label="Suggested">
+                                        {suggested.map(s => (
+                                          <option key={s.pick_sku} value={s.pick_sku}>{fmtOpt(s)}</option>
+                                        ))}
+                                      </optgroup>
+                                    )}
+                                    {others.length > 0 && (
+                                      <optgroup label="Other">
+                                        {others.map(s => (
+                                          <option key={s.pick_sku} value={s.pick_sku}>{fmtOpt(s)}</option>
+                                        ))}
+                                      </optgroup>
+                                    )}
+                                  </>
+                                )
+                              })()}
+                            </select>
+                          </div>
+                          <div className="form-group">
+                            <label>Received By</label>
+                            <input value={receivingForm.received_by}
+                              onChange={e => setReceivingForm({ ...receivingForm, received_by: e.target.value })}
+                              placeholder="Driver / runner name" />
+                          </div>
+                          <div className="form-group">
+                            <label>Quality</label>
+                            <select value={receivingForm.quality_rating}
+                              onChange={e => setReceivingForm({ ...receivingForm, quality_rating: e.target.value })}>
+                              <option value="">—</option>
+                              <option value="good">Good</option>
+                              <option value="acceptable">Acceptable</option>
+                              <option value="poor">Poor</option>
+                            </select>
+                          </div>
+                          <div className="form-group">
+                            <label>Quality Notes</label>
+                            <input value={receivingForm.quality_notes}
+                              onChange={e => setReceivingForm({ ...receivingForm, quality_notes: e.target.value })}
+                              placeholder="Condition notes…" />
+                          </div>
+                          {receivingForm.confirmed_pick_sku && receivingForm.received_weight_lbs && (() => {
+                            const sku = availableSkus.find(s => s.pick_sku === receivingForm.confirmed_pick_sku)
+                            if (sku?.weight_lb) return (
+                              <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 8 }}>
+                                Calculated pieces: {(Number(receivingForm.received_weight_lbs) / sku.weight_lb).toFixed(1)}
+                              </div>
+                            )
+                            return null
+                          })()}
+                          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                            <button className="btn" style={{ flex: 1 }} onClick={() => setReceivingLineId(null)}>Cancel</button>
+                            <button className="btn btn-primary" style={{ flex: 2 }}
+                              disabled={!receivingForm.received_cases || !receivingForm.received_weight_lbs}
+                              onClick={() => handleReceiveSubmit(showDetailModal.id, line.id)}>
+                              Save Receipt
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* History compact */}
+                      {lineRecords.length > 0 && (
+                        <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #f3f4f6' }}>
+                          <div style={{ fontSize: 11, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', marginBottom: 6, letterSpacing: 0.4 }}>History</div>
+                          {lineRecords.map(rec => (
+                            <div key={rec.id} style={{ padding: '8px 0', borderTop: '1px solid #f9fafb', fontSize: 12 }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                                <span style={{ fontWeight: 500 }}>
+                                  {formatDate(rec.received_date)} — {rec.received_cases} cs / {rec.received_weight_lbs} lbs
+                                </span>
+                                {rec.pushed_to_inventory ? (
+                                  <span style={{ color: '#16a34a', fontWeight: 600, fontSize: 11 }}>Pushed</span>
+                                ) : (
+                                  <span style={{ color: '#d97706', fontWeight: 600, fontSize: 11 }}>Pending</span>
+                                )}
+                              </div>
+                              <div style={{ color: '#6b7280', marginTop: 2 }}>
+                                {rec.received_by && <>{rec.received_by} · </>}
+                                {rec.confirmed_pick_sku || <span style={{ color: '#d97706' }}>SKU pending</span>}
+                                {rec.quality_rating && <> · {rec.quality_rating}</>}
+                              </div>
+                              {!rec.pushed_to_inventory && (
+                                <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+                                  {rec.confirmed_pick_sku && (
+                                    <button className="btn btn-sm btn-primary" style={{ flex: 1 }}
+                                      onClick={() => pushMut.mutate(rec.id)}
+                                      disabled={pushMut.isPending}>
+                                      Push to Inventory
+                                    </button>
+                                  )}
+                                  <button className="btn btn-sm btn-danger"
+                                    onClick={() => { if (confirm('Delete this receipt?')) deleteRecMut.mutate(rec.id) }}>
+                                    Del
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* Sticky footer actions */}
+              <div className="po-mobile-sticky-footer">
+                {hasUnpushedRecords && (
+                  <button className="btn btn-primary"
+                    onClick={() => pushAllMut.mutate(showDetailModal.id)}
+                    disabled={pushAllMut.isPending}>
+                    Push All to Inventory
+                  </button>
+                )}
+                <button className="btn" onClick={() => setShowDetailModal(null)}>Close</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
         <div className="modal-overlay" onClick={() => setShowDetailModal(null)}>
           <div className="modal" onClick={e => e.stopPropagation()} style={{ width: 1100, maxWidth: '95vw' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
@@ -1204,7 +1596,7 @@ export default function PurchaseOrders() {
             </div>
           </div>
         </div>
-      )}
+      ))}
 
       {/* Bulk Pickup Edit Modal */}
       {showBulkEditModal && (

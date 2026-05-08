@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom'
 import SkuMapping from './pages/SkuMapping'
 import PicklistSkus from './pages/PicklistSkus'
@@ -34,10 +35,23 @@ const FULL_BLEED_ROUTES = ['/orders', '/confirmed-orders']
 export default function App() {
   const location = useLocation()
   const isFullBleed = FULL_BLEED_ROUTES.some(r => location.pathname.startsWith(r))
+  const [navOpen, setNavOpen] = useState(false)
+
+  // Close the mobile drawer whenever the route changes.
+  useEffect(() => { setNavOpen(false) }, [location.pathname])
 
   return (
-    <div className="app-layout">
-      <nav className="sidebar">
+    <div className={`app-layout${navOpen ? ' nav-open' : ''}`}>
+      <header className="mobile-header">
+        <button
+          className="hamburger-btn"
+          onClick={() => setNavOpen(o => !o)}
+          aria-label="Toggle navigation"
+        >☰</button>
+        <span className="mobile-header-title">GHF Fulfillment</span>
+      </header>
+      {navOpen && <div className="sidebar-backdrop" onClick={() => setNavOpen(false)} />}
+      <nav className={`sidebar${navOpen ? ' open' : ''}`}>
         <div className="sidebar-header">
           <h2>GHF Fulfillment</h2>
         </div>
