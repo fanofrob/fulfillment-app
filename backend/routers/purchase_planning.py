@@ -435,11 +435,22 @@ def list_plan_lines(
     purchases = _purchases_by_combo(lines)
     po_info = _po_info_map(db, lines)
 
+    # Sub-product-type dropdown pulls from picklist_skus.type so users can pick
+    # any defined SKU type as a substitute, not just the ones in this period's
+    # projection. Union with projection types so currently-valid options stay
+    # available even if a SKU has no picklist row yet.
+    picklist_types = {
+        t for (t,) in db.query(models.PicklistSku.type).distinct().all()
+        if t and t.strip()
+    }
+    sub_product_types = sorted(set(metrics.keys()) | picklist_types)
+
     return {
         "projection_period_id": projection_period_id,
         "has_current_projection": bool(metrics),
         "items": [_serialize_line(l, metrics, purchases, po_info.get(l.id)) for l in lines],
         "available_product_types": sorted(metrics.keys()),
+        "available_sub_product_types": sub_product_types,
     }
 
 

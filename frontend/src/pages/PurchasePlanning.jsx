@@ -87,6 +87,7 @@ function buildTSV(rows) {
 // while the user is actively editing one cell.
 
 const PT_DATALIST_ID = 'pt-list-purchase-planning'
+const SUB_PT_DATALIST_ID = 'sub-pt-list-purchase-planning'
 const VENDOR_DATALIST_ID = 'vendor-list-purchase-planning'
 
 // Shipping status enum — matches the dropdown values asked for. Empty string
@@ -203,7 +204,7 @@ function CellEditor({
       <input
         ref={inputRef}
         type="text"
-        list={PT_DATALIST_ID}
+        list={SUB_PT_DATALIST_ID}
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={() => commitNow(null)}
@@ -553,7 +554,7 @@ export default function PurchasePlanning() {
     setVendorInfo(null)
   }, [periodId])  // eslint-disable-line react-hooks/exhaustive-deps
 
-  const { data: planData = { items: [], available_product_types: [], has_current_projection: false }, isLoading } = useQuery({
+  const { data: planData = { items: [], available_product_types: [], available_sub_product_types: [], has_current_projection: false }, isLoading } = useQuery({
     queryKey: ['purchase-planning', periodId],
     queryFn: () => purchasePlanningApi.list(periodId),
     enabled: periodId != null,
@@ -561,6 +562,7 @@ export default function PurchasePlanning() {
 
   const items = planData.items ?? []
   const productTypes = planData.available_product_types ?? []
+  const subProductTypes = planData.available_sub_product_types ?? []
 
   // ── Mutations ───────────────────────────────────────────────────────────
   const createMut = useMutation({
@@ -634,6 +636,7 @@ export default function PurchasePlanning() {
   }, [vendors])
 
   const productTypeSet = useMemo(() => new Set(productTypes), [productTypes])
+  const subProductTypeSet = useMemo(() => new Set(subProductTypes), [subProductTypes])
 
   // Selection grid metadata: ALL columns the user can highlight, in DOM
   // (visible) order. Editable cols carry editorType + parseValue; read-only
@@ -682,7 +685,7 @@ export default function PurchasePlanning() {
       parseValue: (str) => {
         const t = String(str ?? '').trim()
         if (t === '') return { sub_product_type: '' }
-        if (!productTypeSet.has(t)) return null
+        if (!subProductTypeSet.has(t)) return null
         return { sub_product_type: t }
       },
     },
@@ -770,7 +773,7 @@ export default function PurchasePlanning() {
         return { shipping_status: t }
       },
     },
-  ], [vendors, vendorByName, productTypeSet])
+  ], [vendors, vendorByName, productTypeSet, subProductTypeSet])
 
   const colIdxByColId = useMemo(() => {
     const m = new Map()
@@ -1471,6 +1474,9 @@ export default function PurchasePlanning() {
 
       <datalist id={PT_DATALIST_ID}>
         {productTypes.map((pt) => (<option key={pt} value={pt} />))}
+      </datalist>
+      <datalist id={SUB_PT_DATALIST_ID}>
+        {subProductTypes.map((pt) => (<option key={pt} value={pt} />))}
       </datalist>
 
       {periodId && (
