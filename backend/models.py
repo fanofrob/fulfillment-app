@@ -39,8 +39,9 @@ class PackagingMapping(Base):
     packaging pick_sku from inventory. Multiple packaging mappings may exist
     per product (e.g., a clamshell + a label + a sticker for one fruit pack).
 
-    Box-level packaging (1 box per shipment) lives on BoxType.pick_sku — NOT here.
-    This table is exclusively for per-product-unit packaging.
+    Per-box packaging (e.g. 2 shipping labels per shipment) lives on
+    BoxPackagingMapping — NOT here. The box itself (1 box per shipment) is on
+    BoxType.pick_sku. This table is exclusively for per-product-unit packaging.
     """
     __tablename__ = "packaging_mappings"
     id                  = Column(Integer, primary_key=True, index=True)
@@ -53,6 +54,31 @@ class PackagingMapping(Base):
 
     __table_args__ = (
         UniqueConstraint('product_pick_sku', 'packaging_pick_sku', name='uq_packaging_mapping'),
+    )
+
+
+class BoxPackagingMapping(Base):
+    """
+    Per-box packaging consumption rules.
+    When a fulfillment box of a given BoxType ships, deduct qty_per_box of the
+    packaging pick_sku from inventory. Multiple rows per BoxType allowed —
+    e.g. one box might use 2 shipping labels + 1 piece of tape + 1 thank-you card.
+
+    The box material itself (1 box per shipment) is still tracked on
+    BoxType.pick_sku for backward compatibility. This table is for additional
+    per-box packaging at arbitrary rates.
+    """
+    __tablename__ = "box_packaging_mappings"
+    id                  = Column(Integer, primary_key=True, index=True)
+    box_type_id         = Column(Integer, ForeignKey("box_types.id"), nullable=False, index=True)
+    packaging_pick_sku  = Column(String, nullable=False, index=True)   # must reference a PicklistSku with inventory_type='packaging'
+    qty_per_box         = Column(Float, nullable=False, default=1.0)
+    notes               = Column(Text, nullable=True)
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at          = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('box_type_id', 'packaging_pick_sku', name='uq_box_packaging_mapping'),
     )
 
 

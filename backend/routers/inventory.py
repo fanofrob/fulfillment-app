@@ -259,6 +259,15 @@ def _auto_deduct_on_ship(order, db: Session):
         boxes = db.query(models.FulfillmentBox).filter(
             models.FulfillmentBox.plan_id == plan.id
         ).all()
+        # Bulk-fetch box-level packaging mappings for all box types used in this order
+        used_box_type_ids = {b.box_type_id for b in boxes if b.box_type_id}
+        box_pkg_by_type: dict[int, list] = {}
+        if used_box_type_ids:
+            for m in db.query(models.BoxPackagingMapping).filter(
+                models.BoxPackagingMapping.box_type_id.in_(list(used_box_type_ids))
+            ).all():
+                box_pkg_by_type.setdefault(m.box_type_id, []).append(m)
+
         for box in boxes:
             if box.box_type_id:
                 bt = db.query(models.BoxType).filter(
@@ -266,6 +275,13 @@ def _auto_deduct_on_ship(order, db: Session):
                 ).first()
                 if bt and bt.pick_sku:
                     demand[bt.pick_sku] = demand.get(bt.pick_sku, 0.0) + 1.0
+                # Per-box packaging: for each (box_type, packaging) mapping,
+                # deduct qty_per_box. Allows multiple packaging items per box at
+                # arbitrary rates (e.g. 2 labels + 0.05 of a tape roll).
+                for m in box_pkg_by_type.get(box.box_type_id, []):
+                    add_qty = m.qty_per_box or 0.0
+                    if add_qty > 0:
+                        demand[m.packaging_pick_sku] = demand.get(m.packaging_pick_sku, 0.0) + add_qty
 
     # Per-product packaging: for each product pick_sku in `demand`, look up its
     # packaging_mappings and add qty_per_unit × shipped_qty to the matching

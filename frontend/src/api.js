@@ -167,6 +167,12 @@ export const packagingMappingsApi = {
   create: (data) => api.post('/packaging-mappings/', data).then(r => r.data),
   update: (id, data) => api.put(`/packaging-mappings/${id}`, data).then(r => r.data),
   delete: (id) => api.delete(`/packaging-mappings/${id}`).then(r => r.data),
+
+  // Per-box packaging (e.g. 2 shipping labels per shipment)
+  listBox:   (params) => api.get('/packaging-mappings/box/', { params }).then(r => r.data),
+  createBox: (data) => api.post('/packaging-mappings/box/', data).then(r => r.data),
+  updateBox: (id, data) => api.put(`/packaging-mappings/box/${id}`, data).then(r => r.data),
+  deleteBox: (id) => api.delete(`/packaging-mappings/box/${id}`).then(r => r.data),
 }
 
 export const packagingDashboardApi = {

@@ -213,6 +213,7 @@ def _migrate_db():
                 ))
                 conn.commit()
     # packaging_mappings table is created by create_all — no manual migration needed.
+    # box_packaging_mappings table is also auto-created by create_all.
 
 
 def _seed_ups_rates():
