@@ -5,7 +5,8 @@ import math
 from datetime import date, datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from sqlalchemy import func as sqlfunc
 
@@ -14,6 +15,11 @@ import models
 import schemas
 
 router = APIRouter()
+
+# Cap upload size at ~10 MB so a runaway iPhone photo doesn't bloat the DB.
+# Phone images are typically 2–5 MB; the frontend also compresses before send.
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024
+ALLOWED_ATTACHMENT_KINDS = {"invoice", "received_photo", "other"}
 
 PO_STATUSES = ["draft", "placed", "in_transit", "partially_received", "delivered", "imported", "reconciled"]
 PO_STATUS_TRANSITIONS = {
@@ -64,6 +70,21 @@ def _compute_po_subtotal(db: Session, po_id: int):
         po.subtotal = result or 0.0
 
 
+def _resolve_pickup_address(db: Session, po: models.PurchaseOrder, vendor: Optional[models.Vendor]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the effective pickup address + the consolidating vendor's name.
+    Priority: explicit override → consolidator vendor's pickup_address → seller vendor's pickup_address."""
+    if po.pickup_address_override:
+        consolidator = None
+        if po.pickup_at_vendor_id:
+            consolidator = db.query(models.Vendor).filter(models.Vendor.id == po.pickup_at_vendor_id).first()
+        return po.pickup_address_override, (consolidator.name if consolidator else None)
+    if po.pickup_at_vendor_id:
+        consolidator = db.query(models.Vendor).filter(models.Vendor.id == po.pickup_at_vendor_id).first()
+        if consolidator:
+            return consolidator.pickup_address, consolidator.name
+    return (vendor.pickup_address if vendor else None), None
+
+
 def _build_po_response(db: Session, po: models.PurchaseOrder) -> schemas.PurchaseOrderResponse:
     """Build a full PO response with lines, allocations, and vendor name."""
     vendor = db.query(models.Vendor).filter(models.Vendor.id == po.vendor_id).first()
@@ -93,9 +114,18 @@ def _build_po_response(db: Session, po: models.PurchaseOrder) -> schemas.Purchas
         lr.purchase_plan_line_id = plan_link_by_line.get(line.id)
         lines_resp.append(lr)
 
+    attachments = db.query(models.PurchaseOrderAttachment).filter(
+        models.PurchaseOrderAttachment.purchase_order_id == po.id
+    ).order_by(models.PurchaseOrderAttachment.uploaded_at.desc()).all()
+
+    effective_addr, consolidator_name = _resolve_pickup_address(db, po, vendor)
+
     resp = schemas.PurchaseOrderResponse.model_validate(po)
     resp.lines = lines_resp
     resp.vendor_name = vendor.name if vendor else None
+    resp.effective_pickup_address = effective_addr
+    resp.pickup_at_vendor_name = consolidator_name
+    resp.attachments = [schemas.POAttachmentResponse.model_validate(a) for a in attachments]
     return resp
 
 
@@ -141,6 +171,11 @@ def create_purchase_order(data: schemas.PurchaseOrderCreate, db: Session = Depen
         delivery_notes=data.delivery_notes,
         communication_method=data.communication_method,
         notes=data.notes,
+        pickup_at_vendor_id=data.pickup_at_vendor_id,
+        pickup_address_override=data.pickup_address_override,
+        pickup_run_date=data.pickup_run_date,
+        driver_name=data.driver_name,
+        delivery_location=data.delivery_location,
     )
     db.add(po)
     db.flush()
@@ -473,6 +508,80 @@ def create_po_from_projection(data: schemas.POFromProjectionRequest, db: Session
     db.commit()
     db.refresh(po)
     return _build_po_response(db, po)
+
+
+# ── Attachments (invoice photos, etc.) ─────────────────────────────────────
+
+@router.get("/{po_id}/attachments", response_model=List[schemas.POAttachmentResponse])
+def list_attachments(po_id: int, db: Session = Depends(get_db)):
+    po = db.query(models.PurchaseOrder).filter(models.PurchaseOrder.id == po_id).first()
+    if not po:
+        raise HTTPException(404, "Purchase order not found")
+    rows = db.query(models.PurchaseOrderAttachment).filter(
+        models.PurchaseOrderAttachment.purchase_order_id == po_id
+    ).order_by(models.PurchaseOrderAttachment.uploaded_at.desc()).all()
+    return [schemas.POAttachmentResponse.model_validate(r) for r in rows]
+
+
+@router.post("/{po_id}/attachments", response_model=schemas.POAttachmentResponse, status_code=201)
+async def upload_attachment(
+    po_id: int,
+    file: UploadFile = File(...),
+    kind: str = Form("invoice"),
+    db: Session = Depends(get_db),
+):
+    po = db.query(models.PurchaseOrder).filter(models.PurchaseOrder.id == po_id).first()
+    if not po:
+        raise HTTPException(404, "Purchase order not found")
+    if kind not in ALLOWED_ATTACHMENT_KINDS:
+        raise HTTPException(422, f"kind must be one of: {', '.join(sorted(ALLOWED_ATTACHMENT_KINDS))}")
+
+    blob = await file.read()
+    if len(blob) == 0:
+        raise HTTPException(422, "Empty file")
+    if len(blob) > MAX_ATTACHMENT_SIZE:
+        raise HTTPException(413, f"File too large (max {MAX_ATTACHMENT_SIZE // (1024*1024)} MB)")
+
+    att = models.PurchaseOrderAttachment(
+        purchase_order_id=po_id,
+        kind=kind,
+        filename=file.filename,
+        content_type=file.content_type or "application/octet-stream",
+        size_bytes=len(blob),
+        data=blob,
+    )
+    db.add(att)
+    db.commit()
+    db.refresh(att)
+    return schemas.POAttachmentResponse.model_validate(att)
+
+
+@router.get("/{po_id}/attachments/{att_id}/download")
+def download_attachment(po_id: int, att_id: int, db: Session = Depends(get_db)):
+    att = db.query(models.PurchaseOrderAttachment).filter(
+        models.PurchaseOrderAttachment.id == att_id,
+        models.PurchaseOrderAttachment.purchase_order_id == po_id,
+    ).first()
+    if not att:
+        raise HTTPException(404, "Attachment not found")
+    return Response(
+        content=att.data,
+        media_type=att.content_type or "application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="{att.filename or f"attachment-{att.id}"}"'},
+    )
+
+
+@router.delete("/{po_id}/attachments/{att_id}")
+def delete_attachment(po_id: int, att_id: int, db: Session = Depends(get_db)):
+    att = db.query(models.PurchaseOrderAttachment).filter(
+        models.PurchaseOrderAttachment.id == att_id,
+        models.PurchaseOrderAttachment.purchase_order_id == po_id,
+    ).first()
+    if not att:
+        raise HTTPException(404, "Attachment not found")
+    db.delete(att)
+    db.commit()
+    return {"ok": True}
 
 
 # ── On-Order Summary (for projection integration) ──────────────────────────

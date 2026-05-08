@@ -91,7 +91,9 @@ def _compute_pieces(db: Session, pick_sku: str, weight_lbs: float) -> Optional[f
 def _auto_progress_po_status(db: Session, po: models.PurchaseOrder):
     """
     Advance PO status forward based on receiving state.
-    Only moves forward, never regresses.
+    Only moves forward, never regresses, and stops at "delivered" — the
+    transition to "imported" is left as an explicit user action so the
+    operator can review SKUs/quantities before committing inventory.
     """
     current_idx = PO_STATUS_ORDER.index(po.status) if po.status in PO_STATUS_ORDER else 0
 
@@ -113,18 +115,10 @@ def _auto_progress_po_status(db: Session, po: models.PurchaseOrder):
     if not records:
         return
 
-    # Check if all records are pushed to inventory
-    all_pushed = all(r.pushed_to_inventory for r in records)
-    # Check if all lines have at least one receiving record
     lines_with_records = {r.po_line_id for r in records}
     all_lines_received = lines_with_records == set(line_ids)
 
-    if all_pushed and all_lines_received:
-        target = "imported"
-    elif all_lines_received:
-        target = "delivered"
-    else:
-        target = "partially_received"
+    target = "delivered" if all_lines_received else "partially_received"
 
     target_idx = PO_STATUS_ORDER.index(target)
     if target_idx > current_idx:
@@ -197,6 +191,7 @@ def create_receiving_record(
         harvest_date=body.harvest_date,
         quality_rating=body.quality_rating,
         quality_notes=body.quality_notes,
+        received_by=body.received_by,
     )
     db.add(rec)
     db.flush()

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, Date, DateTime, Text, JSON, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Float, Boolean, Date, DateTime, Text, JSON, ForeignKey, UniqueConstraint, LargeBinary
 from sqlalchemy.sql import func
 from database import Base
 
@@ -859,8 +859,32 @@ class PurchaseOrder(Base):
     communication_method    = Column(String, nullable=True)   # how order was placed
     subtotal                = Column(Float, nullable=True)     # calculated from line items
     notes                   = Column(Text, nullable=True)
+    # Pickup logistics — populated as the order moves toward dispatch.
+    # Effective pickup address resolves in priority order:
+    #   pickup_address_override → vendors[pickup_at_vendor_id].pickup_address → vendors[vendor_id].pickup_address
+    # pickup_at_vendor_id is the consolidation case: vendor A is dropping their goods
+    # at vendor B's place so the driver only has to visit B.
+    pickup_at_vendor_id     = Column(Integer, ForeignKey("vendors.id"), nullable=True, index=True)
+    pickup_address_override = Column(Text, nullable=True)
+    pickup_run_date         = Column(Date, nullable=True, index=True)  # when the pickup is scheduled
+    driver_name             = Column(String, nullable=True)            # who is doing the pickup
+    delivery_location       = Column(Text, nullable=True)              # where it goes after pickup (default: the farm)
     created_at              = Column(DateTime(timezone=True), server_default=func.now())
     updated_at              = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class PurchaseOrderAttachment(Base):
+    """Files (invoice photos, etc.) attached to a PO. Stored as a binary blob in
+    the DB so it survives Railway's ephemeral filesystem without external storage."""
+    __tablename__ = "purchase_order_attachments"
+    id                = Column(Integer, primary_key=True, index=True)
+    purchase_order_id = Column(Integer, ForeignKey("purchase_orders.id"), nullable=False, index=True)
+    kind              = Column(String, nullable=False, default="invoice")  # invoice | received_photo | other
+    filename          = Column(String, nullable=True)
+    content_type      = Column(String, nullable=True)
+    size_bytes        = Column(Integer, nullable=True)
+    data              = Column(LargeBinary, nullable=False)
+    uploaded_at       = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class PurchaseOrderLine(Base):
@@ -939,6 +963,7 @@ class ReceivingRecord(Base):
     harvest_date        = Column(Date, nullable=True)
     quality_rating      = Column(String, nullable=True)   # good | acceptable | poor
     quality_notes       = Column(Text, nullable=True)
+    received_by         = Column(String, nullable=True)   # driver/runner name for attribution
     pushed_to_inventory = Column(Boolean, nullable=False, default=False)
     inventory_batch_id  = Column(Integer, ForeignKey("inventory_batches.id"), nullable=True)
     created_at          = Column(DateTime(timezone=True), server_default=func.now())

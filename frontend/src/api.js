@@ -475,6 +475,25 @@ export const purchaseOrdersApi = {
   createFromProjection: (data) => api.post('/purchase-orders/from-projection', data).then(r => r.data),
   // On-order summary
   getOnOrder: (periodId) => api.get(`/purchase-orders/on-order/${periodId}`).then(r => r.data),
+  // Attachments (invoice photos, etc.)
+  listAttachments: (poId) => api.get(`/purchase-orders/${poId}/attachments`).then(r => r.data),
+  uploadAttachment: (poId, file, kind = 'invoice') => {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('kind', kind)
+    return api.post(`/purchase-orders/${poId}/attachments`, form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+    }).then(r => r.data)
+  },
+  // Returns the absolute download URL — used in <img src> and <a href>.
+  attachmentDownloadUrl: (poId, attId) => `${API_BASE}/purchase-orders/${poId}/attachments/${attId}/download`,
+  deleteAttachment: (poId, attId) => api.delete(`/purchase-orders/${poId}/attachments/${attId}`).then(r => r.data),
+}
+
+export const pickupRunsApi = {
+  // date is a YYYY-MM-DD string
+  get: (date) => api.get('/pickup-runs/', { params: { date } }).then(r => r.data),
 }
 
 export const purchasePlanningApi = {

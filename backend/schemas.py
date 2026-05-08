@@ -1040,6 +1040,11 @@ class PurchaseOrderBase(BaseModel):
     delivery_notes: Optional[str] = None
     communication_method: Optional[str] = None
     notes: Optional[str] = None
+    pickup_at_vendor_id: Optional[int] = None
+    pickup_address_override: Optional[str] = None
+    pickup_run_date: Optional[date] = None
+    driver_name: Optional[str] = None
+    delivery_location: Optional[str] = None
 
 class PurchaseOrderCreate(PurchaseOrderBase):
     lines: List[POLineCreate] = []
@@ -1053,6 +1058,22 @@ class PurchaseOrderUpdate(BaseModel):
     delivery_notes: Optional[str] = None
     communication_method: Optional[str] = None
     notes: Optional[str] = None
+    pickup_at_vendor_id: Optional[int] = None
+    pickup_address_override: Optional[str] = None
+    pickup_run_date: Optional[date] = None
+    driver_name: Optional[str] = None
+    delivery_location: Optional[str] = None
+
+class POAttachmentResponse(BaseModel):
+    id: int
+    purchase_order_id: int
+    kind: str
+    filename: Optional[str] = None
+    content_type: Optional[str] = None
+    size_bytes: Optional[int] = None
+    uploaded_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
 
 class PurchaseOrderResponse(PurchaseOrderBase):
     id: int
@@ -1060,6 +1081,11 @@ class PurchaseOrderResponse(PurchaseOrderBase):
     subtotal: Optional[float] = None
     lines: List[POLineResponse] = []
     vendor_name: Optional[str] = None
+    # Effective pickup address resolved server-side from
+    # pickup_address_override → pickup_at_vendor.pickup_address → vendor.pickup_address.
+    effective_pickup_address: Optional[str] = None
+    pickup_at_vendor_name: Optional[str] = None
+    attachments: List[POAttachmentResponse] = []
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -1085,6 +1111,7 @@ class ReceivingRecordCreate(BaseModel):
     harvest_date: Optional[date] = None
     quality_rating: Optional[str] = None   # good | acceptable | poor
     quality_notes: Optional[str] = None
+    received_by: Optional[str] = None
 
 class ReceivingRecordUpdate(BaseModel):
     received_date: Optional[date] = None
@@ -1094,6 +1121,7 @@ class ReceivingRecordUpdate(BaseModel):
     harvest_date: Optional[date] = None
     quality_rating: Optional[str] = None
     quality_notes: Optional[str] = None
+    received_by: Optional[str] = None
 
 class ReceivingRecordResponse(BaseModel):
     id: int
@@ -1106,6 +1134,7 @@ class ReceivingRecordResponse(BaseModel):
     harvest_date: Optional[date] = None
     quality_rating: Optional[str] = None
     quality_notes: Optional[str] = None
+    received_by: Optional[str] = None
     pushed_to_inventory: bool = False
     inventory_batch_id: Optional[int] = None
     product_type: Optional[str] = None  # from PO line for convenience

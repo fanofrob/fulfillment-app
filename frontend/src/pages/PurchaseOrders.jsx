@@ -31,11 +31,44 @@ function formatCurrency(val) {
 const EMPTY_PO = {
   vendor_id: '', status: 'draft', order_date: new Date().toISOString().slice(0, 10),
   expected_delivery_date: '', delivery_notes: '', communication_method: '', notes: '',
+  pickup_at_vendor_id: '', pickup_address_override: '', pickup_run_date: '',
+  driver_name: '', delivery_location: '',
 }
 
 const EMPTY_LINE = {
   product_type: '', quantity_cases: '', case_weight_lbs: '',
   unit_price: '', price_unit: 'case', notes: '',
+}
+
+// Compress an image file in the browser before upload. Phone photos are
+// often 4–8 MB which is wasteful to store; rescaling to 1600px max and
+// re-encoding as JPEG quality 0.82 lands at ~300–600 KB without visible loss.
+async function compressImage(file, maxDim = 1600, quality = 0.82) {
+  if (!file.type.startsWith('image/')) return file
+  const url = URL.createObjectURL(file)
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image()
+      i.onload = () => resolve(i)
+      i.onerror = reject
+      i.src = url
+    })
+    const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight))
+    const w = Math.round(img.naturalWidth * scale)
+    const h = Math.round(img.naturalHeight * scale)
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    ctx.drawImage(img, 0, 0, w, h)
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality))
+    if (!blob) return file
+    return new File([blob], file.name.replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' })
+  } catch {
+    return file
+  } finally {
+    URL.revokeObjectURL(url)
+  }
 }
 
 export default function PurchaseOrders() {
@@ -52,9 +85,17 @@ export default function PurchaseOrders() {
   const [allocations, setAllocations] = useState([])
   // Receiving state
   const [receivingLineId, setReceivingLineId] = useState(null)
-  const [receivingForm, setReceivingForm] = useState({ received_cases: '', case_weight_lbs: '', received_weight_lbs: '', harvest_date: '', confirmed_pick_sku: '', quality_rating: '', quality_notes: '' })
+  const [receivingForm, setReceivingForm] = useState({ received_cases: '', case_weight_lbs: '', received_weight_lbs: '', harvest_date: '', confirmed_pick_sku: '', quality_rating: '', quality_notes: '', received_by: '' })
   const [receivingRecords, setReceivingRecords] = useState([])
   const [availableSkus, setAvailableSkus] = useState([])
+  // Attachment upload state (loading flag for spinner; preview URL for lightbox)
+  const [uploadingAttachment, setUploadingAttachment] = useState(false)
+  const [attachmentPreview, setAttachmentPreview] = useState(null)  // { url, filename }
+  // Pickup-location editor state per detail modal
+  const [pickupForm, setPickupForm] = useState({
+    pickup_at_vendor_id: '', pickup_address_override: '', pickup_run_date: '',
+    driver_name: '', delivery_location: '', expected_delivery_date: '',
+  })
 
   const { data: pos = [], isLoading } = useQuery({
     queryKey: ['purchase-orders', statusFilter],
@@ -125,6 +166,25 @@ export default function PurchaseOrders() {
     onSuccess: () => { if (showDetailModal) { loadReceivingRecords(showDetailModal.id); refreshDetail(showDetailModal.id) } },
   })
 
+  const deleteAttMut = useMutation({
+    mutationFn: ({ poId, attId }) => purchaseOrdersApi.deleteAttachment(poId, attId),
+    onSuccess: (_, vars) => refreshDetail(vars.poId),
+  })
+
+  async function handleUploadAttachment(poId, file) {
+    if (!file) return
+    setUploadingAttachment(true)
+    try {
+      const compressed = await compressImage(file)
+      await purchaseOrdersApi.uploadAttachment(poId, compressed, 'invoice')
+      refreshDetail(poId)
+    } catch (e) {
+      alert('Upload failed: ' + (e.response?.data?.detail || e.message))
+    } finally {
+      setUploadingAttachment(false)
+    }
+  }
+
   function loadReceivingRecords(poId) {
     receivingApi.listForPO(poId).then(setReceivingRecords).catch(() => setReceivingRecords([]))
   }
@@ -159,6 +219,19 @@ export default function PurchaseOrders() {
     if (np.toString() !== urlParams.toString()) setUrlParams(np, { replace: true })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showDetailModal?.id])
+
+  // Sync pickup form whenever the detail modal's PO changes (opens, refreshes after save).
+  useEffect(() => {
+    if (!showDetailModal) return
+    setPickupForm({
+      pickup_at_vendor_id: showDetailModal.pickup_at_vendor_id ?? '',
+      pickup_address_override: showDetailModal.pickup_address_override ?? '',
+      pickup_run_date: showDetailModal.pickup_run_date ?? '',
+      driver_name: showDetailModal.driver_name ?? '',
+      delivery_location: showDetailModal.delivery_location ?? '',
+      expected_delivery_date: showDetailModal.expected_delivery_date ?? '',
+    })
+  }, [showDetailModal?.id, showDetailModal?.updated_at])
 
   function closeCreateModal() {
     setShowCreateModal(false)
@@ -264,6 +337,9 @@ export default function PurchaseOrders() {
       confirmed_pick_sku: '',
       quality_rating: '',
       quality_notes: '',
+      // Default received_by to the PO's driver_name so the receipt is attributed
+      // by default; user can override.
+      received_by: showDetailModal?.driver_name ?? '',
     })
     receivingApi.getSkusForProductType(line.product_type, line.id)
       .then(skus => {
@@ -293,8 +369,21 @@ export default function PurchaseOrders() {
       harvest_date: receivingForm.harvest_date || null,
       quality_rating: receivingForm.quality_rating || null,
       quality_notes: receivingForm.quality_notes || null,
+      received_by: receivingForm.received_by || null,
     }
     receiveMut.mutate({ poId, lineId, data })
+  }
+
+  function handleSavePickup(poId) {
+    const data = {
+      pickup_at_vendor_id: pickupForm.pickup_at_vendor_id ? Number(pickupForm.pickup_at_vendor_id) : null,
+      pickup_address_override: pickupForm.pickup_address_override || null,
+      pickup_run_date: pickupForm.pickup_run_date || null,
+      driver_name: pickupForm.driver_name || null,
+      delivery_location: pickupForm.delivery_location || null,
+      expected_delivery_date: pickupForm.expected_delivery_date || null,
+    }
+    updateMut.mutate({ id: poId, data })
   }
 
   // Receiving records grouped by line
@@ -512,6 +601,133 @@ export default function PurchaseOrders() {
             </div>
             {showDetailModal.notes && <div style={{ marginTop: 8, fontSize: 13, color: '#6b7280' }}>{showDetailModal.notes}</div>}
 
+            {/* Pickup & Delivery */}
+            <div style={{ marginTop: 16, padding: 12, background: '#f9fafb', borderRadius: 6 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <h3 style={{ margin: 0, fontSize: 15 }}>Pickup &amp; Delivery</h3>
+                <div style={{ fontSize: 12, color: '#6b7280' }}>
+                  Effective pickup: {showDetailModal.effective_pickup_address ? (
+                    <a
+                      href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(showDetailModal.effective_pickup_address)}`}
+                      target="_blank" rel="noreferrer"
+                      style={{ color: '#2563eb' }}
+                    >{showDetailModal.effective_pickup_address}</a>
+                  ) : <em style={{ color: '#9ca3af' }}>No address on file — set vendor pickup address or add an override below</em>}
+                </div>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 8 }}>
+                <div className="form-group" style={{ margin: 0 }}>
+                  <label style={{ fontSize: 11 }}>Pickup Date</label>
+                  <input type="date" value={pickupForm.pickup_run_date || ''}
+                    onChange={e => setPickupForm({ ...pickupForm, pickup_run_date: e.target.value })} />
+                </div>
+                <div className="form-group" style={{ margin: 0 }}>
+                  <label style={{ fontSize: 11 }}>Expected Delivery</label>
+                  <input type="date" value={pickupForm.expected_delivery_date || ''}
+                    onChange={e => setPickupForm({ ...pickupForm, expected_delivery_date: e.target.value })} />
+                </div>
+                <div className="form-group" style={{ margin: 0 }}>
+                  <label style={{ fontSize: 11 }}>Driver</label>
+                  <input value={pickupForm.driver_name || ''}
+                    onChange={e => setPickupForm({ ...pickupForm, driver_name: e.target.value })}
+                    placeholder="Driver name" />
+                </div>
+                <div className="form-group" style={{ margin: 0, gridColumn: 'span 2' }}>
+                  <label style={{ fontSize: 11 }}>
+                    Consolidate Pickup at Another Vendor
+                    {pickupForm.pickup_at_vendor_id && (
+                      <span style={{ marginLeft: 8, color: '#6b7280', fontWeight: 400 }}>
+                        — driver picks up here instead of {showDetailModal.vendor_name}
+                      </span>
+                    )}
+                  </label>
+                  <select value={pickupForm.pickup_at_vendor_id}
+                    onChange={e => setPickupForm({ ...pickupForm, pickup_at_vendor_id: e.target.value })}>
+                    <option value="">— Pick up from {showDetailModal.vendor_name || 'seller'} directly —</option>
+                    {vendors.filter(v => v.is_active && v.id !== showDetailModal.vendor_id).map(v => (
+                      <option key={v.id} value={v.id}>
+                        {v.name}{v.pickup_address ? ` — ${v.pickup_address}` : ' (no address on file)'}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="form-group" style={{ margin: 0 }}>
+                  <label style={{ fontSize: 11 }}>Delivery Location (where it goes)</label>
+                  <input value={pickupForm.delivery_location || ''}
+                    onChange={e => setPickupForm({ ...pickupForm, delivery_location: e.target.value })}
+                    placeholder="The farm" />
+                </div>
+                <div className="form-group" style={{ margin: 0, gridColumn: 'span 3' }}>
+                  <label style={{ fontSize: 11 }}>Custom Pickup Address (override — wins over both options above)</label>
+                  <input value={pickupForm.pickup_address_override || ''}
+                    onChange={e => setPickupForm({ ...pickupForm, pickup_address_override: e.target.value })}
+                    placeholder="Free-form address — use this for parking-lot meets, etc." />
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <button className="btn btn-sm btn-primary"
+                  onClick={() => handleSavePickup(showDetailModal.id)}
+                  disabled={updateMut.isPending}>
+                  Save Pickup Details
+                </button>
+              </div>
+            </div>
+
+            {/* Attachments — invoice photos etc. */}
+            <div style={{ marginTop: 12, padding: 12, background: '#f9fafb', borderRadius: 6 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <h3 style={{ margin: 0, fontSize: 15 }}>Invoice &amp; Photos</h3>
+                <label className="btn btn-sm btn-primary" style={{ cursor: uploadingAttachment ? 'wait' : 'pointer', margin: 0 }}>
+                  {uploadingAttachment ? 'Uploading…' : '+ Add Photo'}
+                  {/* capture="environment" tells phones to open the rear camera directly. */}
+                  <input
+                    type="file" accept="image/*" capture="environment"
+                    style={{ display: 'none' }}
+                    disabled={uploadingAttachment}
+                    onChange={e => {
+                      const f = e.target.files?.[0]
+                      if (f) handleUploadAttachment(showDetailModal.id, f)
+                      e.target.value = ''  // reset so picking the same file twice still fires onChange
+                    }}
+                  />
+                </label>
+              </div>
+              {showDetailModal.attachments?.length > 0 ? (
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  {showDetailModal.attachments.map(att => {
+                    const url = purchaseOrdersApi.attachmentDownloadUrl(showDetailModal.id, att.id)
+                    const isImage = (att.content_type || '').startsWith('image/')
+                    return (
+                      <div key={att.id} style={{ position: 'relative', width: 120 }}>
+                        {isImage ? (
+                          <img
+                            src={url}
+                            alt={att.filename || 'attachment'}
+                            style={{ width: 120, height: 120, objectFit: 'cover', borderRadius: 4, cursor: 'pointer', border: '1px solid #e5e7eb' }}
+                            onClick={() => setAttachmentPreview({ url, filename: att.filename })}
+                          />
+                        ) : (
+                          <a href={url} target="_blank" rel="noreferrer"
+                            style={{ display: 'block', width: 120, height: 120, background: '#fff', border: '1px solid #e5e7eb', borderRadius: 4, padding: 8, fontSize: 11, textDecoration: 'none' }}>
+                            📎 {att.filename || 'file'}
+                          </a>
+                        )}
+                        <div style={{ fontSize: 10, color: '#6b7280', marginTop: 2, textAlign: 'center' }}>
+                          {att.kind} · {att.size_bytes ? `${Math.round(att.size_bytes / 1024)} KB` : '—'}
+                        </div>
+                        <button className="btn btn-xs btn-danger"
+                          style={{ position: 'absolute', top: 2, right: 2 }}
+                          onClick={() => { if (confirm('Delete this attachment?')) deleteAttMut.mutate({ poId: showDetailModal.id, attId: att.id }) }}
+                        >×</button>
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div style={{ fontSize: 13, color: '#9ca3af' }}>No invoice or photos uploaded yet. Tap "+ Add Photo" to take or attach one.</div>
+              )}
+            </div>
+
             {/* Line Items */}
             <h3 style={{ marginTop: 20 }}>Line Items</h3>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
@@ -675,7 +891,13 @@ export default function PurchaseOrders() {
                               </select>
                             </div>
                           </div>
-                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: 8, marginBottom: 8 }}>
+                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 2fr', gap: 8, marginBottom: 8 }}>
+                            <div className="form-group" style={{ margin: 0 }}>
+                              <label style={{ fontSize: 11 }}>Received By</label>
+                              <input value={receivingForm.received_by}
+                                onChange={e => setReceivingForm({ ...receivingForm, received_by: e.target.value })}
+                                placeholder="Driver / runner name" />
+                            </div>
                             <div className="form-group" style={{ margin: 0 }}>
                               <label style={{ fontSize: 11 }}>Quality</label>
                               <select value={receivingForm.quality_rating}
@@ -720,6 +942,7 @@ export default function PurchaseOrders() {
                             <thead>
                               <tr style={{ color: '#6b7280' }}>
                                 <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>Date</th>
+                                <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>By</th>
                                 <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>Cases</th>
                                 <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>Weight</th>
                                 <th style={{ padding: '4px 6px', textAlign: 'left', fontWeight: 500 }}>SKU</th>
@@ -733,6 +956,7 @@ export default function PurchaseOrders() {
                               {lineRecords.map(rec => (
                                 <tr key={rec.id} style={{ borderTop: '1px solid #f3f4f6' }}>
                                   <td style={{ padding: '4px 6px' }}>{formatDate(rec.received_date)}</td>
+                                  <td style={{ padding: '4px 6px' }}>{rec.received_by || <span style={{ color: '#9ca3af' }}>—</span>}</td>
                                   <td style={{ padding: '4px 6px' }}>{rec.received_cases}</td>
                                   <td style={{ padding: '4px 6px' }}>{rec.received_weight_lbs} lbs</td>
                                   <td style={{ padding: '4px 6px' }}>{rec.confirmed_pick_sku || <span style={{ color: '#d97706' }}>Pending</span>}</td>
@@ -804,6 +1028,23 @@ export default function PurchaseOrders() {
                 <button className="btn btn-danger" onClick={() => { if (confirm('Delete this PO?')) deleteMut.mutate(showDetailModal.id) }}>Delete PO</button>
               )}
               <button className="btn" onClick={() => setShowDetailModal(null)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Attachment Lightbox */}
+      {attachmentPreview && (
+        <div className="modal-overlay" onClick={() => setAttachmentPreview(null)} style={{ background: 'rgba(0,0,0,0.85)' }}>
+          <div onClick={e => e.stopPropagation()} style={{ maxWidth: '92vw', maxHeight: '92vh' }}>
+            <img src={attachmentPreview.url} alt={attachmentPreview.filename || ''}
+              style={{ maxWidth: '92vw', maxHeight: '88vh', display: 'block' }} />
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, color: '#fff', fontSize: 13 }}>
+              <span>{attachmentPreview.filename}</span>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <a href={attachmentPreview.url} target="_blank" rel="noreferrer" style={{ color: '#fff' }}>Open in new tab</a>
+                <button className="btn btn-sm" onClick={() => setAttachmentPreview(null)}>Close</button>
+              </div>
             </div>
           </div>
         </div>

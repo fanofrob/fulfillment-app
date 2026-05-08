@@ -214,6 +214,28 @@ def _migrate_db():
                 conn.commit()
     # packaging_mappings table is created by create_all — no manual migration needed.
     # box_packaging_mappings table is also auto-created by create_all.
+    # Add pickup logistics columns to purchase_orders if missing.
+    if "purchase_orders" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("purchase_orders")}
+        with engine.connect() as conn:
+            for col_name, col_type in [
+                ("pickup_at_vendor_id",     "INTEGER"),
+                ("pickup_address_override", "TEXT"),
+                ("pickup_run_date",         "DATE"),
+                ("driver_name",             "TEXT"),
+                ("delivery_location",       "TEXT"),
+            ]:
+                if col_name not in cols:
+                    conn.execute(text(f"ALTER TABLE purchase_orders ADD COLUMN {col_name} {col_type}"))
+            conn.commit()
+    # Add received_by to receiving_records if missing.
+    if "receiving_records" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("receiving_records")}
+        if "received_by" not in cols:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE receiving_records ADD COLUMN received_by TEXT"))
+                conn.commit()
+    # purchase_order_attachments table is created by create_all — no manual migration needed.
 
 
 def _seed_ups_rates():
@@ -316,7 +338,7 @@ models.Base.metadata.create_all(bind=engine)
 _seed_ups_rates()
 _seed_gm_settings()
 
-from routers import sku_mapping, sku_helper, cogs, rate_cards, rules, inventory, orders, shopify_auth, shipstation, fulfillment, picklist_skus, products, gm_settings, projection_periods, projection_confirmed_orders, historical_data, projections, vendors, purchase_orders, purchase_planning, inventory_count, receiving, packaging_mappings, packaging_dashboard
+from routers import sku_mapping, sku_helper, cogs, rate_cards, rules, inventory, orders, shopify_auth, shipstation, fulfillment, picklist_skus, products, gm_settings, projection_periods, projection_confirmed_orders, historical_data, projections, vendors, purchase_orders, purchase_planning, inventory_count, receiving, packaging_mappings, packaging_dashboard, pickup_runs
 from services import sheets_service, shopify_service, shipstation_service
 
 app = FastAPI(title="Fulfillment App API")
@@ -358,6 +380,7 @@ app.include_router(purchase_orders.router, prefix="/api/purchase-orders", tags=[
 app.include_router(purchase_planning.router, prefix="/api/purchase-planning", tags=["Purchase Planning"])
 app.include_router(inventory_count.router, prefix="/api/inventory-count", tags=["Inventory Count"])
 app.include_router(receiving.router, prefix="/api/receiving", tags=["Receiving"])
+app.include_router(pickup_runs.router, prefix="/api/pickup-runs", tags=["Pickup Runs"])
 
 @app.get("/api/ping")
 def ping():
