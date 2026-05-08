@@ -267,6 +267,23 @@ def _auto_deduct_on_ship(order, db: Session):
                 if bt and bt.pick_sku:
                     demand[bt.pick_sku] = demand.get(bt.pick_sku, 0.0) + 1.0
 
+    # Per-product packaging: for each product pick_sku in `demand`, look up its
+    # packaging_mappings and add qty_per_unit × shipped_qty to the matching
+    # packaging pick_sku. We snapshot product_skus FIRST so we don't iterate
+    # while mutating; packaging SKUs themselves never recursively map to more
+    # packaging (mappings are always product → packaging).
+    product_skus = list(demand.keys())
+    if product_skus:
+        mappings = db.query(models.PackagingMapping).filter(
+            models.PackagingMapping.product_pick_sku.in_(product_skus)
+        ).all()
+        for m in mappings:
+            product_qty = demand.get(m.product_pick_sku, 0.0)
+            if product_qty <= 0:
+                continue
+            add_qty = product_qty * (m.qty_per_unit or 1.0)
+            demand[m.packaging_pick_sku] = demand.get(m.packaging_pick_sku, 0.0) + add_qty
+
     for pick_sku, qty in demand.items():
         inv = db.query(models.InventoryItem).filter(
             models.InventoryItem.pick_sku == pick_sku,
@@ -550,6 +567,167 @@ def list_adjustments(
     if pick_sku:
         q = q.filter(models.InventoryAdjustment.pick_sku == pick_sku)
     return q.order_by(models.InventoryAdjustment.created_at.desc()).limit(limit).all()
+
+
+@router.get("/discard-report")
+def discard_report(
+    warehouse: str = Query(...),
+    from_date: Optional[str] = Query(None, description="ISO date inclusive, e.g. 2026-04-01"),
+    to_date: Optional[str] = Query(None, description="ISO date inclusive, e.g. 2026-05-07"),
+    category: Optional[str] = Query(None, description="'fruit' | 'packaging' | 'other' | None for all"),
+    db: Session = Depends(get_db),
+):
+    """
+    Aggregate + raw view of discard adjustments (adjustment_type='discard_count').
+
+    Returns:
+      {
+        "warehouse": str,
+        "from_date": str|null,
+        "to_date": str|null,
+        "category": str|null,
+        "by_sku": [{
+          pick_sku, name, category, weight_lb,
+          pieces_discarded, lbs_discarded, event_count, last_discard_at
+        }],
+        "by_event": [{
+          id, created_at, pick_sku, name, category, weight_lb,
+          pieces, lbs, note
+        }],
+        "totals": { pieces, lbs, events, skus }
+      }
+
+    Note: `pieces` is the absolute value of the adjustment delta (deltas are
+    stored negative). `lbs` is computed from pieces × PicklistSku.weight_lb,
+    or null when weight_lb is missing.
+    """
+    # Parse date range. Inclusive on both ends — to_date is the end of that day.
+    start_dt: Optional[datetime] = None
+    end_dt: Optional[datetime] = None
+    if from_date:
+        try:
+            start_dt = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid from_date: {from_date} (expected YYYY-MM-DD)")
+    if to_date:
+        try:
+            end_dt = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid to_date: {to_date} (expected YYYY-MM-DD)")
+
+    q = db.query(models.InventoryAdjustment).filter(
+        models.InventoryAdjustment.warehouse == warehouse,
+        models.InventoryAdjustment.adjustment_type == "discard_count",
+    )
+    if start_dt is not None:
+        q = q.filter(models.InventoryAdjustment.created_at >= start_dt)
+    if end_dt is not None:
+        q = q.filter(models.InventoryAdjustment.created_at < end_dt)
+
+    raw_adjustments = q.order_by(models.InventoryAdjustment.created_at.desc()).all()
+
+    # Pull category + weight_lb + name in one batch.
+    pick_skus = list({a.pick_sku for a in raw_adjustments})
+    sku_meta: dict[str, dict] = {}
+    if pick_skus:
+        psk_rows = db.query(models.PicklistSku).filter(
+            models.PicklistSku.pick_sku.in_(pick_skus)
+        ).all()
+        sku_meta = {
+            p.pick_sku: {
+                "name": p.customer_description,
+                "category": p.category,
+                "weight_lb": p.weight_lb,
+            }
+            for p in psk_rows
+        }
+        # Fallback to InventoryItem.name if PicklistSku has no name.
+        inv_rows = db.query(models.InventoryItem.pick_sku, models.InventoryItem.name).filter(
+            models.InventoryItem.warehouse == warehouse,
+            models.InventoryItem.pick_sku.in_(pick_skus),
+        ).all()
+        inv_names = {r.pick_sku: r.name for r in inv_rows}
+        for sku in pick_skus:
+            if sku not in sku_meta:
+                sku_meta[sku] = {"name": inv_names.get(sku) or sku, "category": None, "weight_lb": None}
+            elif not sku_meta[sku]["name"]:
+                sku_meta[sku]["name"] = inv_names.get(sku) or sku
+
+    cat_filter = (category or "").strip().lower() or None
+
+    def cat_matches(sku_cat: Optional[str]) -> bool:
+        if not cat_filter:
+            return True
+        if cat_filter == "other":
+            # 'other' bucket = anything that isn't fruit/packaging
+            return (sku_cat or "").lower() not in ("fruit", "packaging")
+        return (sku_cat or "").lower() == cat_filter
+
+    by_event = []
+    by_sku_acc: dict[str, dict] = {}
+    total_pieces = 0.0
+    total_lbs = 0.0
+
+    for adj in raw_adjustments:
+        meta = sku_meta.get(adj.pick_sku, {"name": adj.pick_sku, "category": None, "weight_lb": None})
+        if not cat_matches(meta["category"]):
+            continue
+
+        pieces = abs(adj.delta or 0.0)
+        weight_lb = meta["weight_lb"]
+        lbs = round(pieces * weight_lb, 2) if (weight_lb is not None and pieces) else (0.0 if weight_lb is not None else None)
+
+        by_event.append({
+            "id": adj.id,
+            "created_at": adj.created_at.isoformat() if adj.created_at else None,
+            "pick_sku": adj.pick_sku,
+            "name": meta["name"],
+            "category": meta["category"],
+            "weight_lb": weight_lb,
+            "pieces": pieces,
+            "lbs": lbs,
+            "note": adj.note,
+        })
+
+        agg = by_sku_acc.setdefault(adj.pick_sku, {
+            "pick_sku": adj.pick_sku,
+            "name": meta["name"],
+            "category": meta["category"],
+            "weight_lb": weight_lb,
+            "pieces_discarded": 0.0,
+            "lbs_discarded": 0.0 if weight_lb is not None else None,
+            "event_count": 0,
+            "last_discard_at": None,
+        })
+        agg["pieces_discarded"] += pieces
+        if weight_lb is not None:
+            if agg["lbs_discarded"] is None:
+                agg["lbs_discarded"] = 0.0
+            agg["lbs_discarded"] = round(agg["lbs_discarded"] + (lbs or 0.0), 2)
+        agg["event_count"] += 1
+        if adj.created_at and (agg["last_discard_at"] is None or adj.created_at.isoformat() > agg["last_discard_at"]):
+            agg["last_discard_at"] = adj.created_at.isoformat()
+
+        total_pieces += pieces
+        if weight_lb is not None and lbs is not None:
+            total_lbs += lbs
+
+    by_sku = sorted(by_sku_acc.values(), key=lambda r: r["pieces_discarded"], reverse=True)
+
+    return {
+        "warehouse": warehouse,
+        "from_date": from_date,
+        "to_date": to_date,
+        "category": cat_filter,
+        "by_sku": by_sku,
+        "by_event": by_event,
+        "totals": {
+            "pieces": round(total_pieces, 2),
+            "lbs": round(total_lbs, 2),
+            "events": len(by_event),
+            "skus": len(by_sku),
+        },
+    }
 
 
 # ── Batches ───────────────────────────────────────────────────────────────────

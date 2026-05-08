@@ -91,6 +91,10 @@ export const inventoryApi = {
   weeklyReport: (warehouse) =>
     api.get('/inventory/weekly-report', { params: { warehouse } }).then(r => r.data),
 
+  // Discard report — aggregated + raw view of discard_count adjustments over a date range.
+  discardReport: (warehouse, params) =>
+    api.get('/inventory/discard-report', { params: { warehouse, ...params } }).then(r => r.data),
+
   // Recompute committed from live orders
   recomputeCommitted: (warehouse) =>
     api.post('/inventory/recompute-committed', null, { params: { warehouse } }).then(r => r.data),
@@ -153,8 +157,20 @@ export const shipstationApi = {
 export const picklistSkusApi = {
   list: (params) => api.get('/picklist-skus/', { params }).then(r => r.data),
   sync: () => api.post('/picklist-skus/sync').then(r => r.data),
+  create: (data) => api.post('/picklist-skus/', data).then(r => r.data),
   update: (id, data) => api.put(`/picklist-skus/${id}`, data).then(r => r.data),
   missingCogs: () => api.get('/picklist-skus/missing-cogs').then(r => r.data),
+}
+
+export const packagingMappingsApi = {
+  list: (params) => api.get('/packaging-mappings/', { params }).then(r => r.data),
+  create: (data) => api.post('/packaging-mappings/', data).then(r => r.data),
+  update: (id, data) => api.put(`/packaging-mappings/${id}`, data).then(r => r.data),
+  delete: (id) => api.delete(`/packaging-mappings/${id}`).then(r => r.data),
+}
+
+export const packagingDashboardApi = {
+  get: (params) => api.get('/packaging-dashboard/', { params }).then(r => r.data),
 }
 
 export const skuHelperApi = {

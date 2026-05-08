@@ -13,6 +13,7 @@ from database import get_db
 import models
 import schemas
 from services import shipstation_service
+from routers.picklist_skus import get_packaging_pick_skus
 
 router = APIRouter()
 
@@ -100,9 +101,10 @@ def push_order(shopify_order_id: str, db: Session = Depends(get_db)):
     line_items = db.query(models.ShopifyLineItem).filter(
         models.ShopifyLineItem.shopify_order_id == shopify_order_id
     ).all()
+    packaging_skus = get_packaging_pick_skus(db)
 
     try:
-        ss_result = shipstation_service.push_order(order, line_items)
+        ss_result = shipstation_service.push_order(order, line_items, packaging_skus=packaging_skus)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"ShipStation error: {str(e)}")
 
@@ -138,6 +140,9 @@ def push_batch(body: schemas.ShipStationPushBatchRequest, db: Session = Depends(
     Returns per-order results.
     """
     _require_configured()
+
+    # Look up packaging SKUs once for the whole batch — set is small + stable.
+    packaging_skus = get_packaging_pick_skus(db)
 
     results = []
     for order_id in body.order_ids:
@@ -204,7 +209,7 @@ def push_batch(body: schemas.ShipStationPushBatchRequest, db: Session = Depends(
         ).all()
 
         try:
-            ss_result = shipstation_service.push_order(order, line_items)
+            ss_result = shipstation_service.push_order(order, line_items, packaging_skus=packaging_skus)
             order.shipstation_order_id = str(ss_result.get("orderId", ""))
             order.shipstation_order_key = ss_result.get("orderKey", "")
             order.app_status = "in_shipstation_not_shipped"

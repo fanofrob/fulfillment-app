@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 from database import get_db, SessionLocal
 import models
 from services import shipstation_service, sheets_service, shopify_service, mapping_override
+from routers.picklist_skus import get_packaging_pick_skus
 
 router = APIRouter()
 
@@ -1314,6 +1315,7 @@ def push_box(plan_id: int, box_id: int, db: Session = Depends(get_db)):
             carrier_code=carrier_match.get("carrier_code") if carrier_match else None,
             service_code=carrier_match.get("service_code") if carrier_match else None,
             shipping_provider_id=carrier_match.get("shipping_provider_id") if carrier_match else None,
+            packaging_skus=get_packaging_pick_skus(db),
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"ShipStation error: {str(e)}")
@@ -1990,6 +1992,10 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
     validated = []        # list of dicts ready for parallel push
     skip_results = []     # orders that failed validation
 
+    # Snapshot packaging SKUs once for the whole bulk push — small, stable set
+    # that's read inside the worker closure to filter packaging out of payloads.
+    packaging_skus_snapshot = get_packaging_pick_skus(db)
+
     # Running inventory balance — decremented as each order is validated so that
     # later orders in the sorted list see the inventory already committed to
     # earlier orders.  Keys: (pick_sku, warehouse), seeded lazily from DB.
@@ -2166,6 +2172,7 @@ def bulk_push_stream(body: BulkPushRequest, db: Session = Depends(get_db)):
                     carrier_code=bt["carrier_code"],
                     service_code=bt["service_code"],
                     shipping_provider_id=bt.get("shipping_provider_id"),
+                    packaging_skus=packaging_skus_snapshot,
                 )
                 return {"box_id": box_id, "success": True, "ss_result": ss_result}
             except Exception as e:
@@ -2494,6 +2501,7 @@ def bulk_push_plans(body: BulkPushRequest, db: Session = Depends(get_db)):
                     carrier_code=carrier_match.get("carrier_code") if carrier_match else None,
                     service_code=carrier_match.get("service_code") if carrier_match else None,
                     shipping_provider_id=carrier_match.get("shipping_provider_id") if carrier_match else None,
+                    packaging_skus=get_packaging_pick_skus(db),
                 )
                 box.shipstation_order_id = str(ss_result.get("orderId", ""))
                 box.shipstation_order_key = ss_result.get("orderKey", "")

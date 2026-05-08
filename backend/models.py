@@ -13,6 +13,11 @@ class PicklistSku(Base):
     temperature = Column(String, nullable=True)
     type = Column(String, nullable=True)
     category = Column(String, nullable=True)  # 'fruit' | 'packaging' | other
+    # inventory_type controls fulfillment behavior:
+    #   'product'  → pushed to ShipStation as a line item, deducted from inventory at ship time
+    #   'packaging' → app-only; NEVER pushed to ShipStation; deducted via BoxType.pick_sku (1 per box)
+    #                 or via PackagingMapping (qty per product unit shipped)
+    inventory_type = Column(String, nullable=False, default='product', index=True)
     status = Column(String, nullable=True)
     cc_item_id = Column(String, nullable=True)
     notes = Column(Text, nullable=True)
@@ -25,6 +30,30 @@ class PicklistSku(Base):
     synced_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class PackagingMapping(Base):
+    """
+    Per-product packaging consumption rules.
+    When a product pick_sku ships, deduct (qty_per_unit × shipped_qty) of the
+    packaging pick_sku from inventory. Multiple packaging mappings may exist
+    per product (e.g., a clamshell + a label + a sticker for one fruit pack).
+
+    Box-level packaging (1 box per shipment) lives on BoxType.pick_sku — NOT here.
+    This table is exclusively for per-product-unit packaging.
+    """
+    __tablename__ = "packaging_mappings"
+    id                  = Column(Integer, primary_key=True, index=True)
+    product_pick_sku    = Column(String, nullable=False, index=True)   # e.g. 'cherry-01x01'
+    packaging_pick_sku  = Column(String, nullable=False, index=True)   # e.g. '1lb_clamshell'
+    qty_per_unit        = Column(Float, nullable=False, default=1.0)   # 1.0 = one packaging unit per product unit
+    notes               = Column(Text, nullable=True)
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at          = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('product_pick_sku', 'packaging_pick_sku', name='uq_packaging_mapping'),
+    )
 
 
 class SkuMapping(Base):

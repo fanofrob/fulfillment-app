@@ -52,14 +52,21 @@ def get_status() -> dict:
         return {"configured": False, "message": f"Connection error: {str(e)}"}
 
 
-def push_order(order, line_items) -> dict:
+def push_order(order, line_items, packaging_skus: Optional[set] = None) -> dict:
     """
     Create an order in ShipStation from a ShopifyOrder + its line items.
     Returns the ShipStation order dict on success.
     Raises RuntimeError if not configured or API call fails.
+
+    packaging_skus: set of pick_sku strings flagged as inventory_type='packaging'.
+    Any line item whose pick_sku is in this set is skipped — packaging is app-only
+    inventory and must never reach ShipStation. Caller should pass the result of
+    `get_packaging_pick_skus(db)` from routers.picklist_skus.
     """
     if not is_configured():
         raise RuntimeError("ShipStation not configured")
+
+    pkg = packaging_skus or set()
 
     # Build ShipStation order payload
     ss_items = []
@@ -68,6 +75,8 @@ def push_order(order, line_items) -> dict:
     for li in line_items:
         if not li.sku_mapped or not li.pick_sku:
             continue
+        if li.pick_sku in pkg:
+            continue  # packaging SKU — never push to ShipStation
         qty = li.fulfillable_quantity if li.fulfillable_quantity is not None else li.quantity
         units = qty * (li.mix_quantity or 1.0)
 
@@ -234,7 +243,7 @@ def get_shipments(ss_order_ids: List[str], days: int = 14) -> List[Dict]:
     return all_shipments
 
 
-def push_box(order, box_number: int, box_items, weight_oz=None, box_type=None, carrier_code=None, service_code=None, shipping_provider_id=None) -> dict:
+def push_box(order, box_number: int, box_items, weight_oz=None, box_type=None, carrier_code=None, service_code=None, shipping_provider_id=None, packaging_skus: Optional[set] = None) -> dict:
     """
     Create a ShipStation order for a single fulfillment box.
     box_items: list of BoxLineItem model objects.
@@ -243,6 +252,9 @@ def push_box(order, box_number: int, box_items, weight_oz=None, box_type=None, c
     shipping_provider_id: ShipStation shippingProviderId — required when multiple
         accounts share the same carrierCode (e.g. USPS wallet se-4946429 vs
         Stamps.com se-5337414). Sent as advancedOptions.billToMyOtherAccount.
+    packaging_skus: set of pick_skus flagged inventory_type='packaging'. Any
+        box_item whose pick_sku is in this set is skipped — packaging is
+        app-only inventory and must never reach ShipStation.
     Order number is formatted as '<shopify_order_number>-Box<N>' so each box
     gets its own ShipStation entry with a distinct tracking number.
     Returns the ShipStation order dict.
@@ -250,12 +262,16 @@ def push_box(order, box_number: int, box_items, weight_oz=None, box_type=None, c
     if not is_configured():
         raise RuntimeError("ShipStation not configured")
 
+    pkg = packaging_skus or set()
+
     ss_items = []
     seen_skus: dict[str, int] = {}
 
     for item in box_items:
         if not item.pick_sku:
             continue
+        if item.pick_sku in pkg:
+            continue  # packaging SKU — never push to ShipStation
         if item.pick_sku in seen_skus:
             ss_items[seen_skus[item.pick_sku]]["quantity"] += int(item.quantity)
         else:

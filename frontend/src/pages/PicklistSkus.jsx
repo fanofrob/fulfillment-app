@@ -3,7 +3,13 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 import { picklistSkusApi } from '../api'
 
+const INVENTORY_TYPE_OPTIONS = [
+  { value: 'product',   label: 'Product' },
+  { value: 'packaging', label: 'Packaging' },
+]
+
 const EDITABLE_FIELDS = [
+  { key: 'inventory_type',       label: 'Inv. Type',         type: 'select', width: 110, options: INVENTORY_TYPE_OPTIONS, hint: "Product = pushed to ShipStation. Packaging = app-only (boxes, clamshells, labels, etc.)" },
   { key: 'type',                 label: 'Pick Type',         type: 'text',   width: 140 },
   { key: 'weight_lb',            label: 'Weight (lb)',       type: 'number', width: 90 },
   { key: 'cost_per_lb',          label: 'Cost/lb ($)',       type: 'number', width: 90, hint: 'Direct cost per lb' },
@@ -44,6 +50,8 @@ function EditableRow({ item, onSave, prefixCells = null, fields = EDITABLE_FIELD
       const raw = draft[f.key]
       if (f.type === 'number') {
         payload[f.key] = raw === '' || raw === null ? null : Number(raw)
+      } else if (f.type === 'select') {
+        payload[f.key] = raw || null
       } else {
         payload[f.key] = raw === '' ? null : raw
       }
@@ -63,13 +71,25 @@ function EditableRow({ item, onSave, prefixCells = null, fields = EDITABLE_FIELD
         {prefixCells}
         {fields.map(f => (
           <td key={f.key}>
-            <input
-              type={f.type === 'number' ? 'number' : 'text'}
-              value={draft[f.key] ?? ''}
-              onChange={e => setDraft(d => ({ ...d, [f.key]: e.target.value }))}
-              style={{ width: f.width - 16, fontSize: 12, padding: '2px 4px', border: '1px solid #93c5fd', borderRadius: 3 }}
-              step={f.type === 'number' ? 'any' : undefined}
-            />
+            {f.type === 'select' ? (
+              <select
+                value={draft[f.key] ?? ''}
+                onChange={e => setDraft(d => ({ ...d, [f.key]: e.target.value }))}
+                style={{ width: f.width - 8, fontSize: 12, padding: '2px 4px', border: '1px solid #93c5fd', borderRadius: 3 }}
+              >
+                {f.options.map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type={f.type === 'number' ? 'number' : 'text'}
+                value={draft[f.key] ?? ''}
+                onChange={e => setDraft(d => ({ ...d, [f.key]: e.target.value }))}
+                style={{ width: f.width - 16, fontSize: 12, padding: '2px 4px', border: '1px solid #93c5fd', borderRadius: 3 }}
+                step={f.type === 'number' ? 'any' : undefined}
+              />
+            )}
           </td>
         ))}
         <td style={{ whiteSpace: 'nowrap' }}>
@@ -86,15 +106,21 @@ function EditableRow({ item, onSave, prefixCells = null, fields = EDITABLE_FIELD
       {prefixCells}
       {fields.map(f => (
         <td key={f.key} style={{ fontSize: 13 }} title={f.hint || undefined}>
-          {f.key === 'pactor' && item[f.key] != null
-            ? <span className="pactor-chip pactor-line">{item[f.key]}</span>
-            : f.key === 'cost_per_lb' && item.cost_per_lb == null && item.cost_per_case != null && item.case_weight_lb
-              ? <span style={{ color: '#9ca3af', fontStyle: 'italic' }}>
-                  ${(item.cost_per_case / item.case_weight_lb).toFixed(4)} <span style={{ fontSize: 11 }}>(calc)</span>
-                </span>
-              : f.key === 'cost_per_lb' && item.cost_per_lb != null
-                ? <span style={{ color: '#16a34a', fontWeight: 500 }}>${item.cost_per_lb.toFixed(4)}</span>
-                : fmt(item[f.key])
+          {f.key === 'inventory_type'
+            ? <span style={{
+                display: 'inline-block', padding: '1px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600,
+                background: item.inventory_type === 'packaging' ? '#fef3c7' : '#dbeafe',
+                color:      item.inventory_type === 'packaging' ? '#92400e' : '#1e40af',
+              }}>{item.inventory_type === 'packaging' ? 'Packaging' : 'Product'}</span>
+            : f.key === 'pactor' && item[f.key] != null
+              ? <span className="pactor-chip pactor-line">{item[f.key]}</span>
+              : f.key === 'cost_per_lb' && item.cost_per_lb == null && item.cost_per_case != null && item.case_weight_lb
+                ? <span style={{ color: '#9ca3af', fontStyle: 'italic' }}>
+                    ${(item.cost_per_case / item.case_weight_lb).toFixed(4)} <span style={{ fontSize: 11 }}>(calc)</span>
+                  </span>
+                : f.key === 'cost_per_lb' && item.cost_per_lb != null
+                  ? <span style={{ color: '#16a34a', fontWeight: 500 }}>${item.cost_per_lb.toFixed(4)}</span>
+                  : fmt(item[f.key])
           }
         </td>
       ))}
@@ -109,19 +135,132 @@ function EditableRow({ item, onSave, prefixCells = null, fields = EDITABLE_FIELD
   )
 }
 
+function CreateSkuModal({ onClose, onCreated }) {
+  const qc = useQueryClient()
+  const [form, setForm] = useState({
+    pick_sku: '',
+    customer_description: '',
+    inventory_type: 'product',
+    category: '',
+    weight_lb: '',
+    cost_per_lb: '',
+    cost_per_case: '',
+    case_weight_lb: '',
+    notes: '',
+  })
+
+  const createMut = useMutation({
+    mutationFn: picklistSkusApi.create,
+    onSuccess: (res) => {
+      qc.invalidateQueries(['picklist-skus'])
+      qc.invalidateQueries(['packaging-dashboard'])
+      onCreated?.(res)
+      onClose()
+    },
+  })
+
+  function submit(e) {
+    e.preventDefault()
+    if (!form.pick_sku.trim()) return
+    const payload = { ...form, pick_sku: form.pick_sku.trim() }
+    // Coerce numeric fields
+    for (const k of ['weight_lb', 'cost_per_lb', 'cost_per_case', 'case_weight_lb']) {
+      payload[k] = payload[k] === '' ? null : Number(payload[k])
+    }
+    if (!payload.customer_description) payload.customer_description = null
+    if (!payload.category) payload.category = null
+    if (!payload.notes) payload.notes = null
+    createMut.mutate(payload)
+  }
+
+  const errMsg = createMut.error?.response?.data?.detail || createMut.error?.message
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+    }} onClick={onClose}>
+      <form
+        onClick={e => e.stopPropagation()}
+        onSubmit={submit}
+        style={{ background: 'white', borderRadius: 8, padding: 24, minWidth: 480, boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}
+      >
+        <h2 style={{ marginTop: 0, marginBottom: 16 }}>Create Pick SKU</h2>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 8, fontSize: 13, alignItems: 'center' }}>
+          <label>Pick SKU *</label>
+          <input value={form.pick_sku} onChange={e => setForm({ ...form, pick_sku: e.target.value })} required autoFocus placeholder="e.g. 8x8x8_box" />
+
+          <label>Description</label>
+          <input value={form.customer_description} onChange={e => setForm({ ...form, customer_description: e.target.value })} placeholder="e.g. 8x8x8 corrugated box" />
+
+          <label>Inventory Type *</label>
+          <select value={form.inventory_type} onChange={e => setForm({ ...form, inventory_type: e.target.value })}>
+            {INVENTORY_TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+
+          <label>Category</label>
+          <input value={form.category} onChange={e => setForm({ ...form, category: e.target.value })} placeholder="e.g. packaging, fruit" />
+
+          <label>Weight (lb)</label>
+          <input type="number" step="any" value={form.weight_lb} onChange={e => setForm({ ...form, weight_lb: e.target.value })} />
+
+          <label>Cost / lb ($)</label>
+          <input type="number" step="any" value={form.cost_per_lb} onChange={e => setForm({ ...form, cost_per_lb: e.target.value })} />
+
+          <label>Cost / case ($)</label>
+          <input type="number" step="any" value={form.cost_per_case} onChange={e => setForm({ ...form, cost_per_case: e.target.value })} />
+
+          <label>Case wt (lb)</label>
+          <input type="number" step="any" value={form.case_weight_lb} onChange={e => setForm({ ...form, case_weight_lb: e.target.value })} />
+
+          <label>Notes</label>
+          <input value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} />
+        </div>
+
+        {form.inventory_type === 'packaging' && (
+          <div style={{ marginTop: 12, padding: 10, fontSize: 12, background: '#fef3c7', border: '1px solid #fcd34d', borderRadius: 4, color: '#78350f' }}>
+            <strong>Packaging SKU:</strong> won't be pushed to ShipStation. Deducted from inventory at ship time via either (a) a Box Type linked to this SKU, or (b) a per-product Packaging Mapping (1lb_clamshell → cherry-01x01).
+          </div>
+        )}
+
+        {errMsg && (
+          <div style={{ marginTop: 12, padding: 8, fontSize: 12, color: '#dc2626', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 4 }}>
+            {errMsg}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 20 }}>
+          <button type="button" className="btn btn-secondary" onClick={onClose}>Cancel</button>
+          <button type="submit" className="btn btn-primary" disabled={createMut.isPending || !form.pick_sku.trim()}>
+            {createMut.isPending ? 'Creating…' : 'Create SKU'}
+          </button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
 export default function PicklistSkus() {
   const qc = useQueryClient()
   const [urlParams, setUrlParams] = useSearchParams()
   const filter = urlParams.get('filter') || ''
   const isMissingCogs = filter === 'missing-cogs'
   const [search, setSearch] = useState(urlParams.get('search') || '')
+  const [typeFilter, setTypeFilter] = useState('')  // '' | 'product' | 'packaging'
   const [page, setPage] = useState(0)
   const limit = 200
   const [syncResult, setSyncResult] = useState(null)
+  const [showCreate, setShowCreate] = useState(false)
 
   const { data = { total: 0, items: [] }, isLoading } = useQuery({
-    queryKey: ['picklist-skus', search, page],
-    queryFn: () => picklistSkusApi.list({ search: search || undefined, skip: page * limit, limit }),
+    queryKey: ['picklist-skus', search, typeFilter, page],
+    queryFn: () => picklistSkusApi.list({
+      search: search || undefined,
+      inventory_type: typeFilter || undefined,
+      skip: page * limit,
+      limit,
+    }),
     enabled: !isMissingCogs,
   })
 
@@ -146,6 +285,7 @@ export default function PicklistSkus() {
     onSuccess: () => {
       qc.invalidateQueries(['picklist-skus'])
       qc.invalidateQueries(['picklist-skus-missing-cogs'])
+      qc.invalidateQueries(['packaging-dashboard'])
     },
   })
 
@@ -188,15 +328,33 @@ export default function PicklistSkus() {
 
       <div className="toolbar">
         {!isMissingCogs && (
-          <input
-            placeholder="Search SKU or description..."
-            value={search}
-            onChange={e => { setSearch(e.target.value); setPage(0) }}
-            style={{ minWidth: 240 }}
-          />
+          <>
+            <input
+              placeholder="Search SKU or description..."
+              value={search}
+              onChange={e => { setSearch(e.target.value); setPage(0) }}
+              style={{ minWidth: 240 }}
+            />
+            <select
+              value={typeFilter}
+              onChange={e => { setTypeFilter(e.target.value); setPage(0) }}
+              style={{ fontSize: 13, padding: '4px 8px' }}
+              title="Filter by inventory type"
+            >
+              <option value="">All types</option>
+              <option value="product">Product only</option>
+              <option value="packaging">Packaging only</option>
+            </select>
+          </>
         )}
         <button
           className="btn btn-primary"
+          onClick={() => setShowCreate(true)}
+        >
+          + New SKU
+        </button>
+        <button
+          className="btn btn-secondary"
           onClick={() => { setSyncResult(null); syncMut.mutate() }}
           disabled={syncMut.isPending}
         >
@@ -269,6 +427,13 @@ export default function PicklistSkus() {
           <span>Page {page + 1} of {totalPages}</span>
           <button className="btn btn-secondary" onClick={() => setPage(p => p + 1)} disabled={page >= totalPages - 1}>Next →</button>
         </div>
+      )}
+
+      {showCreate && (
+        <CreateSkuModal
+          onClose={() => setShowCreate(false)}
+          onCreated={() => { /* parent already invalidates queries via mutation onSuccess */ }}
+        />
       )}
     </div>
   )

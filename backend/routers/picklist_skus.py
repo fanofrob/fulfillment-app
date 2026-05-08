@@ -14,6 +14,22 @@ from services import sheets_service
 router = APIRouter()
 
 
+VALID_INVENTORY_TYPES = ('product', 'packaging')
+
+
+def get_packaging_pick_skus(db: Session) -> set:
+    """
+    Return the set of pick_skus that are inventory_type='packaging'.
+    Used to filter packaging SKUs out of ShipStation pushes — packaging is
+    app-only inventory tracked via PackagingMapping / BoxType.pick_sku and
+    must never appear as a line item in a ShipStation order.
+    """
+    rows = db.query(models.PicklistSku.pick_sku).filter(
+        models.PicklistSku.inventory_type == 'packaging'
+    ).all()
+    return {r[0] for r in rows}
+
+
 class PicklistSkuUpdate(BaseModel):
     customer_description: Optional[str] = None
     weight_lb: Optional[float] = None
@@ -22,6 +38,26 @@ class PicklistSkuUpdate(BaseModel):
     temperature: Optional[str] = None
     type: Optional[str] = None
     category: Optional[str] = None
+    inventory_type: Optional[str] = None  # 'product' | 'packaging'
+    status: Optional[str] = None
+    cc_item_id: Optional[str] = None
+    notes: Optional[str] = None
+    days_til_expiration: Optional[float] = None
+    cost_per_lb: Optional[float] = None
+    cost_per_case: Optional[float] = None
+    case_weight_lb: Optional[float] = None
+
+
+class PicklistSkuCreate(BaseModel):
+    pick_sku: str
+    customer_description: Optional[str] = None
+    weight_lb: Optional[float] = None
+    pactor_multiplier: Optional[float] = None
+    pactor: Optional[float] = None
+    temperature: Optional[str] = None
+    type: Optional[str] = None
+    category: Optional[str] = None
+    inventory_type: str = 'product'
     status: Optional[str] = None
     cc_item_id: Optional[str] = None
     notes: Optional[str] = None
@@ -42,6 +78,7 @@ def _to_dict(item: models.PicklistSku) -> dict:
         "temperature": item.temperature,
         "type": item.type,
         "category": item.category,
+        "inventory_type": item.inventory_type,
         "status": item.status,
         "cc_item_id": item.cc_item_id,
         "notes": item.notes,
@@ -104,6 +141,7 @@ def get_missing_cogs_skus(db: Session = Depends(get_db)):
 @router.get("/")
 def list_picklist_skus(
     search: Optional[str] = Query(None),
+    inventory_type: Optional[str] = Query(None, description="Filter by 'product' or 'packaging'"),
     skip: int = Query(0, ge=0),
     limit: int = Query(200, ge=1, le=2000),
     db: Session = Depends(get_db),
@@ -115,9 +153,43 @@ def list_picklist_skus(
             models.PicklistSku.pick_sku.ilike(s) |
             models.PicklistSku.customer_description.ilike(s)
         )
+    if inventory_type:
+        if inventory_type not in VALID_INVENTORY_TYPES:
+            raise HTTPException(status_code=400, detail=f"inventory_type must be one of {VALID_INVENTORY_TYPES}")
+        q = q.filter(models.PicklistSku.inventory_type == inventory_type)
     total = q.count()
     items = q.order_by(models.PicklistSku.customer_description).offset(skip).limit(limit).all()
     return {"total": total, "items": [_to_dict(i) for i in items]}
+
+
+@router.post("/", status_code=201)
+def create_picklist_sku(data: PicklistSkuCreate, db: Session = Depends(get_db)):
+    """
+    Create a new pick SKU. Auto-mirrors into inventory_items for every warehouse
+    at on_hand_qty=0. Used for both Product and Packaging SKUs.
+    """
+    if data.inventory_type not in VALID_INVENTORY_TYPES:
+        raise HTTPException(status_code=400, detail=f"inventory_type must be one of {VALID_INVENTORY_TYPES}")
+    pick_sku = (data.pick_sku or "").strip()
+    if not pick_sku:
+        raise HTTPException(status_code=400, detail="pick_sku is required")
+    existing = db.query(models.PicklistSku).filter_by(pick_sku=pick_sku).first()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"pick_sku '{pick_sku}' already exists")
+
+    payload = data.model_dump(exclude_unset=False)
+    payload["pick_sku"] = pick_sku
+    item = models.PicklistSku(**payload)
+    db.add(item)
+    db.flush()  # populate item.id before mirroring inventory
+
+    # Mirror into inventory_items (qty=0) for every configured warehouse.
+    sync_inventory_with_picklist(db)
+    db.commit()
+    db.refresh(item)
+    # Invalidate pactor cache so any rule that reads the new SKU sees it
+    sheets_service.invalidate("picklist_pactors")
+    return _to_dict(item)
 
 
 @router.post("/sync")
@@ -177,7 +249,10 @@ def update_picklist_sku(
     item = db.query(models.PicklistSku).filter_by(id=item_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="Not found")
-    for k, v in data.model_dump(exclude_unset=True).items():
+    update_data = data.model_dump(exclude_unset=True)
+    if "inventory_type" in update_data and update_data["inventory_type"] not in VALID_INVENTORY_TYPES:
+        raise HTTPException(status_code=400, detail=f"inventory_type must be one of {VALID_INVENTORY_TYPES}")
+    for k, v in update_data.items():
         setattr(item, k, v)
     db.commit()
     db.refresh(item)

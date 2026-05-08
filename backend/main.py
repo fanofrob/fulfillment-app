@@ -201,6 +201,18 @@ def _migrate_db():
                 if col_name not in cols:
                     conn.execute(text(f"ALTER TABLE period_projection_overrides ADD COLUMN {col_name} {col_type}"))
             conn.commit()
+    # Add inventory_type to picklist_skus (Product/Packaging classification).
+    # Backfills existing rows to 'product'; packaging SKUs are flipped via the UI.
+    if "picklist_skus" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("picklist_skus")}
+        if "inventory_type" not in cols:
+            with engine.connect() as conn:
+                # NOT NULL DEFAULT 'product' works on both SQLite and Postgres for ALTER TABLE
+                conn.execute(text(
+                    "ALTER TABLE picklist_skus ADD COLUMN inventory_type TEXT NOT NULL DEFAULT 'product'"
+                ))
+                conn.commit()
+    # packaging_mappings table is created by create_all — no manual migration needed.
 
 
 def _seed_ups_rates():
@@ -303,7 +315,7 @@ models.Base.metadata.create_all(bind=engine)
 _seed_ups_rates()
 _seed_gm_settings()
 
-from routers import sku_mapping, sku_helper, cogs, rate_cards, rules, inventory, orders, shopify_auth, shipstation, fulfillment, picklist_skus, products, gm_settings, projection_periods, projection_confirmed_orders, historical_data, projections, vendors, purchase_orders, purchase_planning, inventory_count, receiving
+from routers import sku_mapping, sku_helper, cogs, rate_cards, rules, inventory, orders, shopify_auth, shipstation, fulfillment, picklist_skus, products, gm_settings, projection_periods, projection_confirmed_orders, historical_data, projections, vendors, purchase_orders, purchase_planning, inventory_count, receiving, packaging_mappings, packaging_dashboard
 from services import sheets_service, shopify_service, shipstation_service
 
 app = FastAPI(title="Fulfillment App API")
@@ -331,6 +343,8 @@ app.include_router(shopify_auth.router, prefix="/api/shopify", tags=["Shopify Au
 app.include_router(shipstation.router, prefix="/api/shipstation", tags=["ShipStation"])
 app.include_router(fulfillment.router, prefix="/api/fulfillment", tags=["Fulfillment"])
 app.include_router(picklist_skus.router, prefix="/api/picklist-skus", tags=["Picklist SKUs"])
+app.include_router(packaging_mappings.router, prefix="/api/packaging-mappings", tags=["Packaging Mappings"])
+app.include_router(packaging_dashboard.router, prefix="/api/packaging-dashboard", tags=["Packaging Dashboard"])
 app.include_router(sku_helper.router, prefix="/api/sku-helper", tags=["SKU Helper"])
 app.include_router(products.router, prefix="/api/products", tags=["Products"])
 app.include_router(gm_settings.router, prefix="/api/gm-settings", tags=["GM Settings"])

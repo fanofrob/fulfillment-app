@@ -22,6 +22,8 @@ import StagingDashboard from './pages/StagingDashboard'
 import IssueSkuDetail from './pages/IssueSkuDetail'
 import UnmappedSkus from './pages/UnmappedSkus'
 import InventoryCount from './pages/InventoryCount'
+import PackagingDashboard from './pages/PackagingDashboard'
+import PackagingMappings from './pages/PackagingMappings'
 import './App.css'
 
 // Routes that use the full-bleed no-padding layout
@@ -41,6 +43,7 @@ export default function App() {
         <ul>
           <li><NavLink to="/inventory">Inventory</NavLink></li>
           <li><NavLink to="/inventory-count">Inventory Count</NavLink></li>
+          <li><NavLink to="/packaging-dashboard">Packaging Dashboard</NavLink></li>
           <li><NavLink to="/orders">Orders</NavLink></li>
           <li><NavLink to="/unmapped-skus">Unmapped SKUs</NavLink></li>
           <li><NavLink to="/staging-dashboard">Staging Dashboard</NavLink></li>
@@ -63,6 +66,7 @@ export default function App() {
         <div className="nav-section-label">Reference Data</div>
         <ul>
           <li><NavLink to="/picklist-skus">Picklist SKUs</NavLink></li>
+          <li><NavLink to="/packaging-mappings">Packaging Mappings</NavLink></li>
           <li><NavLink to="/sku-mapping">SKU Mapping</NavLink></li>
           <li><NavLink to="/sku-helper">SKU Helper</NavLink></li>
           <li><NavLink to="/cogs">COGS</NavLink></li>
@@ -77,6 +81,8 @@ export default function App() {
           <Route path="/" element={<Navigate to="/inventory" replace />} />
           <Route path="/inventory" element={<Inventory />} />
           <Route path="/inventory-count" element={<InventoryCount />} />
+          <Route path="/packaging-dashboard" element={<PackagingDashboard />} />
+          <Route path="/packaging-mappings" element={<PackagingMappings />} />
           <Route path="/orders" element={<Orders />} />
           <Route path="/staging-dashboard" element={<StagingDashboard />} />
           <Route path="/staging-dashboard/issue/:pickSku" element={<IssueSkuDetail />} />
