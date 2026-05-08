@@ -22,15 +22,23 @@ MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024
 ALLOWED_ATTACHMENT_KINDS = {"invoice", "received_photo", "other"}
 
 PO_STATUSES = ["draft", "placed", "in_transit", "partially_received", "delivered", "imported", "reconciled"]
-PO_STATUS_TRANSITIONS = {
-    "draft": ["placed", "in_transit"],
-    "placed": ["in_transit", "partially_received", "delivered"],
-    "in_transit": ["partially_received", "delivered"],
-    "partially_received": ["delivered"],
-    "delivered": ["imported"],
-    "imported": ["reconciled"],
-    "reconciled": [],
-}
+# Once a PO has been imported (its receiving records were committed to inventory)
+# its status is essentially locked, since unwinding the inventory commit isn't
+# something we want a casual click to do. The only allowed move from there is the
+# bookkeeping step to "reconciled". Reconciled is terminal.
+LOCKED_STATUSES = {"imported", "reconciled"}
+
+
+def _allowed_transitions(current: str) -> list[str]:
+    """Return the statuses a PO can be moved to from its current state.
+    Free-form before "imported"; locked after."""
+    if current == "imported":
+        return ["reconciled"]
+    if current == "reconciled":
+        return []
+    # Any non-locked status is reachable from any other non-locked status, including
+    # "imported" itself (the user explicitly chooses to commit; not a casual undo).
+    return [s for s in PO_STATUSES if s != current and s != "reconciled"]
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -229,11 +237,12 @@ def update_purchase_order(po_id: int, data: schemas.PurchaseOrderUpdate, db: Ses
     # Validate status transitions
     if "status" in update_data and update_data["status"] != po.status:
         new_status = update_data["status"]
-        if new_status not in PO_STATUS_TRANSITIONS.get(po.status, []):
+        allowed = _allowed_transitions(po.status)
+        if new_status not in allowed:
             raise HTTPException(
                 400,
                 f"Cannot transition from '{po.status}' to '{new_status}'. "
-                f"Allowed: {PO_STATUS_TRANSITIONS.get(po.status, [])}"
+                f"Allowed: {allowed}"
             )
 
     for field, value in update_data.items():
@@ -516,6 +525,46 @@ BULK_PICKUP_FIELDS = {
     "pickup_run_date", "expected_delivery_date", "driver_name",
     "pickup_at_vendor_id", "pickup_address_override", "delivery_location",
 }
+
+
+@router.post("/bulk-update-status", response_model=schemas.POBulkStatusUpdateResponse)
+def bulk_update_status(data: schemas.POBulkStatusUpdateRequest, db: Session = Depends(get_db)):
+    """Apply a target status to a batch of POs. POs already at the target status
+    are no-ops; POs whose current status doesn't allow the transition (locked at
+    imported/reconciled) are reported in `skipped`."""
+    if not data.ids:
+        raise HTTPException(400, "ids is required")
+    if data.status not in PO_STATUSES:
+        raise HTTPException(422, f"Unknown status '{data.status}'. Allowed: {PO_STATUSES}")
+
+    pos = db.query(models.PurchaseOrder).filter(models.PurchaseOrder.id.in_(data.ids)).all()
+    found_ids = {p.id for p in pos}
+
+    updated = 0
+    skipped: list[dict] = []
+
+    for missing in [i for i in data.ids if i not in found_ids]:
+        skipped.append({"id": missing, "reason": "not found"})
+
+    for po in pos:
+        if po.status == data.status:
+            # Already there — count as updated rather than skipped so the
+            # caller's "applied to N POs" tally reflects intent.
+            updated += 1
+            continue
+        allowed = _allowed_transitions(po.status)
+        if data.status not in allowed:
+            skipped.append({
+                "id": po.id, "po_number": po.po_number,
+                "current_status": po.status,
+                "reason": f"cannot move from '{po.status}' to '{data.status}'",
+            })
+            continue
+        po.status = data.status
+        updated += 1
+
+    db.commit()
+    return schemas.POBulkStatusUpdateResponse(updated=updated, skipped=skipped)
 
 
 @router.post("/bulk-update-pickup", response_model=schemas.POBulkPickupUpdateResponse)

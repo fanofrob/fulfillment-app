@@ -8,14 +8,13 @@ const STATUS_COLORS = {
   draft: '#e5e7eb', placed: '#bfdbfe', in_transit: '#c4b5fd',
   partially_received: '#fde68a', delivered: '#bbf7d0', imported: '#6ee7b7', reconciled: '#9ca3af',
 }
-const STATUS_TRANSITIONS = {
-  draft: ['placed', 'in_transit'],
-  placed: ['in_transit', 'partially_received', 'delivered'],
-  in_transit: ['partially_received', 'delivered'],
-  partially_received: ['delivered'],
-  delivered: ['imported'],
-  imported: ['reconciled'],
-  reconciled: [],
+
+// Once a PO is "imported" it's locked except for the bookkeeping move to
+// "reconciled". Before that it can move to any other non-reconciled status.
+function allowedTransitions(current) {
+  if (current === 'imported') return ['reconciled']
+  if (current === 'reconciled') return []
+  return PO_STATUSES.filter(s => s !== current && s !== 'reconciled')
 }
 
 function formatDate(d) {
@@ -192,6 +191,24 @@ export default function PurchaseOrders() {
       setSelectedIds(new Set())
     },
   })
+
+  const bulkStatusMut = useMutation({
+    mutationFn: (data) => purchaseOrdersApi.bulkUpdateStatus(data),
+    onSuccess: (resp) => {
+      qc.invalidateQueries(['purchase-orders'])
+      setSelectedIds(new Set())
+      setBulkStatusValue('')
+      // Surface skipped POs (locked at imported/reconciled) — bulk endpoints
+      // partial-succeed on purpose so a single locked PO doesn't fail the batch.
+      if (resp.skipped?.length) {
+        const lines = resp.skipped.slice(0, 5).map(s => `• ${s.po_number || `#${s.id}`}: ${s.reason}`).join('\n')
+        const more = resp.skipped.length > 5 ? `\n…and ${resp.skipped.length - 5} more.` : ''
+        alert(`Updated ${resp.updated}. Skipped ${resp.skipped.length}:\n${lines}${more}`)
+      }
+    },
+  })
+
+  const [bulkStatusValue, setBulkStatusValue] = useState('')
 
   function toggleSelected(poId) {
     setSelectedIds(prev => {
@@ -514,15 +531,35 @@ export default function PurchaseOrders() {
       {selectedIds.size > 0 && (
         <div style={{
           marginBottom: 12, padding: '8px 12px', background: '#eff6ff', border: '1px solid #bfdbfe',
-          borderRadius: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12,
+          borderRadius: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap',
         }}>
           <div style={{ fontSize: 14 }}>
             <strong>{selectedIds.size}</strong> PO{selectedIds.size === 1 ? '' : 's'} selected
           </div>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
             <button className="btn btn-sm btn-primary" onClick={openBulkEdit}>
               Edit Pickup &amp; Delivery
             </button>
+            <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+              <span style={{ fontSize: 13, color: '#6b7280' }}>Set status:</span>
+              <select
+                value={bulkStatusValue}
+                onChange={e => setBulkStatusValue(e.target.value)}
+                style={{ textTransform: 'capitalize' }}
+              >
+                <option value="">— pick status —</option>
+                {PO_STATUSES.map(s => (
+                  <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>
+                ))}
+              </select>
+              <button className="btn btn-sm btn-primary"
+                disabled={!bulkStatusValue || bulkStatusMut.isPending}
+                onClick={() => {
+                  if (!bulkStatusValue) return
+                  bulkStatusMut.mutate({ ids: Array.from(selectedIds), status: bulkStatusValue })
+                }}
+              >Apply</button>
+            </div>
             <button className="btn btn-sm" onClick={() => setSelectedIds(new Set())}>
               Clear selection
             </button>
@@ -708,16 +745,26 @@ export default function PurchaseOrders() {
             </div>
 
             {/* Status transition */}
-            {STATUS_TRANSITIONS[showDetailModal.status]?.length > 0 && (
-              <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
-                <span style={{ fontSize: 13, color: '#6b7280' }}>Advance to:</span>
-                {STATUS_TRANSITIONS[showDetailModal.status].map(s => (
-                  <button key={s} className="btn btn-sm" style={{ textTransform: 'capitalize' }}
-                    onClick={() => handleStatusChange(showDetailModal, s)}
-                  >{s.replace(/_/g, ' ')}</button>
-                ))}
-              </div>
-            )}
+            {(() => {
+              const choices = allowedTransitions(showDetailModal.status)
+              if (!choices.length) return (
+                <div style={{ marginTop: 12, fontSize: 13, color: '#6b7280' }}>
+                  Status is locked — this PO has been reconciled.
+                </div>
+              )
+              return (
+                <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 13, color: '#6b7280' }}>
+                    {showDetailModal.status === 'imported' ? 'Mark as:' : 'Change status to:'}
+                  </span>
+                  {choices.map(s => (
+                    <button key={s} className="btn btn-sm" style={{ textTransform: 'capitalize' }}
+                      onClick={() => handleStatusChange(showDetailModal, s)}
+                    >{s.replace(/_/g, ' ')}</button>
+                  ))}
+                </div>
+              )
+            })()}
 
             {/* PO Info */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginTop: 16, fontSize: 13 }}>

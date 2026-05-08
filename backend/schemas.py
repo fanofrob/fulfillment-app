@@ -1118,6 +1118,19 @@ class POBulkPickupUpdateResponse(BaseModel):
     skipped_ids: List[int] = []
 
 
+class POBulkStatusUpdateRequest(BaseModel):
+    ids: List[int]
+    status: str  # target status — must be a valid PO status
+
+
+class POBulkStatusUpdateResponse(BaseModel):
+    updated: int
+    # POs we couldn't move because their current status is locked (imported/
+    # reconciled) and the transition isn't allowed. Reported back so the UI
+    # can show "5 updated, 2 skipped (already imported)" instead of failing.
+    skipped: List[dict] = []
+
+
 # ---------------------------------------------------------------------------
 # Receiving Records (Phase 5)
 # ---------------------------------------------------------------------------
