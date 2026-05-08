@@ -379,7 +379,10 @@
       "Bash(curl -s -X POST \"http://localhost:8000/api/purchase-orders/bulk-update-status\" -H \"Content-Type: application/json\" -d '{\"ids\":[2,3],\"status\":\"draft\"}')",
       "Bash(curl -s -X PUT \"http://localhost:8000/api/purchase-orders/2\" -H \"Content-Type: application/json\" -d '{\"status\":\"reconciled\"}')",
       "Bash(curl -s -X PUT \"http://localhost:8000/api/purchase-orders/2\" -H \"Content-Type: application/json\" -d '{\"status\":\"draft\"}')",
-      "Bash(curl -s -X PUT \"http://localhost:8000/api/purchase-orders/3\" -H \"Content-Type: application/json\" -d '{\"status\":\"draft\"}')"
+      "Bash(curl -s -X PUT \"http://localhost:8000/api/purchase-orders/3\" -H \"Content-Type: application/json\" -d '{\"status\":\"draft\"}')",
+      "Bash(git -C \"/Users/robertfan/Claude Code/fulfillment-app\" status -s)",
+      "Bash(curl -s -X POST \"http://localhost:8000/api/purchase-orders/bulk-update-pickup\" -H \"Content-Type: application/json\" -d '{\"ids\":[3],\"fields_to_update\":[\"pickup_run_date\",\"driver_name\"],\"pickup_run_date\":\"2026-05-08\",\"driver_name\":\"Miguel\"}')",
+      "Bash(curl -s -X POST \"http://localhost:8000/api/purchase-orders/bulk-update-pickup\" -H \"Content-Type: application/json\" -d '{\"ids\":[3],\"fields_to_update\":[\"pickup_run_date\",\"driver_name\"],\"pickup_run_date\":null,\"driver_name\":null}')"
     ]
   }
 }

@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useLocation } from 'react-router-dom'
-import { pickupRunsApi } from '../api'
+import { pickupRunsApi, purchaseOrdersApi } from '../api'
 
 function todayIso() {
   return new Date().toISOString().slice(0, 10)
@@ -27,9 +27,22 @@ function whatsappLink(phone) {
   return `https://wa.me/${phone.replace(/[^\d]/g, '')}`
 }
 
+// Pick the vendor name to show as the group header. If pickups are consolidated
+// at a known vendor, that's the host. Otherwise, if every PO at this stop ships
+// from the same seller, use that seller's name. If sellers are mixed (e.g. a
+// shared custom override address), fall back to a count.
+function groupVendorLabel(g) {
+  if (g.consolidator_vendor_name) return g.consolidator_vendor_name
+  const sellers = [...new Set(g.pos.map(p => p.seller_vendor_name).filter(Boolean))]
+  if (sellers.length === 1) return sellers[0]
+  if (sellers.length > 1) return `${sellers.length} vendors`
+  return null
+}
+
 export default function PickupRuns() {
   const [date, setDate] = useState(todayIso())
   const location = useLocation()
+  const qc = useQueryClient()
   const inPackingMode = location.pathname.startsWith('/packing')
   const poHref = (poId) => inPackingMode
     ? `/packing?tab=purchase-orders${poId != null ? `&po=${poId}` : ''}`
@@ -39,6 +52,20 @@ export default function PickupRuns() {
     queryKey: ['pickup-runs', date],
     queryFn: () => pickupRunsApi.get(date),
   })
+
+  const markPickedUpMut = useMutation({
+    mutationFn: (poId) => purchaseOrdersApi.update(poId, { status: 'in_transit' }),
+    onSuccess: () => {
+      qc.invalidateQueries(['pickup-runs'])
+      qc.invalidateQueries(['purchase-orders'])
+    },
+    onError: (err) => alert('Failed to mark picked up: ' + (err.response?.data?.detail || err.message)),
+  })
+
+  function confirmMarkPickedUp(po) {
+    const msg = `Mark ${po.po_number} (${po.seller_vendor_name || 'vendor'}) as picked up?\n\nThis moves the PO to "In Transit".`
+    if (window.confirm(msg)) markPickedUpMut.mutate(po.id)
+  }
 
   const groups = data?.groups || []
   const totalPos = groups.reduce((s, g) => s + g.po_count, 0)
@@ -94,14 +121,23 @@ export default function PickupRuns() {
         </p>
       )}
 
-      {groups.map((g, idx) => (
+      {groups.map((g, idx) => {
+        const vendorLabel = groupVendorLabel(g)
+        return (
         <div key={idx} className="pickup-group">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
             <div>
-              <div style={{ fontSize: 12, color: '#6b7280', textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                Stop {idx + 1}{g.consolidator_vendor_name ? ` · Consolidated at ${g.consolidator_vendor_name}` : ''}
-              </div>
-              <div style={{ fontSize: 16, fontWeight: 600, marginTop: 2 }}>
+              {vendorLabel && (
+                <div style={{ fontSize: 16, fontWeight: 600 }}>
+                  {vendorLabel}
+                  {g.consolidator_vendor_name && (
+                    <span style={{ marginLeft: 8, fontSize: 12, fontWeight: 400, color: '#6b7280' }}>
+                      (consolidated pickup)
+                    </span>
+                  )}
+                </div>
+              )}
+              <div style={{ fontSize: 14, marginTop: 2 }}>
                 {g.address ? (
                   <a href={mapsLink(g.address)} target="_blank" rel="noreferrer" style={{ color: '#2563eb', textDecoration: 'none' }}>
                     {g.address}
@@ -118,9 +154,11 @@ export default function PickupRuns() {
             </div>
           </div>
 
-          {g.pos.map(po => (
-            <div key={po.id} className="pickup-po">
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          {g.pos.map(po => {
+            const isPickedUp = po.status !== 'placed'  // anything past "placed" = already picked up
+            return (
+            <div key={po.id} className="pickup-po" style={{ opacity: isPickedUp ? 0.55 : 1 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
                 <div>
                   <div style={{ fontWeight: 600 }}>
                     <Link to={poHref(po.id)} style={{ color: 'inherit', textDecoration: 'none' }}>
@@ -165,6 +203,16 @@ export default function PickupRuns() {
                     )}
                     {po.driver_name && <div>Driver: {po.driver_name}</div>}
                   </div>
+                  <div className="pickup-runs-noprint" style={{ marginTop: 6 }}>
+                    {po.status === 'placed' ? (
+                      <button className="btn btn-sm btn-primary"
+                        disabled={markPickedUpMut.isPending}
+                        onClick={() => confirmMarkPickedUp(po)}
+                      >Mark Picked Up</button>
+                    ) : (
+                      <span style={{ fontSize: 11, color: '#16a34a', fontWeight: 600 }}>✓ Picked up</span>
+                    )}
+                  </div>
                 </div>
               </div>
 
@@ -191,9 +239,11 @@ export default function PickupRuns() {
                 </tbody>
               </table>
             </div>
-          ))}
+            )
+          })}
         </div>
-      ))}
+        )
+      })}
     </div>
   )
 }
