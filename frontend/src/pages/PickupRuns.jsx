@@ -1,6 +1,6 @@
 import React, { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Link } from 'react-router-dom'
+import { Link, useLocation } from 'react-router-dom'
 import { pickupRunsApi } from '../api'
 
 function todayIso() {
@@ -29,6 +29,11 @@ function whatsappLink(phone) {
 
 export default function PickupRuns() {
   const [date, setDate] = useState(todayIso())
+  const location = useLocation()
+  const inPackingMode = location.pathname.startsWith('/packing')
+  const poHref = (poId) => inPackingMode
+    ? `/packing?tab=purchase-orders${poId != null ? `&po=${poId}` : ''}`
+    : `/purchase-orders${poId != null ? `?po=${poId}` : ''}`
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['pickup-runs', date],
@@ -76,7 +81,7 @@ export default function PickupRuns() {
         {data?.unscheduled_count > 0 && (
           <div className="pickup-runs-noprint" style={{ marginTop: 8, padding: 8, background: '#fef3c7', borderRadius: 4, fontSize: 13 }}>
             ⚠ {data.unscheduled_count} eligible PO{data.unscheduled_count === 1 ? '' : 's'} {data.unscheduled_count === 1 ? 'has' : 'have'} no pickup date set —{' '}
-            <Link to="/purchase-orders">open Purchase Orders</Link> to schedule.
+            <Link to={poHref()}>open Purchase Orders</Link> to schedule.
           </div>
         )}
       </div>
@@ -118,7 +123,7 @@ export default function PickupRuns() {
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                 <div>
                   <div style={{ fontWeight: 600 }}>
-                    <Link to={`/purchase-orders?po=${po.id}`} style={{ color: 'inherit', textDecoration: 'none' }}>
+                    <Link to={poHref(po.id)} style={{ color: 'inherit', textDecoration: 'none' }}>
                       {po.po_number}
                     </Link>
                     {' · '}

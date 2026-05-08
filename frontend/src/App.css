@@ -13,6 +13,16 @@
 .main-content { flex: 1; overflow-y: auto; padding: 32px; min-width: 0; }
 .main-content.no-padding { padding: 0; overflow: hidden; }
 
+/* Packing view: standalone shell at /packing, no admin sidebar. */
+.packing-shell { display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #f5f5f7; }
+.packing-tabs { display: flex; align-items: center; gap: 16px; padding: 0 24px; background: #1a1a2e; color: #fff; border-bottom: 1px solid #2a2a4a; flex-shrink: 0; }
+.packing-brand { font-size: 14px; font-weight: 700; color: #fff; padding: 16px 0; white-space: nowrap; }
+.packing-tabs-list { display: flex; gap: 0; flex: 1; overflow-x: auto; }
+.packing-tab { background: transparent; border: none; color: #aaa; padding: 16px 20px; font-size: 14px; font-weight: 500; cursor: pointer; border-bottom: 3px solid transparent; transition: color 0.15s, border-color 0.15s; white-space: nowrap; }
+.packing-tab:hover { color: #fff; }
+.packing-tab.active { color: #fff; border-bottom-color: #4f8ef7; }
+.packing-body { flex: 1; overflow-y: auto; padding: 32px; min-width: 0; -webkit-overflow-scrolling: touch; }
+
 .page-header { margin-bottom: 24px; }
 .page-header h1 { font-size: 22px; font-weight: 700; }
 .page-header p { color: #666; margin-top: 4px; font-size: 13px; }
@@ -913,6 +923,12 @@ tr:hover td { background: #fafafa; }
     -webkit-overflow-scrolling: touch;
   }
   .main-content.no-padding { padding: 0; }
+
+  /* Packing view tightens to match mobile-receiving feel */
+  .packing-tabs { padding: 0 12px; gap: 8px; }
+  .packing-brand { font-size: 13px; padding: 12px 0; }
+  .packing-tab { padding: 12px 14px; font-size: 13px; }
+  .packing-body { padding: 16px; }
 
   /* Headings tighter */
   .page-header h1, h1 { font-size: 18px; }

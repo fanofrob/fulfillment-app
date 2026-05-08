@@ -27,6 +27,7 @@ import InventoryCount from './pages/InventoryCount'
 import DiscardReport from './pages/DiscardReport'
 import PackagingDashboard from './pages/PackagingDashboard'
 import PackagingMappings from './pages/PackagingMappings'
+import Packing from './pages/Packing'
 import './App.css'
 
 // Routes that use the full-bleed no-padding layout
@@ -39,6 +40,16 @@ export default function App() {
 
   // Close the mobile drawer whenever the route changes.
   useEffect(() => { setNavOpen(false) }, [location.pathname])
+
+  // /packing renders its own shell (no admin sidebar) so a single shareable
+  // link gives a packer a reduced view with just Inventory / POs / Pickup Runs.
+  if (location.pathname === '/packing' || location.pathname.startsWith('/packing/')) {
+    return (
+      <Routes>
+        <Route path="/packing" element={<Packing />} />
+      </Routes>
+    )
+  }
 
   return (
     <div className={`app-layout${navOpen ? ' nav-open' : ''}`}>
