@@ -261,18 +261,14 @@ def commit_count(payload: CommitRequest, db: Session = Depends(get_db)):
             models.InventoryItem.warehouse == payload.warehouse,
         ).first()
 
-        # In set (inventory) mode, on_hand_qty IS the new on-hand. In subtract (discard)
-        # mode, on_hand_qty IS the amount to deduct from current on-hand.
-        deduct_qty = row.on_hand_qty if is_discard else None
-        new_qty = row.on_hand_qty if not is_discard else None
-
-        if item is None:
-            if is_discard:
-                # Can't discard from a SKU that doesn't exist in inventory yet — skip.
-                # (Otherwise we'd create a row with negative or zero on-hand from nothing.)
-                continue
-
-            # Look up name from PicklistSku if not provided
+        # If the SKU has no InventoryItem in this warehouse yet, create one at 0 first
+        # and let the unified math below apply the operation. This mirrors how the
+        # set/inventory path used to auto-create new rows — we now do the same for
+        # discard mode (the row appears in the count + audit log instead of being
+        # silently dropped). For discard against on_hand=0, max(0, 0-X)=0 so the row
+        # stays at 0 with a delta=0 adjustment, surfacing the event in the audit log.
+        is_new = item is None
+        if is_new:
             name = row.name
             if not name:
                 sku_obj = db.query(models.PicklistSku).filter(
@@ -284,44 +280,39 @@ def commit_count(payload: CommitRequest, db: Session = Depends(get_db)):
                 pick_sku=row.pick_sku,
                 warehouse=payload.warehouse,
                 name=name,
-                on_hand_qty=new_qty,
+                on_hand_qty=0.0,
                 committed_qty=0.0,
-                available_qty=new_qty,
+                available_qty=0.0,
                 batch_code=row.batch,
             )
             db.add(item)
             db.flush()
 
-            db.add(models.InventoryAdjustment(
-                pick_sku=row.pick_sku,
-                warehouse=payload.warehouse,
-                delta=new_qty,
-                adjustment_type=adjustment_type,
-                note=note,
-            ))
+        old_qty = item.on_hand_qty
+        if is_discard:
+            # Subtract; never let on_hand go below zero. Delta reflects the actual
+            # change applied (so audit + on_hand history stay consistent).
+            final_qty = max(0.0, old_qty - row.on_hand_qty)
+            delta = final_qty - old_qty
+        else:
+            final_qty = row.on_hand_qty
+            delta = row.on_hand_qty - old_qty
+
+        item.on_hand_qty = final_qty
+        item.available_qty = final_qty - item.committed_qty
+        if row.batch and not is_new:
+            item.batch_code = row.batch
+
+        db.add(models.InventoryAdjustment(
+            pick_sku=row.pick_sku,
+            warehouse=payload.warehouse,
+            delta=delta,
+            adjustment_type=adjustment_type,
+            note=note,
+        ))
+        if is_new:
             created += 1
         else:
-            old_qty = item.on_hand_qty
-            if is_discard:
-                # Subtract; never let on_hand go below zero.
-                final_qty = max(0.0, old_qty - (deduct_qty or 0.0))
-                delta = final_qty - old_qty  # negative
-            else:
-                final_qty = new_qty
-                delta = new_qty - old_qty
-
-            item.on_hand_qty = final_qty
-            item.available_qty = final_qty - item.committed_qty
-            if row.batch:
-                item.batch_code = row.batch
-
-            db.add(models.InventoryAdjustment(
-                pick_sku=row.pick_sku,
-                warehouse=payload.warehouse,
-                delta=delta,
-                adjustment_type=adjustment_type,
-                note=note,
-            ))
             updated += 1
 
     db.commit()
