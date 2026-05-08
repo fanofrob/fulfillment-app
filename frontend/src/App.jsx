@@ -22,6 +22,7 @@ import StagingDashboard from './pages/StagingDashboard'
 import IssueSkuDetail from './pages/IssueSkuDetail'
 import UnmappedSkus from './pages/UnmappedSkus'
 import InventoryCount from './pages/InventoryCount'
+import DiscardReport from './pages/DiscardReport'
 import PackagingDashboard from './pages/PackagingDashboard'
 import PackagingMappings from './pages/PackagingMappings'
 import './App.css'
@@ -43,6 +44,7 @@ export default function App() {
         <ul>
           <li><NavLink to="/inventory">Inventory</NavLink></li>
           <li><NavLink to="/inventory-count">Inventory Count</NavLink></li>
+          <li><NavLink to="/discard-report">Discard Report</NavLink></li>
           <li><NavLink to="/packaging-dashboard">Packaging Dashboard</NavLink></li>
           <li><NavLink to="/orders">Orders</NavLink></li>
           <li><NavLink to="/unmapped-skus">Unmapped SKUs</NavLink></li>
@@ -81,6 +83,7 @@ export default function App() {
           <Route path="/" element={<Navigate to="/inventory" replace />} />
           <Route path="/inventory" element={<Inventory />} />
           <Route path="/inventory-count" element={<InventoryCount />} />
+          <Route path="/discard-report" element={<DiscardReport />} />
           <Route path="/packaging-dashboard" element={<PackagingDashboard />} />
           <Route path="/packaging-mappings" element={<PackagingMappings />} />
           <Route path="/orders" element={<Orders />} />
