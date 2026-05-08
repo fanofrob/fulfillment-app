@@ -510,6 +510,45 @@ def create_po_from_projection(data: schemas.POFromProjectionRequest, db: Session
     return _build_po_response(db, po)
 
 
+# ── Bulk Pickup Update ─────────────────────────────────────────────────────
+
+BULK_PICKUP_FIELDS = {
+    "pickup_run_date", "expected_delivery_date", "driver_name",
+    "pickup_at_vendor_id", "pickup_address_override", "delivery_location",
+}
+
+
+@router.post("/bulk-update-pickup", response_model=schemas.POBulkPickupUpdateResponse)
+def bulk_update_pickup(data: schemas.POBulkPickupUpdateRequest, db: Session = Depends(get_db)):
+    """Apply pickup/delivery fields to a batch of POs. Skips POs that don't exist."""
+    if not data.ids:
+        raise HTTPException(400, "ids is required")
+    bad = [f for f in data.fields_to_update if f not in BULK_PICKUP_FIELDS]
+    if bad:
+        raise HTTPException(422, f"Unknown fields: {bad}. Allowed: {sorted(BULK_PICKUP_FIELDS)}")
+    if not data.fields_to_update:
+        raise HTTPException(400, "fields_to_update is empty — nothing to do")
+
+    # Validate pickup_at_vendor_id if it's being set (to a non-null value).
+    if "pickup_at_vendor_id" in data.fields_to_update and data.pickup_at_vendor_id is not None:
+        exists = db.query(models.Vendor.id).filter(models.Vendor.id == data.pickup_at_vendor_id).first()
+        if not exists:
+            raise HTTPException(404, f"pickup_at_vendor_id {data.pickup_at_vendor_id} does not exist")
+
+    payload = {f: getattr(data, f) for f in data.fields_to_update}
+
+    pos = db.query(models.PurchaseOrder).filter(models.PurchaseOrder.id.in_(data.ids)).all()
+    found_ids = {p.id for p in pos}
+    skipped = [i for i in data.ids if i not in found_ids]
+
+    for po in pos:
+        for field, value in payload.items():
+            setattr(po, field, value)
+
+    db.commit()
+    return schemas.POBulkPickupUpdateResponse(updated=len(pos), skipped_ids=skipped)
+
+
 # ── Attachments (invoice photos, etc.) ─────────────────────────────────────
 
 @router.get("/{po_id}/attachments", response_model=List[schemas.POAttachmentResponse])

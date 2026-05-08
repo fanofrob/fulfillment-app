@@ -473,6 +473,8 @@ export const purchaseOrdersApi = {
   setAllocations: (poId, lineId, data) => api.put(`/purchase-orders/${poId}/lines/${lineId}/allocations`, data).then(r => r.data),
   // From projection
   createFromProjection: (data) => api.post('/purchase-orders/from-projection', data).then(r => r.data),
+  // Bulk-apply pickup/delivery fields across multiple POs
+  bulkUpdatePickup: (data) => api.post('/purchase-orders/bulk-update-pickup', data).then(r => r.data),
   // On-order summary
   getOnOrder: (periodId) => api.get(`/purchase-orders/on-order/${periodId}`).then(r => r.data),
   // Attachments (invoice photos, etc.)

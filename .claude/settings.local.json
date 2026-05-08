@@ -372,7 +372,9 @@
       "Bash(curl -s -X POST \"http://localhost:8000/api/purchase-orders/3/attachments\" -F \"file=@/tmp/test_invoice.jpg\" -F \"kind=invoice\")",
       "Bash(curl -s \"http://localhost:8000/api/purchase-orders/3/attachments\")",
       "Bash(curl -s -X DELETE \"http://localhost:8000/api/purchase-orders/3/attachments/1\")",
-      "Bash(rm -f /tmp/test_invoice.jpg)"
+      "Bash(rm -f /tmp/test_invoice.jpg)",
+      "Bash(curl -s \"http://localhost:8000/api/purchase-orders/\")",
+      "Bash(curl -s -X POST http://localhost:8000/api/purchase-orders/bulk-update-pickup -H 'Content-Type: application/json' -d '{\"ids\":[2,3],\"fields_to_update\":[\"driver_name\"],\"driver_name\":null}')"
     ]
   }
 }

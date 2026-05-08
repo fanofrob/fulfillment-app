@@ -96,6 +96,19 @@ export default function PurchaseOrders() {
     pickup_at_vendor_id: '', pickup_address_override: '', pickup_run_date: '',
     driver_name: '', delivery_location: '', expected_delivery_date: '',
   })
+  // Bulk selection — set of PO ids checked in the list
+  const [selectedIds, setSelectedIds] = useState(() => new Set())
+  // Bulk-edit pickup modal state
+  const [showBulkEditModal, setShowBulkEditModal] = useState(false)
+  // Per-field "apply this field" toggles — only checked fields get sent
+  const [bulkApply, setBulkApply] = useState({
+    pickup_run_date: false, expected_delivery_date: false, driver_name: false,
+    pickup_at_vendor_id: false, pickup_address_override: false, delivery_location: false,
+  })
+  const [bulkValues, setBulkValues] = useState({
+    pickup_run_date: '', expected_delivery_date: '', driver_name: '',
+    pickup_at_vendor_id: '', pickup_address_override: '', delivery_location: '',
+  })
 
   const { data: pos = [], isLoading } = useQuery({
     queryKey: ['purchase-orders', statusFilter],
@@ -170,6 +183,72 @@ export default function PurchaseOrders() {
     mutationFn: ({ poId, attId }) => purchaseOrdersApi.deleteAttachment(poId, attId),
     onSuccess: (_, vars) => refreshDetail(vars.poId),
   })
+
+  const bulkPickupMut = useMutation({
+    mutationFn: (data) => purchaseOrdersApi.bulkUpdatePickup(data),
+    onSuccess: () => {
+      qc.invalidateQueries(['purchase-orders'])
+      setShowBulkEditModal(false)
+      setSelectedIds(new Set())
+    },
+  })
+
+  function toggleSelected(poId) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(poId)) next.delete(poId)
+      else next.add(poId)
+      return next
+    })
+  }
+
+  function toggleSelectAllVisible(visiblePos) {
+    const allSelected = visiblePos.length > 0 && visiblePos.every(p => selectedIds.has(p.id))
+    if (allSelected) {
+      // Unselect just the visible ones (preserve any selections outside the current filter).
+      setSelectedIds(prev => {
+        const next = new Set(prev)
+        visiblePos.forEach(p => next.delete(p.id))
+        return next
+      })
+    } else {
+      setSelectedIds(prev => {
+        const next = new Set(prev)
+        visiblePos.forEach(p => next.add(p.id))
+        return next
+      })
+    }
+  }
+
+  function openBulkEdit() {
+    // Reset modal to a clean slate every time so a stale "apply" toggle from
+    // a previous edit doesn't sneak through.
+    setBulkApply({
+      pickup_run_date: false, expected_delivery_date: false, driver_name: false,
+      pickup_at_vendor_id: false, pickup_address_override: false, delivery_location: false,
+    })
+    setBulkValues({
+      pickup_run_date: '', expected_delivery_date: '', driver_name: '',
+      pickup_at_vendor_id: '', pickup_address_override: '', delivery_location: '',
+    })
+    setShowBulkEditModal(true)
+  }
+
+  function handleBulkSubmit() {
+    const fields_to_update = Object.entries(bulkApply).filter(([, on]) => on).map(([k]) => k)
+    if (!fields_to_update.length) {
+      alert('Tick at least one field to apply.')
+      return
+    }
+    const payload = { ids: Array.from(selectedIds), fields_to_update }
+    fields_to_update.forEach(f => {
+      const v = bulkValues[f]
+      // Empty string → null (clear). Number-FK → number. Otherwise pass through.
+      if (f === 'pickup_at_vendor_id') payload[f] = v ? Number(v) : null
+      else payload[f] = v === '' ? null : v
+    })
+    bulkPickupMut.mutate(payload)
+  }
 
   async function handleUploadAttachment(poId, file) {
     if (!file) return
@@ -431,10 +510,43 @@ export default function PurchaseOrders() {
 
       {isLoading && <p>Loading...</p>}
 
+      {/* Bulk action toolbar — appears when >=1 POs are selected */}
+      {selectedIds.size > 0 && (
+        <div style={{
+          marginBottom: 12, padding: '8px 12px', background: '#eff6ff', border: '1px solid #bfdbfe',
+          borderRadius: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12,
+        }}>
+          <div style={{ fontSize: 14 }}>
+            <strong>{selectedIds.size}</strong> PO{selectedIds.size === 1 ? '' : 's'} selected
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-sm btn-primary" onClick={openBulkEdit}>
+              Edit Pickup &amp; Delivery
+            </button>
+            <button className="btn btn-sm" onClick={() => setSelectedIds(new Set())}>
+              Clear selection
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* PO List Table */}
+      {(() => {
+        const allVisibleSelected = pos.length > 0 && pos.every(p => selectedIds.has(p.id))
+        const someVisibleSelected = pos.some(p => selectedIds.has(p.id))
+        return (
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14 }}>
         <thead>
           <tr style={{ borderBottom: '2px solid #e5e7eb', textAlign: 'left' }}>
+            <th style={{ padding: '8px', width: 32 }}>
+              <input
+                type="checkbox"
+                checked={allVisibleSelected}
+                ref={el => { if (el) el.indeterminate = !allVisibleSelected && someVisibleSelected }}
+                onChange={() => toggleSelectAllVisible(pos)}
+                title="Select all in current view"
+              />
+            </th>
             <th style={{ padding: '8px' }}>PO #</th>
             <th style={{ padding: '8px' }}>Vendor</th>
             <th style={{ padding: '8px' }}>Status</th>
@@ -447,7 +559,19 @@ export default function PurchaseOrders() {
         </thead>
         <tbody>
           {pos.map(po => (
-            <tr key={po.id} style={{ borderBottom: '1px solid #f3f4f6', cursor: 'pointer' }} onClick={() => { setShowDetailModal(po); loadReceivingRecords(po.id) }}>
+            <tr key={po.id}
+                style={{
+                  borderBottom: '1px solid #f3f4f6', cursor: 'pointer',
+                  background: selectedIds.has(po.id) ? '#eff6ff' : undefined,
+                }}
+                onClick={() => { setShowDetailModal(po); loadReceivingRecords(po.id) }}>
+              <td style={{ padding: '8px' }} onClick={e => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  checked={selectedIds.has(po.id)}
+                  onChange={() => toggleSelected(po.id)}
+                />
+              </td>
               <td style={{ padding: '8px', fontWeight: 600 }}>{po.po_number}</td>
               <td style={{ padding: '8px' }}>{po.vendor_name || '—'}</td>
               <td style={{ padding: '8px' }}>
@@ -467,6 +591,8 @@ export default function PurchaseOrders() {
           ))}
         </tbody>
       </table>
+        )
+      })()}
 
       {pos.length === 0 && !isLoading && (
         <p style={{ color: '#6b7280', textAlign: 'center', marginTop: 40 }}>No purchase orders found.</p>
@@ -1028,6 +1154,71 @@ export default function PurchaseOrders() {
                 <button className="btn btn-danger" onClick={() => { if (confirm('Delete this PO?')) deleteMut.mutate(showDetailModal.id) }}>Delete PO</button>
               )}
               <button className="btn" onClick={() => setShowDetailModal(null)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Pickup Edit Modal */}
+      {showBulkEditModal && (
+        <div className="modal-overlay" onClick={() => setShowBulkEditModal(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 640 }}>
+            <h2 style={{ margin: '0 0 4px 0' }}>Bulk Edit Pickup &amp; Delivery</h2>
+            <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 12 }}>
+              Applying to <strong>{selectedIds.size}</strong> selected PO{selectedIds.size === 1 ? '' : 's'}.
+              Tick a checkbox to update that field — unchecked fields are left as-is on each PO.
+              Leaving a checked field blank clears it.
+            </div>
+
+            {[
+              { key: 'pickup_run_date', label: 'Pickup Date', type: 'date' },
+              { key: 'expected_delivery_date', label: 'Expected Delivery', type: 'date' },
+              { key: 'driver_name', label: 'Driver', type: 'text', placeholder: 'Driver name' },
+              { key: 'pickup_at_vendor_id', label: 'Consolidate Pickup at Vendor', type: 'vendor-select' },
+              { key: 'delivery_location', label: 'Delivery Location', type: 'text', placeholder: 'The farm' },
+              { key: 'pickup_address_override', label: 'Custom Pickup Address', type: 'text', placeholder: 'Free-form override' },
+            ].map(f => (
+              <div key={f.key} style={{ display: 'grid', gridTemplateColumns: 'auto 180px 1fr', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={bulkApply[f.key]}
+                  onChange={e => setBulkApply({ ...bulkApply, [f.key]: e.target.checked })}
+                />
+                <label style={{ fontSize: 13, color: bulkApply[f.key] ? '#111827' : '#9ca3af' }}>
+                  {f.label}
+                </label>
+                {f.type === 'vendor-select' ? (
+                  <select
+                    value={bulkValues[f.key]}
+                    disabled={!bulkApply[f.key]}
+                    onChange={e => setBulkValues({ ...bulkValues, [f.key]: e.target.value })}
+                  >
+                    <option value="">— Clear consolidation (pick up from sellers directly) —</option>
+                    {vendors.filter(v => v.is_active).map(v => (
+                      <option key={v.id} value={v.id}>
+                        {v.name}{v.pickup_address ? ` — ${v.pickup_address}` : ' (no address)'}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type={f.type}
+                    value={bulkValues[f.key]}
+                    disabled={!bulkApply[f.key]}
+                    placeholder={f.placeholder}
+                    onChange={e => setBulkValues({ ...bulkValues, [f.key]: e.target.value })}
+                  />
+                )}
+              </div>
+            ))}
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
+              <button className="btn" onClick={() => setShowBulkEditModal(false)}>Cancel</button>
+              <button className="btn btn-primary"
+                onClick={handleBulkSubmit}
+                disabled={bulkPickupMut.isPending}>
+                {bulkPickupMut.isPending ? 'Applying…' : `Apply to ${selectedIds.size} PO${selectedIds.size === 1 ? '' : 's'}`}
+              </button>
             </div>
           </div>
         </div>

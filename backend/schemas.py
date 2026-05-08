@@ -1099,6 +1099,25 @@ class POFromProjectionRequest(BaseModel):
     vendor_id: Optional[int] = None  # if not provided, use preferred vendor
 
 
+class POBulkPickupUpdateRequest(BaseModel):
+    """Bulk-apply pickup/delivery fields to a list of POs. Only the keys named
+    in fields_to_update are written — other keys are left alone. A None value
+    inside a named key explicitly clears that field on the PO."""
+    ids: List[int]
+    fields_to_update: List[str]
+    pickup_run_date: Optional[date] = None
+    expected_delivery_date: Optional[date] = None
+    driver_name: Optional[str] = None
+    pickup_at_vendor_id: Optional[int] = None
+    pickup_address_override: Optional[str] = None
+    delivery_location: Optional[str] = None
+
+
+class POBulkPickupUpdateResponse(BaseModel):
+    updated: int
+    skipped_ids: List[int] = []
+
+
 # ---------------------------------------------------------------------------
 # Receiving Records (Phase 5)
 # ---------------------------------------------------------------------------
