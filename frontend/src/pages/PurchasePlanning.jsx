@@ -690,6 +690,12 @@ export default function PurchasePlanning() {
       },
     },
     {
+      colId: 'purchase_product_type',
+      editable: false,
+      getValue: (row) => row.purchase_product_type || '',
+      getDisplay: (row) => row.purchase_product_type || '—',
+    },
+    {
       colId: 'inventory_lbs',
       editable: false,
       getValue: (row) => numStr(row.inventory_lbs),
@@ -885,6 +891,16 @@ export default function PurchasePlanning() {
       header: 'Sub Product Type',
       accessorKey: 'sub_product_type',
       cell: ({ row }) => row.original.sub_product_type || '—',
+      filterFn: 'includesString',
+    },
+    {
+      // Effective purchase product type — sub_product_type when set, else the
+      // base product_type. Useful as a sort key so substitution pairs (e.g.
+      // a Cherimoya/sub=Atemoya row and an Atemoya row) group together.
+      id: 'purchase_product_type',
+      header: 'Purchase Product Type',
+      accessorKey: 'purchase_product_type',
+      cell: ({ row }) => row.original.purchase_product_type || '—',
       filterFn: 'includesString',
     },
     {
@@ -1347,8 +1363,8 @@ export default function PurchasePlanning() {
             vendor / case weight / purchase weight per product type. Optionally
             set a Sub Product Type — its on-hand reduces the row's Gap and
             purchases on the substitute fill the same gap. Net After Purchase
-            sums across all rows sharing the same (product type, sub product
-            type) combo, so splits across vendors net out together.
+            sums across all rows that buy the same effective Purchase Product
+            Type, so substitution pairs and multi-vendor splits net out together.
           </p>
           <p style={{ fontSize: 12, color: '#6b7280' }}>
             <strong>Spreadsheet shortcuts:</strong> click to select, drag or
@@ -1493,7 +1509,7 @@ export default function PurchasePlanning() {
             paddingBottom: 16,
           }}
         >
-          <table className="data-table" style={{ minWidth: 1780 }}>
+          <table className="data-table" style={{ minWidth: 1940 }}>
             {/* The global CSS sets thead { z-index: 1 }, but the body's
                 sticky-left cells are also at z:1 — so they paint over the
                 header (later in document order wins). Bump thead higher so
@@ -1822,21 +1838,42 @@ export default function PurchasePlanning() {
 // contact + address and a copy-paste-ready summary of every planned product
 // type for this vendor in the current period.
 
+function groupPlannedItems(items) {
+  // Group rows by effective purchase product type so a substitution pair
+  // (e.g. an Atemoya row + a Cherimoya row subbed to Atemoya) collapses into
+  // a single combined line for the vendor. Single-row groups keep their
+  // original case-vs-lbs formatting; multi-row groups always show summed lbs
+  // since case structures across rows aren't guaranteed to match.
+  const groups = new Map()
+  for (const it of items) {
+    const name = it.purchase_product_type || it.sub_product_type || it.product_type || ''
+    if (!groups.has(name)) groups.set(name, { name, rows: [], totalLbs: 0 })
+    const g = groups.get(name)
+    g.rows.push(it)
+    const w = Number(it.purchase_weight_lbs)
+    if (!Number.isNaN(w)) g.totalLbs += w
+  }
+  return Array.from(groups.values())
+}
+
 function buildPlannedItemsText(items) {
-  // Two-column layout: "<amount>   <product_type>".
-  // - When sub_product_type is set, that substitute IS what we're ordering
-  //   from this vendor, so use it and hide the base product type.
-  // - Amount uses the same case-vs-lbs rule as the on-screen Converted
-  //   Order column, so the copy-pasted message matches the table.
-  // - Right-pad amounts with regular spaces to the longest amount + a
-  //   2-space gutter so product types line up. The popover textarea is
-  //   monospaced, so spaces give a clean column. Falls back gracefully if
-  //   it's pasted into a non-monospace surface.
-  const rows = items.map((it) => ({
-    amount: fmtConvertedOrder(it) || 'TBD',
-    name: it.sub_product_type || it.product_type,
-  }))
-  if (rows.length === 0) return ''
+  // Two-column layout: "<amount>   <product_type>". Rows that effectively
+  // buy the same product collapse into one line so the vendor sees a single
+  // combined ask. Amount is monospace-padded to align the product column.
+  const groups = groupPlannedItems(items)
+  if (groups.length === 0) return ''
+  const rows = groups.map((g) => {
+    let amount
+    if (g.rows.length === 1) {
+      amount = fmtConvertedOrder(g.rows[0]) || 'TBD'
+    } else if (g.totalLbs > 0) {
+      const t = g.totalLbs
+      amount = `${Number.isInteger(t) ? t : t.toFixed(1)} lbs`
+    } else {
+      amount = 'TBD'
+    }
+    return { amount, name: g.name }
+  })
   const colWidth = rows.reduce((m, r) => Math.max(m, r.amount.length), 0) + 2
   return rows
     .map((r) => `${r.amount.padEnd(colWidth)}${r.name}`)
@@ -1975,6 +2012,9 @@ function VendorInfoPopover({ vendor, items, anchorRect, onClose }) {
   // period are already visible to the user in the popover header and the
   // page itself, so including them in the pasted message is just noise.
   const fullCopyText = buildPlannedItemsText(items)
+  // Number of distinct product-type lines after substitution-grouping. Reads
+  // more naturally to the user than the raw row count when two rows collapse.
+  const groupCount = groupPlannedItems(items).length
 
   async function handleCopy() {
     try {
@@ -2037,7 +2077,7 @@ function VendorInfoPopover({ vendor, items, anchorRect, onClose }) {
           <div style={popoverSectionStyle}>
             <div style={{ ...popoverLabelStyle, display: 'flex', alignItems: 'center', gap: 8 }}>
               <span style={{ flex: 1 }}>
-                Planned for this period ({items.length} {items.length === 1 ? 'item' : 'items'})
+                Planned for this period ({groupCount} {groupCount === 1 ? 'item' : 'items'})
               </span>
               <button
                 type="button"

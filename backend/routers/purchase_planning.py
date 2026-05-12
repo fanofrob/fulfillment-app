@@ -127,28 +127,47 @@ def _projection_metrics_for_period(db: Session, period_id: int) -> dict[str, dic
     }
 
 
-def _purchases_by_combo(
-    lines: list[models.PurchasePlanLine],
-) -> dict[tuple[str, str], float]:
-    """
-    Sum purchase_weight_lbs across all lines sharing the same
-    (product_type, sub_product_type) combo. Empty/None sub_product_type
-    is treated as "" so rows with no substitution aggregate together.
-    """
-    out: dict[tuple[str, str], float] = {}
-    for l in lines:
-        if not l.purchase_weight_lbs:
-            continue
-        key = (l.product_type, l.sub_product_type or "")
-        out[key] = out.get(key, 0.0) + float(l.purchase_weight_lbs)
-    return out
-
-
 # ── PO mirroring ───────────────────────────────────────────────────────────
 # A plan row's "effective" product type (the thing we're literally buying from
 # the vendor) is the substitute when set, otherwise the base.
 def _po_line_product_type(plan: models.PurchasePlanLine) -> str:
     return (plan.sub_product_type or plan.product_type or "").strip()
+
+
+def _purchase_pt_totals(
+    lines: list[models.PurchasePlanLine],
+    metrics: dict[str, dict],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """
+    Group plan lines by their effective purchase product type — sub_product_type
+    when set (that's literally what's being bought from the vendor), else the
+    base product_type — and return (gaps_by_purchase_pt, purchases_by_purchase_pt).
+
+    Rows that share a purchase product type (e.g. an Atemoya row and a Cherimoya
+    row subbed to Atemoya) aggregate so Net After Purchase reflects the
+    substitution group's combined surplus / deficit. Gap is deduped by
+    (product_type, sub_product_type) so multi-vendor splits of one product
+    don't count the same projection gap twice.
+    """
+    gaps: dict[str, float] = {}
+    purchases: dict[str, float] = {}
+    seen_combos: set[tuple[str, str]] = set()
+    for l in lines:
+        purchase_pt = _po_line_product_type(l)
+        if not purchase_pt:
+            continue
+        combo = (l.product_type or "", l.sub_product_type or "")
+        if combo not in seen_combos:
+            seen_combos.add(combo)
+            base = metrics.get(l.product_type)
+            base_gap = base["gap_lbs"] if base else None
+            sub = metrics.get(l.sub_product_type) if l.sub_product_type else None
+            sub_inv = sub["on_hand_lbs"] if sub else 0.0
+            if base_gap is not None:
+                gaps[purchase_pt] = gaps.get(purchase_pt, 0.0) + (base_gap - sub_inv)
+        if l.purchase_weight_lbs:
+            purchases[purchase_pt] = purchases.get(purchase_pt, 0.0) + float(l.purchase_weight_lbs)
+    return gaps, purchases
 
 
 def _quantity_cases_from_plan(plan: models.PurchasePlanLine) -> float:
@@ -363,7 +382,8 @@ def _po_info_map(db: Session, plan_lines: list[models.PurchasePlanLine]) -> dict
 def _serialize_line(
     line: models.PurchasePlanLine,
     metrics: dict[str, dict],
-    purchases_by_combo: dict[tuple[str, str], float],
+    gaps_by_purchase_pt: dict[str, float],
+    purchases_by_purchase_pt: dict[str, float],
     po_info: Optional[dict] = None,
 ) -> dict:
     pwh = _purchase_weight_helper(line.purchase_weight_lbs, line.case_weight_lbs)
@@ -384,10 +404,13 @@ def _serialize_line(
     else:
         gap_lbs = base_gap - (sub_inventory_lbs or 0.0)
 
-    purchased_for_combo = purchases_by_combo.get(
-        (line.product_type, line.sub_product_type or ""), 0.0
-    )
-    net = None if gap_lbs is None else (gap_lbs - purchased_for_combo)
+    # Net is computed across the row's purchase-product-type group, so rows
+    # that effectively buy the same physical product (a substitution pair like
+    # Cherimoya/sub=Atemoya + Atemoya) share one combined net.
+    purchase_pt = _po_line_product_type(line) or None
+    group_gap = gaps_by_purchase_pt.get(purchase_pt) if purchase_pt else None
+    group_purchases = purchases_by_purchase_pt.get(purchase_pt, 0.0) if purchase_pt else 0.0
+    net = None if group_gap is None else (group_gap - group_purchases)
 
     return {
         "id": line.id,
@@ -395,6 +418,7 @@ def _serialize_line(
         "vendor_id": line.vendor_id,
         "product_type": line.product_type,
         "sub_product_type": line.sub_product_type,
+        "purchase_product_type": purchase_pt,
         "purchase_weight_lbs": line.purchase_weight_lbs,
         "case_weight_lbs": line.case_weight_lbs,
         "quantity": line.quantity,
@@ -404,7 +428,6 @@ def _serialize_line(
         "sub_inventory_lbs": sub_inventory_lbs,
         "gap_lbs": gap_lbs,
         "purchase_weight_helper_lbs": pwh,
-        "purchased_combo_total_lbs": purchased_for_combo,
         "net_after_purchase_lbs": net,
         # Linked PO info (null when this row hasn't been attached to a PO yet).
         "purchase_order_line_id": line.purchase_order_line_id,
@@ -432,7 +455,7 @@ def list_plan_lines(
         .all()
     )
     metrics = _projection_metrics_for_period(db, projection_period_id)
-    purchases = _purchases_by_combo(lines)
+    gaps_by_pt, purchases_by_pt = _purchase_pt_totals(lines, metrics)
     po_info = _po_info_map(db, lines)
 
     # Sub-product-type dropdown pulls from picklist_skus.type so users can pick
@@ -448,7 +471,7 @@ def list_plan_lines(
     return {
         "projection_period_id": projection_period_id,
         "has_current_projection": bool(metrics),
-        "items": [_serialize_line(l, metrics, purchases, po_info.get(l.id)) for l in lines],
+        "items": [_serialize_line(l, metrics, gaps_by_pt, purchases_by_pt, po_info.get(l.id)) for l in lines],
         "available_product_types": sorted(metrics.keys()),
         "available_sub_product_types": sub_product_types,
     }
@@ -489,8 +512,8 @@ def create_plan_line(body: PurchasePlanLineCreate, db: Session = Depends(get_db)
     period_lines = db.query(models.PurchasePlanLine).filter_by(
         projection_period_id=body.projection_period_id
     ).all()
-    purchases = _purchases_by_combo(period_lines)
-    return _serialize_line(line, metrics_for_default, purchases)
+    gaps_by_pt, purchases_by_pt = _purchase_pt_totals(period_lines, metrics_for_default)
+    return _serialize_line(line, metrics_for_default, gaps_by_pt, purchases_by_pt)
 
 
 @router.put("/{line_id}")
@@ -545,9 +568,9 @@ def update_plan_line(line_id: int, body: PurchasePlanLineUpdate, db: Session = D
     period_lines = db.query(models.PurchasePlanLine).filter_by(
         projection_period_id=line.projection_period_id
     ).all()
-    purchases = _purchases_by_combo(period_lines)
+    gaps_by_pt, purchases_by_pt = _purchase_pt_totals(period_lines, metrics)
     po_info = _po_info_map(db, [line]).get(line.id)
-    return _serialize_line(line, metrics, purchases, po_info)
+    return _serialize_line(line, metrics, gaps_by_pt, purchases_by_pt, po_info)
 
 
 @router.delete("/{line_id}")
@@ -715,10 +738,10 @@ def bulk_set_plan_line_po(body: BulkPOLinkBody, db: Session = Depends(get_db)):
         db.refresh(p)
 
     metrics_by_period = {pid: _projection_metrics_for_period(db, pid) for pid in period_ids}
-    purchases_by_period: dict[int, dict] = {}
+    totals_by_period: dict[int, tuple[dict, dict]] = {}
     for pid in period_ids:
         period_lines = db.query(models.PurchasePlanLine).filter_by(projection_period_id=pid).all()
-        purchases_by_period[pid] = _purchases_by_combo(period_lines)
+        totals_by_period[pid] = _purchase_pt_totals(period_lines, metrics_by_period[pid])
     info_map = _po_info_map(db, plans)
 
     return {
@@ -726,7 +749,8 @@ def bulk_set_plan_line_po(body: BulkPOLinkBody, db: Session = Depends(get_db)):
             _serialize_line(
                 p,
                 metrics_by_period[p.projection_period_id],
-                purchases_by_period[p.projection_period_id],
+                totals_by_period[p.projection_period_id][0],
+                totals_by_period[p.projection_period_id][1],
                 info_map.get(p.id),
             )
             for p in plans
@@ -741,9 +765,9 @@ def _return_plan_row(db: Session, plan: models.PurchasePlanLine) -> dict:
     period_lines = db.query(models.PurchasePlanLine).filter_by(
         projection_period_id=plan.projection_period_id
     ).all()
-    purchases = _purchases_by_combo(period_lines)
+    gaps_by_pt, purchases_by_pt = _purchase_pt_totals(period_lines, metrics)
     info = _po_info_map(db, [plan]).get(plan.id)
-    return _serialize_line(plan, metrics, purchases, info)
+    return _serialize_line(plan, metrics, gaps_by_pt, purchases_by_pt, info)
 
 
 @router.get("/eligible-pos")
