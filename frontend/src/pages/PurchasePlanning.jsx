@@ -1860,19 +1860,30 @@ function buildPlannedItemsText(items) {
   // Two-column layout: "<amount>   <product_type>". Rows that effectively
   // buy the same product collapse into one line so the vendor sees a single
   // combined ask. Amount is monospace-padded to align the product column.
+  // Multi-row groups whose contributing rows all share one case_weight stay
+  // in case-format (sum of per-row case counts); mixed or missing case
+  // weights fall back to summed lbs.
   const groups = groupPlannedItems(items)
   if (groups.length === 0) return ''
   const rows = groups.map((g) => {
-    let amount
     if (g.rows.length === 1) {
-      amount = fmtConvertedOrder(g.rows[0]) || 'TBD'
-    } else if (g.totalLbs > 0) {
-      const t = g.totalLbs
-      amount = `${Number.isInteger(t) ? t : t.toFixed(1)} lbs`
-    } else {
-      amount = 'TBD'
+      return { amount: fmtConvertedOrder(g.rows[0]) || 'TBD', name: g.name }
     }
-    return { amount, name: g.name }
+    const contributing = g.rows.filter((r) => Number(r.purchase_weight_lbs) > 0)
+    const cws = contributing.map((r) => Number(r.case_weight_lbs))
+    const allCased = contributing.length > 0 && cws.every((cw) => cw > 0 && cw === cws[0])
+    if (allCased) {
+      const cases = contributing.reduce(
+        (sum, r) => sum + Math.ceil(Number(r.purchase_weight_lbs) / Number(r.case_weight_lbs)),
+        0,
+      )
+      return { amount: `${cases} case${cases === 1 ? '' : 's'}`, name: g.name }
+    }
+    if (g.totalLbs > 0) {
+      const t = g.totalLbs
+      return { amount: `${Number.isInteger(t) ? t : t.toFixed(1)} lbs`, name: g.name }
+    }
+    return { amount: 'TBD', name: g.name }
   })
   const colWidth = rows.reduce((m, r) => Math.max(m, r.amount.length), 0) + 2
   return rows
