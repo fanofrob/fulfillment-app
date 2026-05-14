@@ -8,21 +8,26 @@ function fmt(val, decimals = 1) {
   return Number(val).toFixed(decimals)
 }
 
+const isPackaging = (skuObj) => skuObj?.inventory_type === 'packaging'
+
 // Build initial editable state for a scanned row
 function initRow(r, skuMap) {
   const actualSku = r.matched_sku || r.extracted_sku
   const skuObj = skuMap[actualSku] || null
+  const packaging = isPackaging(skuObj)
   return {
     ...r,
     _actualSku: actualSku,
     _weightPerLb: r.weight_per_lb ?? (skuObj?.weight_lb ?? null),
     _batch: r.batch || '',
-    // Count mode: 'lbs' | 'boxes' | 'pieces'
-    _mode: 'lbs',
-    _lbs: r.lbs,
+    // Count mode: 'lbs' | 'boxes' | 'pieces'.
+    // Packaging items (clamshells, boxes, tape, etc.) are only counted in pieces —
+    // Claude extracts a count into r.lbs, so move it into _directPieces.
+    _mode: packaging ? 'pieces' : 'lbs',
+    _lbs: packaging ? '' : r.lbs,
     _boxes: '',
     _caseWeight: skuObj?.case_weight_lb ?? '',
-    _directPieces: '',
+    _directPieces: packaging ? (r.lbs ?? '') : '',
   }
 }
 
@@ -132,6 +137,13 @@ export default function InventoryCount() {
         const obj = skuMap[changes._actualSku]
         if (obj?.weight_lb) updated._weightPerLb = obj.weight_lb
         if (obj?.case_weight_lb && updated._mode === 'boxes') updated._caseWeight = obj.case_weight_lb
+        // Packaging SKUs are pieces-only; migrate any lbs value into the pieces field.
+        if (isPackaging(obj) && updated._mode !== 'pieces') {
+          if (updated._mode === 'lbs' && updated._lbs !== '' && updated._lbs != null) {
+            updated._directPieces = updated._lbs
+          }
+          updated._mode = 'pieces'
+        }
       }
       return updated
     }))
@@ -356,6 +368,8 @@ export default function InventoryCount() {
                   const totalLbs = computeLbs(r)
                   const skuMismatch = r._actualSku && r.extracted_sku && r._actualSku !== r.extracted_sku
                   const rowBg = flags.length > 0 ? '#fff9f9' : (idx % 2 === 0 ? '#fff' : '#f9fafb')
+                  const packaging = isPackaging(skuMap[r._actualSku])
+                  const modeOptions = packaging ? ['pieces'] : ['lbs', 'boxes', 'pieces']
 
                   return (
                     <tr key={idx} style={{ background: rowBg, borderBottom: '1px solid #e5e7eb' }}>
@@ -399,10 +413,10 @@ export default function InventoryCount() {
                           placeholder="—" style={{ ...inputStyle, width: 70 }} />
                       </td>
 
-                      {/* Count type toggle */}
+                      {/* Count type toggle (packaging is pieces-only) */}
                       <td style={td}>
                         <div style={{ display: 'flex', borderRadius: 4, overflow: 'hidden', border: '1px solid #d1d5db', width: 'fit-content' }}>
-                          {['lbs', 'boxes', 'pieces'].map(mode => (
+                          {modeOptions.map(mode => (
                             <button key={mode} onClick={() => updateRow(idx, { _mode: mode })}
                               style={{ padding: '2px 8px', fontSize: 11, border: 'none', cursor: 'pointer', background: r._mode === mode ? '#2563eb' : '#fff', color: r._mode === mode ? '#fff' : '#374151', fontWeight: r._mode === mode ? 600 : 400 }}>
                               {mode}
