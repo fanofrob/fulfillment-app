@@ -360,6 +360,16 @@ export default function PicklistSkus() {
         >
           {syncMut.isPending ? 'Syncing...' : '↓ Sync from Sheets'}
         </button>
+        {total > 0 && (
+          <a
+            className="btn btn-secondary"
+            style={{ textDecoration: 'none' }}
+            href={picklistSkusApi.exportUrl({ search, inventory_type: typeFilter })}
+            download
+          >
+            ↧ Export CSV
+          </a>
+        )}
         {syncResult && (
           <span style={{ fontSize: 12, color: '#16a34a' }}>
             Synced: {syncResult.created} created, {syncResult.updated} updated ({syncResult.total} total)

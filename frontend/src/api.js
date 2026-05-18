@@ -160,6 +160,13 @@ export const picklistSkusApi = {
   create: (data) => api.post('/picklist-skus/', data).then(r => r.data),
   update: (id, data) => api.put(`/picklist-skus/${id}`, data).then(r => r.data),
   missingCogs: () => api.get('/picklist-skus/missing-cogs').then(r => r.data),
+  exportUrl: (params = {}) => {
+    const qs = new URLSearchParams()
+    if (params.search) qs.set('search', params.search)
+    if (params.inventory_type) qs.set('inventory_type', params.inventory_type)
+    const q = qs.toString()
+    return `${API_BASE}/picklist-skus/export${q ? `?${q}` : ''}`
+  },
 }
 
 export const packagingMappingsApi = {

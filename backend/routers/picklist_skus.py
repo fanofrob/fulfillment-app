@@ -1,7 +1,10 @@
+import csv
+import io
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -136,6 +139,63 @@ def get_missing_cogs_skus(db: Session = Depends(get_db)):
 
     results.sort(key=lambda x: x["affected_order_count"], reverse=True)
     return results
+
+
+PICKLIST_EXPORT_COLUMNS = [
+    ("pick_sku", "Pick SKU"),
+    ("customer_description", "Description"),
+    ("inventory_type", "Inventory Type"),
+    ("type", "Pick Type"),
+    ("weight_lb", "Weight (lb)"),
+    ("cost_per_lb", "Cost/lb"),
+    ("cost_per_case", "Cost/case"),
+    ("case_weight_lb", "Case Weight (lb)"),
+    ("pactor_multiplier", "Pactor Multiplier"),
+    ("pactor", "Pactor"),
+    ("temperature", "Temperature"),
+    ("category", "Category"),
+    ("status", "Status"),
+    ("cc_item_id", "CC Item ID"),
+    ("days_til_expiration", "Days Til Expiration"),
+    ("notes", "Notes"),
+]
+
+
+@router.get("/export")
+def export_picklist_skus_csv(
+    search: Optional[str] = Query(None),
+    inventory_type: Optional[str] = Query(None, description="Filter by 'product' or 'packaging'"),
+    db: Session = Depends(get_db),
+):
+    """Stream the picklist SKU table as CSV, honoring the same search/type filters as the list view."""
+    q = db.query(models.PicklistSku)
+    if search:
+        s = f"%{search}%"
+        q = q.filter(
+            models.PicklistSku.pick_sku.ilike(s) |
+            models.PicklistSku.customer_description.ilike(s)
+        )
+    if inventory_type:
+        if inventory_type not in VALID_INVENTORY_TYPES:
+            raise HTTPException(status_code=400, detail=f"inventory_type must be one of {VALID_INVENTORY_TYPES}")
+        q = q.filter(models.PicklistSku.inventory_type == inventory_type)
+    q = q.order_by(models.PicklistSku.pick_sku)
+
+    def rows():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([label for _, label in PICKLIST_EXPORT_COLUMNS])
+        yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+        for r in q.yield_per(1000):
+            w.writerow([getattr(r, field) for field, _ in PICKLIST_EXPORT_COLUMNS])
+            yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+
+    filename = f"picklist_skus_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
+    return StreamingResponse(
+        rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/")
