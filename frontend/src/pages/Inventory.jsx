@@ -781,7 +781,7 @@ function EditInventoryDrawer({ item, onClose }) {
 
           {/* ── Log Tab ── */}
           {tab === 'log' && (
-            <LogTab adjustments={adjustments} loading={adjLoading} />
+            <LogTab adjustments={adjustments} loading={adjLoading} item={item} />
           )}
         </div>
       </div>
@@ -1014,7 +1014,17 @@ function AdjustTab({ item, onAdjust }) {
   )
 }
 
-function LogTab({ adjustments, loading }) {
+// adjustments are newest-first; balance = on-hand immediately after each entry, anchored to current on-hand
+function withRunningBalance(adjustments, onHand) {
+  let running = onHand ?? 0
+  return adjustments.map(adj => {
+    const balance = running
+    running -= adj.delta
+    return { ...adj, balance }
+  })
+}
+
+function LogTab({ adjustments, loading, item }) {
   const adjClass = (type) => {
     if (type === 'ship_deduct' || type === 'manual_deduct') return 'adj-badge adj-deduct'
     if (type === 'manual_add' || type === 'initial_set' || type === 'restock' || type === 'batch_adjust') return 'adj-badge adj-add'
@@ -1022,6 +1032,7 @@ function LogTab({ adjustments, loading }) {
   }
   if (loading) return <div className="loading">Loading…</div>
   if (!adjustments.length) return <div className="empty">No adjustments recorded yet.</div>
+  const rows = withRunningBalance(adjustments, item?.on_hand_qty)
   return (
     <table style={{ width: '100%', fontSize: 13 }}>
       <thead>
@@ -1029,11 +1040,12 @@ function LogTab({ adjustments, loading }) {
           <th style={{ textAlign: 'left', padding: '6px 8px' }}>Date</th>
           <th style={{ textAlign: 'left', padding: '6px 8px' }}>Type</th>
           <th style={{ textAlign: 'right', padding: '6px 8px' }}>Delta</th>
+          <th style={{ textAlign: 'right', padding: '6px 8px' }}>Balance</th>
           <th style={{ textAlign: 'left', padding: '6px 8px' }}>Note</th>
         </tr>
       </thead>
       <tbody>
-        {adjustments.map(adj => (
+        {rows.map(adj => (
           <tr key={adj.id}>
             <td style={{ color: '#888', fontSize: 11, padding: '5px 8px' }}>
               {adj.created_at ? new Date(adj.created_at).toLocaleString() : '—'}
@@ -1045,6 +1057,9 @@ function LogTab({ adjustments, loading }) {
             </td>
             <td style={{ textAlign: 'right', fontWeight: 600, padding: '5px 8px', color: adj.delta >= 0 ? '#16a34a' : '#dc2626' }}>
               {adj.delta >= 0 ? '+' : ''}{formatQty(adj.delta)}
+            </td>
+            <td style={{ textAlign: 'right', fontWeight: 600, padding: '5px 8px', color: adj.balance < 0 ? '#dc2626' : '#1f2937' }}>
+              {formatQty(adj.balance)}
             </td>
             <td style={{ color: '#888', fontSize: 11, padding: '5px 8px', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={adj.note || ''}>
               {adj.note || '—'}
@@ -1072,11 +1087,12 @@ function AdjustmentDrawer({ item, onClose }) {
     if (type === 'manual_add' || type === 'initial_set' || type === 'restock') return 'adj-badge adj-add'
     return 'adj-badge adj-ship'
   }
+  const rows = withRunningBalance(adjustments || [], item.on_hand_qty)
 
   return (
     <div className="side-drawer-overlay">
       <div className="side-drawer-backdrop" onClick={onClose} />
-      <div className="side-drawer">
+      <div className="side-drawer" style={{ width: 540 }}>
         <div className="side-drawer-header">
           <div>
             <div className="side-drawer-title">{item.pick_sku}</div>
@@ -1096,11 +1112,12 @@ function AdjustmentDrawer({ item, onClose }) {
                   <th>Date</th>
                   <th>Type</th>
                   <th style={{ textAlign: 'right' }}>Delta</th>
+                  <th style={{ textAlign: 'right' }}>Balance</th>
                   <th>Note</th>
                 </tr>
               </thead>
               <tbody>
-                {adjustments.map(adj => (
+                {rows.map(adj => (
                   <tr key={adj.id}>
                     <td style={{ color: '#888', fontSize: 11 }}>
                       {adj.created_at ? new Date(adj.created_at).toLocaleString() : '—'}
@@ -1112,6 +1129,9 @@ function AdjustmentDrawer({ item, onClose }) {
                     </td>
                     <td style={{ textAlign: 'right', fontWeight: 600, color: adj.delta >= 0 ? '#16a34a' : '#dc2626' }}>
                       {adj.delta >= 0 ? '+' : ''}{formatQty(adj.delta)}
+                    </td>
+                    <td style={{ textAlign: 'right', fontWeight: 600, color: adj.balance < 0 ? '#dc2626' : '#1f2937' }}>
+                      {formatQty(adj.balance)}
                     </td>
                     <td style={{ color: '#888', fontSize: 11, maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={adj.note || ''}>
                       {adj.note || '—'}
