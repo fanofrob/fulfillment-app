@@ -6,6 +6,7 @@ with its own short-ship and inventory-hold SKU configurations.
 """
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -17,14 +18,21 @@ from services import sheets_service
 
 router = APIRouter()
 
+# Projection periods follow the business's local calendar (Pacific). Week
+# boundaries (Wed 12:00am → Tue 11:59pm) and the "this week" suggestion are
+# computed in this zone, then returned as timezone-aware ISO strings.
+PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _suggest_default_boundaries(reference_date: datetime = None):
-    """Suggest default Wed 12:00am → Tue 11:59pm boundaries for the week containing reference_date."""
+    """Suggest default Wed 12:00am → Tue 11:59pm Pacific boundaries for the week containing reference_date."""
     if reference_date is None:
-        reference_date = datetime.now(timezone.utc)
-    # Find Wednesday (weekday=2) at midnight
+        reference_date = datetime.now(PACIFIC_TZ)
+    else:
+        reference_date = reference_date.astimezone(PACIFIC_TZ)
+    # Find Wednesday (weekday=2) at midnight, in Pacific time
     days_since_wed = (reference_date.weekday() - 2) % 7
     wed = reference_date - timedelta(days=days_since_wed)
     start = wed.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -50,8 +58,8 @@ def list_periods(
 
 @router.get("/suggest-dates")
 def suggest_dates():
-    """Return default Wed-Tue boundaries for the current week and next week."""
-    now = datetime.now(timezone.utc)
+    """Return default Wed-Tue (Pacific) boundaries for the current week and next week."""
+    now = datetime.now(PACIFIC_TZ)
     s1, e1 = _suggest_default_boundaries(now)
     s2, e2 = _suggest_default_boundaries(now + timedelta(weeks=1))
     return {

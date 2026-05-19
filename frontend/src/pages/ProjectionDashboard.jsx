@@ -19,11 +19,19 @@ const EMPTY_CREATE_FORM = {
   notes: '',
 }
 
+// UTC/ISO instant → "YYYY-MM-DDTHH:mm" in the browser's local time, for datetime-local inputs.
 function toLocalInput(iso) {
   if (!iso) return ''
   const d = new Date(iso)
   const pad = n => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+// "YYYY-MM-DDTHH:mm" local wall-clock from a datetime-local input → UTC ISO string for the API.
+function fromLocalInput(local) {
+  if (!local) return null
+  const d = new Date(local)
+  return isNaN(d.getTime()) ? null : d.toISOString()
 }
 
 function formatLbs(v) { return v != null ? v.toFixed(1) : '—' }
@@ -1295,10 +1303,10 @@ function PeriodEditPanel({ period, periods = [], onSave, isSaving, saveError, sa
           className="btn btn-primary btn-sm"
           onClick={() => onSave({
             name: form.name,
-            start_datetime: form.start_datetime,
-            end_datetime: form.end_datetime,
-            fulfillment_start: form.fulfillment_start || null,
-            fulfillment_end: form.fulfillment_end || null,
+            start_datetime: fromLocalInput(form.start_datetime),
+            end_datetime: fromLocalInput(form.end_datetime),
+            fulfillment_start: fromLocalInput(form.fulfillment_start),
+            fulfillment_end: fromLocalInput(form.fulfillment_end),
             sku_mapping_sheet_tab: form.sku_mapping_sheet_tab || null,
             notes: form.notes || null,
             status: form.status,
@@ -1441,8 +1449,10 @@ export default function ProjectionDashboard() {
       ...createForm,
       previous_period_id: createForm.previous_period_id ? parseInt(createForm.previous_period_id) : null,
       sku_mapping_sheet_tab: createForm.sku_mapping_sheet_tab || null,
-      fulfillment_start: createForm.fulfillment_start || null,
-      fulfillment_end: createForm.fulfillment_end || null,
+      start_datetime: fromLocalInput(createForm.start_datetime),
+      end_datetime: fromLocalInput(createForm.end_datetime),
+      fulfillment_start: fromLocalInput(createForm.fulfillment_start),
+      fulfillment_end: fromLocalInput(createForm.fulfillment_end),
     }
     createPeriodMut.mutate(payload)
   }

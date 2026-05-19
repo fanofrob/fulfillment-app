@@ -12,10 +12,20 @@ const EMPTY_FORM = {
   notes: '',
 }
 
+// UTC/ISO instant → "YYYY-MM-DDTHH:mm" in the browser's local time, for datetime-local inputs.
 function toLocalInput(iso) {
   if (!iso) return ''
   const d = new Date(iso)
-  return d.toISOString().slice(0, 16)
+  if (isNaN(d.getTime())) return ''
+  const pad = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+// "YYYY-MM-DDTHH:mm" local wall-clock from a datetime-local input → UTC ISO string for the API.
+function fromLocalInput(local) {
+  if (!local) return null
+  const d = new Date(local)
+  return isNaN(d.getTime()) ? null : d.toISOString()
 }
 
 function formatDate(iso) {
@@ -177,8 +187,10 @@ export default function ProjectionPeriods() {
       ...form,
       previous_period_id: form.previous_period_id ? parseInt(form.previous_period_id) : null,
       sku_mapping_sheet_tab: form.sku_mapping_sheet_tab || null,
-      fulfillment_start: form.fulfillment_start || null,
-      fulfillment_end: form.fulfillment_end || null,
+      start_datetime: fromLocalInput(form.start_datetime),
+      end_datetime: fromLocalInput(form.end_datetime),
+      fulfillment_start: fromLocalInput(form.fulfillment_start),
+      fulfillment_end: fromLocalInput(form.fulfillment_end),
     }
     if (editing) updateMut.mutate({ id: editing.id, data: payload })
     else createMut.mutate(payload)

@@ -19,10 +19,20 @@ function formatDate(iso) {
   })
 }
 
+// UTC/ISO instant → "YYYY-MM-DDTHH:mm" in the browser's local time, for datetime-local inputs.
 function toLocalInput(iso) {
   if (!iso) return ''
   const d = new Date(iso)
-  return d.toISOString().slice(0, 16)
+  if (isNaN(d.getTime())) return ''
+  const pad = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+// "YYYY-MM-DDTHH:mm" local wall-clock from a datetime-local input → UTC ISO string for the API.
+function fromLocalInput(local) {
+  if (!local) return null
+  const d = new Date(local)
+  return isNaN(d.getTime()) ? null : d.toISOString()
 }
 
 export default function HistoricalPromotions() {
@@ -95,6 +105,8 @@ export default function HistoricalPromotions() {
     e.preventDefault()
     const payload = {
       ...form,
+      start_datetime: fromLocalInput(form.start_datetime),
+      end_datetime: fromLocalInput(form.end_datetime),
       affected_skus: form.scope === 'sku_specific' && form.affected_skus
         ? form.affected_skus.split(',').map(s => s.trim()).filter(Boolean)
         : null,
