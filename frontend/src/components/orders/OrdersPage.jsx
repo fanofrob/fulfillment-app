@@ -55,45 +55,94 @@ function csvEscape(val) {
 
 const ORDER_CSV_HEADERS = [
   'order_number', 'customer', 'status', 'order_date', 'age_days',
-  'order_total', 'tags', 'city', 'state', 'has_plan', 'gross_margin_pct',
+  'order_total', 'tags', 'address1', 'address2', 'city', 'state',
+  'has_plan', 'gross_margin_pct',
   'pick_sku', 'product_title', 'fulfillable_qty', 'pick_qty', 'line_status',
 ]
 
-function exportOrdersCsv(orders, marginsMap, label) {
+async function exportOrdersCsv(orders, marginsMap, label) {
+  // Fetch plans (with boxes + items) for all orders being exported, so we can
+  // emit one row per fulfillable box (e.g. #139843-Box1) instead of one row per
+  // order line item.
+  const orderIds = orders.map(o => o.shopify_order_id)
+  let planByOrder = {}
+  try {
+    const plans = await fulfillmentApi.listPlansByOrders(orderIds)
+    for (const p of plans) {
+      if (!p.shopify_order_id) continue
+      // Prefer the most recent non-cancelled plan per order
+      if (p.status === 'cancelled') continue
+      if (!planByOrder[p.shopify_order_id]) {
+        planByOrder[p.shopify_order_id] = p
+      }
+    }
+  } catch (err) {
+    console.error('Failed to fetch plans for export — falling back to line-item rows', err)
+  }
+
   const rows = []
   for (const o of orders) {
     const marginEntry = marginsMap?.[o.shopify_order_id]
     const gmPct = (!marginEntry?.missing_cost_skus?.length && marginEntry?.gm_pct != null)
       ? marginEntry.gm_pct.toFixed(1)
       : ''
-    const orderFields = [
-      o.shopify_order_number || o.shopify_order_id,
+    const baseOrderNumber = o.shopify_order_number || o.shopify_order_id
+    const orderFieldsFor = (orderNumber) => [
+      orderNumber,
       o.customer_name || '',
       STATUS_BADGE[o.app_status]?.label || o.app_status || '',
       o.created_at_shopify ? new Date(o.created_at_shopify).toLocaleDateString() : '',
       daysAgo(o.created_at_shopify) ?? '',
       (marginEntry?.fulfillable_revenue ?? o.total_price) != null ? Number(marginEntry?.fulfillable_revenue ?? o.total_price).toFixed(2) : '',
       (o.tags || '').split(',').map(t => t.trim()).filter(Boolean).join('; '),
+      o.shipping_address1 || '',
+      o.shipping_address2 || '',
       o.shipping_city || '',
       o.shipping_province || '',
       o.has_plan ? 'yes' : 'no',
       gmPct,
     ]
-    const fulfillableItems = (o.line_items || []).filter(li => (li.fulfillable_quantity ?? li.quantity ?? 0) > 0)
-    if (fulfillableItems.length === 0) {
-      rows.push([...orderFields, '', '', '', '', ''].map(csvEscape).join(','))
+
+    const plan = planByOrder[o.shopify_order_id]
+    const activeBoxes = (plan?.boxes || []).filter(b => b.status !== 'cancelled')
+
+    if (activeBoxes.length > 0) {
+      for (const box of activeBoxes) {
+        const orderNumber = `${baseOrderNumber}-Box${box.box_number}`
+        const items = box.items || []
+        if (items.length === 0) {
+          rows.push([...orderFieldsFor(orderNumber), '', '', '', '', ''].map(csvEscape).join(','))
+        } else {
+          for (const bi of items) {
+            const qty = bi.quantity ?? 0
+            rows.push([
+              ...orderFieldsFor(orderNumber),
+              bi.pick_sku || '',
+              bi.product_title || '',
+              '',
+              qty % 1 === 0 ? qty : qty.toFixed(2),
+              '',
+            ].map(csvEscape).join(','))
+          }
+        }
+      }
     } else {
-      for (const li of fulfillableItems) {
-        const fq = li.fulfillable_quantity ?? li.quantity ?? 0
-        const pickQty = fq * (li.mix_quantity ?? 1)
-        rows.push([
-          ...orderFields,
-          li.pick_sku || '',
-          li.product_title || '',
-          fq,
-          pickQty % 1 === 0 ? pickQty : pickQty.toFixed(2),
-          li.app_line_status || '',
-        ].map(csvEscape).join(','))
+      const fulfillableItems = (o.line_items || []).filter(li => (li.fulfillable_quantity ?? li.quantity ?? 0) > 0)
+      if (fulfillableItems.length === 0) {
+        rows.push([...orderFieldsFor(baseOrderNumber), '', '', '', '', ''].map(csvEscape).join(','))
+      } else {
+        for (const li of fulfillableItems) {
+          const fq = li.fulfillable_quantity ?? li.quantity ?? 0
+          const pickQty = fq * (li.mix_quantity ?? 1)
+          rows.push([
+            ...orderFieldsFor(baseOrderNumber),
+            li.pick_sku || '',
+            li.product_title || '',
+            fq,
+            pickQty % 1 === 0 ? pickQty : pickQty.toFixed(2),
+            li.app_line_status || '',
+          ].map(csvEscape).join(','))
+        }
       }
     }
   }

@@ -329,6 +329,7 @@ export const fulfillmentApi = {
 
   // Plans
   listPlans: (params) => api.get('/fulfillment/plans', { params }).then(r => r.data),
+  listPlansByOrders: (order_ids) => api.post('/fulfillment/plans/by-orders', { order_ids }).then(r => r.data),
   createPlan: (data) => api.post('/fulfillment/plans', data).then(r => r.data),
   getPlan: (id) => api.get(`/fulfillment/plans/${id}`).then(r => r.data),
   updatePlan: (id, data) => api.put(`/fulfillment/plans/${id}`, data).then(r => r.data),

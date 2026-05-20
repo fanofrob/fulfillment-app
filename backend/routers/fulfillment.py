@@ -899,6 +899,25 @@ def list_plans(
     return [_plan_to_dict(p, db) for p in plans]
 
 
+class PlansByOrdersRequest(BaseModel):
+    order_ids: List[str]
+
+
+@router.post("/plans/by-orders")
+def list_plans_by_orders(body: PlansByOrdersRequest, db: Session = Depends(get_db)):
+    """Return plans (with boxes + items) for many Shopify order IDs in one call.
+    Used by the Orders CSV export to render box-level rows without N round-trips."""
+    if not body.order_ids:
+        return []
+    plans = (
+        db.query(models.FulfillmentPlan)
+        .filter(models.FulfillmentPlan.shopify_order_id.in_(body.order_ids))
+        .order_by(models.FulfillmentPlan.created_at.desc())
+        .all()
+    )
+    return [_plan_to_dict(p, db) for p in plans]
+
+
 @router.post("/plans")
 def create_plan(body: PlanCreate, db: Session = Depends(get_db)):
     order = db.query(models.ShopifyOrder).filter(
