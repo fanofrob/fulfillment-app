@@ -54,10 +54,10 @@ function csvEscape(val) {
 }
 
 const ORDER_CSV_HEADERS = [
-  'order_number', 'customer', 'status', 'order_date', 'age_days',
-  'order_total', 'tags', 'address1', 'address2', 'city', 'state',
+  'order_number', 'order_id', 'customer', 'status', 'order_date', 'age_days',
+  'order_total', 'tags', 'address1', 'address2', 'city', 'state', 'zip',
   'has_plan', 'gross_margin_pct',
-  'pick_sku', 'product_title', 'fulfillable_qty', 'pick_qty', 'line_status',
+  'pick_sku', 'shopify_line_item_id', 'product_title', 'fulfillable_qty', 'pick_qty', 'line_status',
 ]
 
 async function exportOrdersCsv(orders, marginsMap, label) {
@@ -89,6 +89,7 @@ async function exportOrdersCsv(orders, marginsMap, label) {
     const baseOrderNumber = o.shopify_order_number || o.shopify_order_id
     const orderFieldsFor = (orderNumber) => [
       orderNumber,
+      o.shopify_order_id || '',
       o.customer_name || '',
       STATUS_BADGE[o.app_status]?.label || o.app_status || '',
       o.created_at_shopify ? new Date(o.created_at_shopify).toLocaleDateString() : '',
@@ -99,6 +100,7 @@ async function exportOrdersCsv(orders, marginsMap, label) {
       o.shipping_address2 || '',
       o.shipping_city || '',
       o.shipping_province || '',
+      o.shipping_zip || '',
       o.has_plan ? 'yes' : 'no',
       gmPct,
     ]
@@ -111,13 +113,14 @@ async function exportOrdersCsv(orders, marginsMap, label) {
         const orderNumber = `${baseOrderNumber}-Box${box.box_number}`
         const items = box.items || []
         if (items.length === 0) {
-          rows.push([...orderFieldsFor(orderNumber), '', '', '', '', ''].map(csvEscape).join(','))
+          rows.push([...orderFieldsFor(orderNumber), '', '', '', '', '', ''].map(csvEscape).join(','))
         } else {
           for (const bi of items) {
             const qty = bi.quantity ?? 0
             rows.push([
               ...orderFieldsFor(orderNumber),
               bi.pick_sku || '',
+              bi.shopify_line_item_id || '',
               bi.product_title || '',
               '',
               qty % 1 === 0 ? qty : qty.toFixed(2),
@@ -129,7 +132,7 @@ async function exportOrdersCsv(orders, marginsMap, label) {
     } else {
       const fulfillableItems = (o.line_items || []).filter(li => (li.fulfillable_quantity ?? li.quantity ?? 0) > 0)
       if (fulfillableItems.length === 0) {
-        rows.push([...orderFieldsFor(baseOrderNumber), '', '', '', '', ''].map(csvEscape).join(','))
+        rows.push([...orderFieldsFor(baseOrderNumber), '', '', '', '', '', ''].map(csvEscape).join(','))
       } else {
         for (const li of fulfillableItems) {
           const fq = li.fulfillable_quantity ?? li.quantity ?? 0
@@ -137,6 +140,7 @@ async function exportOrdersCsv(orders, marginsMap, label) {
           rows.push([
             ...orderFieldsFor(baseOrderNumber),
             li.pick_sku || '',
+            li.line_item_id || '',
             li.product_title || '',
             fq,
             pickQty % 1 === 0 ? pickQty : pickQty.toFixed(2),
