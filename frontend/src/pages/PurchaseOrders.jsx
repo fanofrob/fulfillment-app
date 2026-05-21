@@ -28,6 +28,113 @@ function formatCurrency(val) {
   return `$${Number(val).toFixed(2)}`
 }
 
+const BUYER_INFO = {
+  name: 'Good Hill Farms',
+  address: '10098 Gomez Creek Rd, Fallbrook, CA 92028',
+  phone: '626-487-6981',
+  email: 'rob@goodhillfarms.com, supply@goodhillfarms.com',
+}
+
+function escapeHtml(s) {
+  if (s == null) return ''
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+}
+
+function printPurchaseOrder(po) {
+  const lineRows = (po.lines || []).map(line => `
+    <tr>
+      <td>${escapeHtml(line.product_type)}</td>
+      <td class="num">${line.quantity_cases ?? ''}</td>
+      <td class="num">${line.case_weight_lbs != null ? `${line.case_weight_lbs} lbs` : '—'}</td>
+      <td class="num">${line.total_weight_lbs != null ? `${line.total_weight_lbs.toFixed(1)} lbs` : '—'}</td>
+      <td>${escapeHtml(line.notes || '')}</td>
+    </tr>
+  `).join('')
+
+  const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>${escapeHtml(po.po_number)} — Purchase Order</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; color: #111; margin: 0; padding: 32px; font-size: 12pt; }
+    h1 { font-size: 22pt; margin: 0 0 4px 0; }
+    .meta { color: #555; font-size: 11pt; margin-bottom: 24px; }
+    .parties { display: flex; gap: 32px; margin-bottom: 24px; }
+    .party { flex: 1; border: 1px solid #ccc; border-radius: 6px; padding: 12px; }
+    .party h3 { margin: 0 0 6px 0; font-size: 11pt; text-transform: uppercase; color: #555; letter-spacing: 0.5px; }
+    .party .name { font-weight: 600; font-size: 13pt; }
+    .party .line { font-size: 11pt; margin-top: 2px; white-space: pre-line; }
+    .info-row { display: flex; gap: 24px; margin-bottom: 16px; font-size: 11pt; }
+    .info-row > div { flex: 1; }
+    .info-row strong { display: block; color: #555; font-size: 10pt; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { padding: 8px 6px; text-align: left; border-bottom: 1px solid #ddd; font-size: 11pt; }
+    th { background: #f3f4f6; font-weight: 600; border-bottom: 2px solid #999; }
+    td.num, th.num { text-align: right; }
+    tfoot td { font-weight: 600; border-top: 2px solid #999; border-bottom: none; padding-top: 12px; }
+    .notes { margin-top: 16px; font-size: 11pt; color: #555; white-space: pre-wrap; }
+    .print-btn { position: fixed; top: 12px; right: 12px; padding: 8px 16px; font-size: 11pt; cursor: pointer; }
+    @media print { .print-btn { display: none; } body { padding: 0.5in; } }
+  </style>
+</head>
+<body>
+  <button class="print-btn" onclick="window.print()">🖨 Print</button>
+
+  <h1>Purchase Order</h1>
+  <div class="meta">
+    <strong>${escapeHtml(po.po_number)}</strong>
+    &nbsp;·&nbsp; Date: ${escapeHtml(formatDate(po.order_date))}
+    ${po.expected_delivery_date ? `&nbsp;·&nbsp; Expected Delivery: ${escapeHtml(formatDate(po.expected_delivery_date))}` : ''}
+  </div>
+
+  <div class="parties">
+    <div class="party">
+      <h3>Vendor</h3>
+      <div class="name">${escapeHtml(po.vendor_name || '—')}</div>
+      <div class="line">${escapeHtml(po.effective_pickup_address || '—')}</div>
+    </div>
+    <div class="party">
+      <h3>Buyer</h3>
+      <div class="name">${escapeHtml(BUYER_INFO.name)}</div>
+      <div class="line">${escapeHtml(BUYER_INFO.address)}</div>
+      <div class="line">Phone: ${escapeHtml(BUYER_INFO.phone)}</div>
+      <div class="line">Email: ${escapeHtml(BUYER_INFO.email)}</div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Product Type</th>
+        <th class="num">Cases</th>
+        <th class="num">Case Wt</th>
+        <th class="num">Total Wt</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${lineRows || `<tr><td colspan="5" style="color:#888;text-align:center;padding:24px;">No line items</td></tr>`}
+    </tbody>
+  </table>
+
+  ${po.notes ? `<div class="notes"><strong>Notes:</strong> ${escapeHtml(po.notes)}</div>` : ''}
+
+  <script>
+    window.addEventListener('load', () => setTimeout(() => window.print(), 200));
+  </script>
+</body>
+</html>`
+
+  const w = window.open('', '_blank', 'width=900,height=1000')
+  if (!w) { alert('Pop-up blocked — allow pop-ups for this site to print.'); return }
+  w.document.write(html)
+  w.document.close()
+}
+
 const EMPTY_PO = {
   vendor_id: '', status: 'draft', order_date: new Date().toISOString().slice(0, 10),
   expected_delivery_date: '', delivery_notes: '', communication_method: '', notes: '',
@@ -1115,6 +1222,7 @@ export default function PurchaseOrders() {
                     Push All to Inventory
                   </button>
                 )}
+                <button className="btn" onClick={() => printPurchaseOrder(showDetailModal)}>🖨 Print PO</button>
                 <button className="btn" onClick={() => setShowDetailModal(null)}>Close</button>
               </div>
             </div>
@@ -1592,6 +1700,7 @@ export default function PurchaseOrders() {
               {showDetailModal.status === 'draft' && (
                 <button className="btn btn-danger" onClick={() => { if (confirm('Delete this PO?')) deleteMut.mutate(showDetailModal.id) }}>Delete PO</button>
               )}
+              <button className="btn" onClick={() => printPurchaseOrder(showDetailModal)}>🖨 Print PO</button>
               <button className="btn" onClick={() => setShowDetailModal(null)}>Close</button>
             </div>
           </div>
