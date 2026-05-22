@@ -1798,6 +1798,7 @@ export default function PurchasePlanning() {
                                     const rect = e.currentTarget.getBoundingClientRect()
                                     setVendorInfo({
                                       vendorId: row.original.vendor_id,
+                                      poNumber: row.original.purchase_order_number || null,
                                       anchorRect: { top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right },
                                     })
                                   }}
@@ -1825,7 +1826,11 @@ export default function PurchasePlanning() {
           vendorId={vendorInfo.vendorId}
           anchorRect={vendorInfo.anchorRect}
           vendor={vendors.find((v) => v.id === vendorInfo.vendorId)}
-          items={items.filter((it) => it.vendor_id === vendorInfo.vendorId)}
+          items={items.filter((it) => {
+            if (it.vendor_id !== vendorInfo.vendorId) return false
+            const rowPo = it.purchase_order_number || null
+            return rowPo === vendorInfo.poNumber
+          })}
           onClose={() => setVendorInfo(null)}
         />
       )}
